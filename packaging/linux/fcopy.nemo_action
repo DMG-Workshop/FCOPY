@@ -1,0 +1,8 @@
+# Cinnamon Nemo action. System path: /usr/share/nemo/actions/
+[Nemo Action]
+Name=Copy with fcopy…
+Comment=Copy the selection with fcopy
+Exec=fcopy-gui --sources %F
+Icon-Name=io.github.fcopy
+Selection=notnone
+Extensions=any;

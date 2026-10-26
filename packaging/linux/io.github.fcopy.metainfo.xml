@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata: makes the app show up properly in GNOME Software / KDE Discover / Flathub. -->
+<component type="desktop-application">
+  <id>io.github.fcopy</id>
+  <name>fcopy</name>
+  <summary>Fast, verified file copying</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <description>
+    <p>Copies files and folders with pause/resume, speed limits, checksum verification
+    (XXH3, SHA-256, MD5) and Retry/Skip/Cancel error recovery.</p>
+  </description>
+  <launchable type="desktop-id">io.github.fcopy.desktop</launchable>
+  <provides><binary>fcopy</binary><binary>fcopy-gui</binary></provides>
+  <categories><category>Utility</category></categories>
+</component>

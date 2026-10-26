@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = ["crates/fc-engine", "crates/fc-cli", "crates/fc-gui", "crates/fc-remote"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3

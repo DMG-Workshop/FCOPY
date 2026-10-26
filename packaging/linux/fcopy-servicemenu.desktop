@@ -1,0 +1,11 @@
+# KDE Dolphin service menu. System path: /usr/share/kio/servicemenus/ (must be executable on KF6).
+[Desktop Entry]
+Type=Service
+MimeType=all/all;
+Actions=fcopyCopy;
+X-KDE-Priority=TopLevel
+
+[Desktop Action fcopyCopy]
+Name=Copy with fcopy…
+Icon=io.github.fcopy
+Exec=fcopy-gui --sources %F

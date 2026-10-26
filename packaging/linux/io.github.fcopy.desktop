@@ -1,0 +1,20 @@
+[Desktop Entry]
+Type=Application
+Name=fcopy
+GenericName=File Copier
+Comment=Fast, verified file copying
+Exec=fcopy-gui --sources %F
+Icon=io.github.fcopy
+Terminal=false
+Categories=Utility;FileTools;System;
+# Lets the app appear in "Open With" for folders and any file. A copier cannot
+# become the file manager's default *copy* handler: no freedesktop spec exists
+# for that, so integration is via the context-menu entries below.
+MimeType=inode/directory;application/octet-stream;
+StartupWMClass=io.github.fcopy
+Keywords=copy;teracopy;verify;checksum;transfer;
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Transfer Window
+Exec=fcopy-gui

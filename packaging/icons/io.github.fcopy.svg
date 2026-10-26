@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <!-- Original placeholder icon: two stacked sheets and a check mark (copy + verify). -->
+  <rect x="14" y="10" width="68" height="84" rx="10" fill="#2c6e91"/>
+  <rect x="40" y="32" width="74" height="86" rx="10" fill="#4fa3c7" stroke="#1d3f52" stroke-width="4"/>
+  <path d="M58 76 l12 12 l24 -26" fill="none" stroke="#ffffff" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

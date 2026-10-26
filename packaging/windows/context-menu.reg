@@ -1,0 +1,21 @@
+Windows Registry Editor Version 5.00
+
+; Per-user "Copy with fcopy…" verbs. Equivalent to `fcopy-gui --install-integration`.
+; Adjust the install path. On Windows 11 these appear under "Show more options";
+; the top-level modern menu requires an IExplorerCommand COM handler + sparse MSIX package.
+
+[HKEY_CURRENT_USER\Software\Classes\*\shell\fcopy]
+@="Copy with fcopy…"
+"Icon"="\"C:\\Program Files\\fcopy\\fcopy-gui.exe\",0"
+"MultiSelectModel"="Player"
+
+[HKEY_CURRENT_USER\Software\Classes\*\shell\fcopy\command]
+@="\"C:\\Program Files\\fcopy\\fcopy-gui.exe\" --sources %*"
+
+[HKEY_CURRENT_USER\Software\Classes\Directory\shell\fcopy]
+@="Copy with fcopy…"
+"Icon"="\"C:\\Program Files\\fcopy\\fcopy-gui.exe\",0"
+"MultiSelectModel"="Player"
+
+[HKEY_CURRENT_USER\Software\Classes\Directory\shell\fcopy\command]
+@="\"C:\\Program Files\\fcopy\\fcopy-gui.exe\" --sources %*"

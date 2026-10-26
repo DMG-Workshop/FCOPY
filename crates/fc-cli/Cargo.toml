@@ -1,0 +1,19 @@
+[package]
+name = "fc-cli"
+description = "fcopy: command-line front end for fc-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+ctrlc = "3.5.2"
+fc-engine = { path = "../fc-engine" }
+
+[[bin]]
+name = "fcopy"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3"

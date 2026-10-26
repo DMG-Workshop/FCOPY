@@ -1,0 +1,57 @@
+[package]
+name = "fc-gui"
+description = "fcopy-gui: egui front end for fc-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eframe = { version = "0.32.3", default-features = false, features = ["glow", "x11", "wayland", "default_fonts"] }
+egui = "0.32.3"
+fc-engine = { path = "../fc-engine" }
+
+[[bin]]
+name = "fcopy-gui"
+path = "src/main.rs"
+
+[target."cfg(windows)".dependencies]
+winreg = "0.56.0"
+
+[build-dependencies]
+embed-resource = "3.0.12"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+# `cargo deb -p fc-gui` (Debian/Ubuntu). Build fc-cli first so its binary exists.
+[package.metadata.deb]
+name = "fcopy"
+maintainer = "you <you@example.com>"
+section = "utils"
+depends = "$auto, libxkbcommon0, libgl1"
+assets = [
+  ["target/release/fcopy-gui", "usr/bin/", "755"],
+  ["target/release/fcopy", "usr/bin/", "755"],
+  ["../../packaging/linux/io.github.fcopy.desktop", "usr/share/applications/", "644"],
+  ["../../packaging/linux/io.github.fcopy.metainfo.xml", "usr/share/metainfo/", "644"],
+  ["../../packaging/linux/fcopy-servicemenu.desktop", "usr/share/kio/servicemenus/fcopy.desktop", "755"],
+  ["../../packaging/linux/fcopy.nemo_action", "usr/share/nemo/actions/", "644"],
+  ["../../packaging/icons/io.github.fcopy.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+]
+
+# `cargo generate-rpm -p crates/fc-gui` (Fedora/openSUSE).
+[package.metadata.generate-rpm]
+name = "fcopy"
+assets = [
+  { source = "target/release/fcopy-gui", dest = "/usr/bin/fcopy-gui", mode = "755" },
+  { source = "target/release/fcopy", dest = "/usr/bin/fcopy", mode = "755" },
+  { source = "../../packaging/linux/io.github.fcopy.desktop", dest = "/usr/share/applications/io.github.fcopy.desktop", mode = "644" },
+  { source = "../../packaging/linux/io.github.fcopy.metainfo.xml", dest = "/usr/share/metainfo/io.github.fcopy.metainfo.xml", mode = "644" },
+  { source = "../../packaging/linux/fcopy-servicemenu.desktop", dest = "/usr/share/kio/servicemenus/fcopy.desktop", mode = "755" },
+  { source = "../../packaging/linux/fcopy.nemo_action", dest = "/usr/share/nemo/actions/fcopy.nemo_action", mode = "644" },
+  { source = "../../packaging/icons/io.github.fcopy.svg", dest = "/usr/share/icons/hicolor/scalable/apps/io.github.fcopy.svg", mode = "644" },
+]
+[package.metadata.generate-rpm.requires]
+libxkbcommon = "*"
+mesa-libGL = "*"
