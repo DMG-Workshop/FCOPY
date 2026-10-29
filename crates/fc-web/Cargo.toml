@@ -1,0 +1,24 @@
+[package]
+name = "fc-web"
+description = "Local web management dashboard for fcopy: login, transfer queue, live telemetry over WebSocket"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+argon2 = "0.6.0"
+axum = { version = "0.8.9", features = ["ws"] }
+base64 = "0.23.1"
+fc-engine = { path = "../fc-engine" }
+fc-remote = { path = "../fc-remote" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11.0"
+subtle = "2.6.1"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tower = { version = "0.5", features = ["util"] }
