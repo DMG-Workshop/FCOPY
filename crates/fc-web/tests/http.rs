@@ -38,6 +38,7 @@ async fn setup() -> App {
             session_ttl: Duration::from_secs(3600),
             hash_cost: HashCost { m_kib: 256, t: 1, p: 1 },
             state_dir: None,
+            certificate_fingerprint: None,
         },
     )
     .unwrap();
@@ -66,7 +67,7 @@ async fn send(app: &App, method: &str, uri: &str, headers: &[(&str, &str)], body
         None => Body::empty(),
     };
     let mut req = b.body(body).unwrap();
-    req.extensions_mut().insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000))));
+    req.extensions_mut().insert(ConnectInfo(fc_web::https::PeerAddr(SocketAddr::from(([127, 0, 0, 1], 40_000)))));
     let resp = app.router.clone().oneshot(req).await.unwrap();
     let status = resp.status();
     let set_cookie = resp.headers().get(SET_COOKIE).and_then(|v| v.to_str().ok()).map(str::to_string);
@@ -256,7 +257,7 @@ async fn dashboard_assets_are_served_with_a_strict_policy() {
         ("/static/alpine.min.js", "text/javascript"),
     ] {
         let mut req = Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap();
-        req.extensions_mut().insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000))));
+        req.extensions_mut().insert(ConnectInfo(fc_web::https::PeerAddr(SocketAddr::from(([127, 0, 0, 1], 40_000)))));
         let resp = app.router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "{uri}");
         let headers = resp.headers();

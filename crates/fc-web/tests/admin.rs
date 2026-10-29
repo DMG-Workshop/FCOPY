@@ -64,6 +64,7 @@ async fn env() -> Env {
             session_ttl: Duration::from_secs(3600),
             hash_cost: HashCost { m_kib: 256, t: 1, p: 1 },
             state_dir: Some(state_dir.path().to_path_buf()),
+            certificate_fingerprint: None,
         },
     )
     .unwrap();
@@ -92,7 +93,7 @@ async fn send(e: &Env, method: &str, uri: &str, cookie: Option<&str>, body: Opti
         None => Body::empty(),
     };
     let mut req = b.body(body).unwrap();
-    req.extensions_mut().insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000))));
+    req.extensions_mut().insert(ConnectInfo(fc_web::https::PeerAddr(SocketAddr::from(([127, 0, 0, 1], 40_000)))));
     let resp = e.router.clone().oneshot(req).await.unwrap();
     let status = resp.status();
     let set_cookie = resp.headers().get(SET_COOKIE).and_then(|v| v.to_str().ok()).map(str::to_string);

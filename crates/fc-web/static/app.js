@@ -72,8 +72,9 @@ function fcopy() {
     // session
     user: null,
     form: { user: '', password: '' },
-    error: '',
+    error: "",
     busy: false,
+    certificate: null,
     socket: null,
     retry: 1000,
     live: false,
@@ -106,6 +107,8 @@ function fcopy() {
     clientTimer: null,
 
     async start() {
+      const info = await fetch("/api/info", { credentials: "same-origin" });
+      if (info.ok) this.certificate = (await info.json()).certificate;
       const r = await this.api('GET', '/api/me');
       if (r.ok) {
         this.user = await r.json();

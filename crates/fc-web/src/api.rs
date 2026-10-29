@@ -2,7 +2,6 @@
 //! so a user can only see or change their own transfers. Admins see all.
 //! Pairing, settings and accounts are admin-only.
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -45,10 +44,10 @@ impl From<Principal> for Me {
 
 pub async fn login(
     State(s): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ConnectInfo(addr): ConnectInfo<crate::https::PeerAddr>,
     Json(req): Json<LoginReq>,
 ) -> Result<Response, ApiError> {
-    let ip = addr.ip().to_canonical();
+    let ip = addr.0.ip().to_canonical();
     if let Err(wait) = s.limiter.check(ip, Some(&req.user)) {
         return Err(ApiError::LockedOut(wait));
     }
@@ -73,6 +72,20 @@ pub async fn logout(State(s): State<Arc<AppState>>, headers: axum::http::HeaderM
         s.sessions.revoke(token);
     }
     ([(SET_COOKIE, auth::clear_session_cookie(s.cookie_secure))], StatusCode::NO_CONTENT).into_response()
+}
+
+#[derive(Serialize)]
+pub struct Info {
+    pub scheme: &'static str,
+    /// `SHA256:…` of the console's certificate.
+    pub certificate: Option<String>,
+}
+
+/// Public. The sign-in page shows the certificate fingerprint so it can be
+/// compared with the one the agent shows.
+pub async fn info(State(s): State<Arc<AppState>>) -> Json<Info> {
+    let scheme = if s.cookie_secure { "https" } else { "http" };
+    Json(Info { scheme, certificate: s.certificate_fingerprint.clone() })
 }
 
 pub async fn me(p: Principal) -> Json<Me> {

@@ -13,6 +13,7 @@
 
 pub mod api;
 pub mod clients;
+pub mod https;
 pub mod auth;
 pub mod telemetry;
 
@@ -55,6 +56,8 @@ pub struct AppState {
     pub telemetry: broadcast::Sender<Arc<telemetry::Frame>>,
     pub clients: clients::ClientStore,
     pub cookie_secure: bool,
+    /// The console certificate's fingerprint, shown on the sign-in page to compare by eye.
+    pub certificate_fingerprint: Option<String>,
 }
 
 /// Settings for [`build`].
@@ -65,11 +68,12 @@ pub struct Config {
     pub hash_cost: HashCost,
     /// Where paired clients are saved. `None` keeps them in memory.
     pub state_dir: Option<PathBuf>,
+    pub certificate_fingerprint: Option<String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { roots: vec![], cookie_secure: true, session_ttl: Duration::from_secs(12 * 3600), hash_cost: HashCost::default(), state_dir: None }
+        Self { roots: vec![], cookie_secure: true, session_ttl: Duration::from_secs(12 * 3600), hash_cost: HashCost::default(), state_dir: None, certificate_fingerprint: None }
     }
 }
 
@@ -103,6 +107,7 @@ pub fn build(queue: Queue, events: std::sync::mpsc::Receiver<Event>, config: Con
         telemetry,
         clients: clients::ClientStore::open(config.state_dir.map(|d| d.join("clients.json")))?,
         cookie_secure: config.cookie_secure,
+        certificate_fingerprint: config.certificate_fingerprint,
     });
     telemetry::spawn_producer(state.clone(), events);
     Ok(state)
@@ -141,6 +146,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/static/alpine.min.js", get(|| asset("text/javascript; charset=utf-8", ALPINE_JS)))
         .route("/api/auth/login", post(api::login))
         .route("/api/auth/logout", post(api::logout))
+        .route("/api/info", get(api::info))
         .route("/api/me", get(api::me))
         .route("/api/transfers", get(api::list_transfers).post(api::create_transfer))
         .route("/api/transfers/{id}", delete(api::cancel_transfer))
@@ -228,6 +234,14 @@ pub fn within_roots(roots: &[PathBuf], path: &Path) -> bool {
     let base = if path.exists() { Some(path) } else { path.parent() };
     let Some(real) = base.and_then(|b| b.canonicalize().ok()) else { return false };
     roots.iter().any(|root| real.starts_with(root))
+}
+
+/// Serve the console over HTTPS on an already-bound listener.
+///
+/// Set `Config::cookie_secure` to true when calling this, so the session
+/// cookie is only sent over TLS.
+pub async fn serve(state: Arc<AppState>, listener: https::TlsListener) -> std::io::Result<()> {
+    axum::serve(listener, router(state).into_make_service_with_connect_info::<https::PeerAddr>()).await
 }
 
 #[cfg(test)]

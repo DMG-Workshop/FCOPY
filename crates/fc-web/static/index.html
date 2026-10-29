@@ -28,6 +28,7 @@
     <p x-show="error" x-text="error" role="alert" class="text-bad"></p>
     <button type="submit" :disabled="busy" class="btn-primary h-10">Sign in</button>
   </form>
+  <p x-show="certificate" class="break-all font-mono text-[10px] text-faint" title="Compare this with the fingerprint the other PC shows">Certificate <span x-text="certificate"></span></p>
 </main>
 
 <!-- ============ Workspace ============ -->
@@ -96,11 +97,11 @@
             <tr>
               <th class="w-8 p-2 text-center"><input type="checkbox" class="accent-brand" :checked="allSelected()" @change="toggleAll($event.target.checked)" aria-label="Select all"></th>
               <th class="p-2">Name and path</th>
-              <th class="hidden w-24 p-2 text-right lg:table-cell">Size</th>
+              <th class="w-24 p-2 text-right">Size</th>
               <th class="w-52 p-2">Progress</th>
               <th class="w-36 p-2">Status</th>
               <th class="w-32 p-2 text-right">Rate</th>
-              <th class="hidden w-24 p-2 text-right lg:table-cell">Files</th>
+              <th class="w-24 p-2 text-right">Files</th>
               <th class="w-24 p-2 text-center">Actions</th>
             </tr>
           </thead>
@@ -114,7 +115,7 @@
                   </div>
                   <div class="truncate text-[10px] text-faint" x-text="job.remote ? `→ ${job.destination}` : (job.current_file || job.owner || '—')"></div>
                 </td>
-                <td class="hidden p-2 text-right tabular-nums text-body lg:table-cell" x-text="fmtBytes(job.bytes_total)"></td>
+                <td class="hidden p-2 text-right tabular-nums text-body md:table-cell" x-text="fmtBytes(job.bytes_total)"></td>
                 <td class="mt-2 block p-0 md:table-cell md:p-2">
                   <div class="flex items-center gap-2">
                     <div class="h-1.5 flex-1 overflow-hidden bg-raised" role="progressbar" :aria-valuenow="Math.round(job.percent)" aria-valuemin="0" aria-valuemax="100" :aria-label="job.label">
@@ -128,7 +129,7 @@
                   <div class="text-[10px] text-faint" x-text="job.state === 'running' ? `ETA ${fmtEta(job.eta_secs)}` : ''"></div>
                 </td>
                 <td class="hidden p-2 text-right tabular-nums text-body md:table-cell" x-text="fmtRate(job.rate_bps)"></td>
-                <td class="hidden p-2 text-right tabular-nums text-dim lg:table-cell" x-text="`${job.files_done}/${job.files_total}`"></td>
+                <td class="hidden p-2 text-right tabular-nums text-dim md:table-cell" x-text="`${job.files_done}/${job.files_total}`"></td>
                 <td class="block p-0 md:table-cell md:p-2">
                   <div class="flex justify-end gap-1">
                     <button x-show="job.state === 'running'" class="btn-mini" @click="act(job, 'pause')">Pause</button>

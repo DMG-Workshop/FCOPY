@@ -190,3 +190,16 @@ pub fn client_config(verifier: Arc<PinnedVerifier>) -> io::Result<quinn::ClientC
     cfg.transport_config(Arc::new(transport()));
     Ok(cfg)
 }
+
+/// TLS 1.3 for the web console, using this agent's identity. The ALPN is
+/// HTTP/1.1, which is what the console speaks. QUIC uses [`server_config`].
+pub fn https_server_config(id: &Identity) -> io::Result<rustls::ServerConfig> {
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(io::Error::other)?
+        .with_no_client_auth()
+        .with_single_cert(vec![id.cert.clone()], PrivateKeyDer::Pkcs8(id.key.clone_key()))
+        .map_err(io::Error::other)?;
+    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(tls)
+}
