@@ -143,14 +143,14 @@ Not planned yet: pull (download) direction (add a `FileRequest` message mirrorin
 
 Done since the handoff, each with tests:
 - `RemoteBackend` (fc-remote/backend.rs): queue jobs to a paired PC. Reconnect with token then password, resume, identity refusal.
-- `fcopy-agent` (fc-agent): init, serve, fingerprint, share, user, unattended, allow, service install/uninstall/run (Windows: compiled, not run). systemd and launchd files in packaging/.
+- `fcopy-agent` (fc-agent): init, serve, fingerprint, share, user, unattended, allow, service install/uninstall/run (Windows service verified on this PC). systemd and launchd files in packaging/.
 - LAN discovery (fc-remote/discovery.rs): advertise and browse `_fcopy._udp.local.`. The agent announces itself when `discovery = true`.
 - `fcopy copy SRC user@host:/share/dir` with password from file, env or prompt. `--accept-fingerprint`, trust saved after confirmation. `fcopy peers`.
 - Web console: Remote node mode in Add task; HTTPS only, with the agent's certificate.
 - Desktop GUI: Copy to a PC on the network; redesigned window (tab bar, sidebar, queue table, status bar).
 
 Still open:
-- Windows service: not run on a real install (needs an elevated shell).
+- Windows service: verified on this PC (elevated): install, start, listening on UDP 47800, stop, uninstall. It writes no logs yet.
 - Pull (download) direction, not planned yet.
 - BitTorrent engine (web and desktop tabs are disabled and labelled).
 - Public certificate for the web console; the self-signed one needs trusting once.
