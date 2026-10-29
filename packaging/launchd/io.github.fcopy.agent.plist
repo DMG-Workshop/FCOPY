@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- launchd job for fcopy-agent (macOS). Install with:
+       sudo cp io.github.fcopy.agent.plist /Library/LaunchDaemons/
+       sudo launchctl bootstrap system /Library/LaunchDaemons/io.github.fcopy.agent.plist
+     The state directory is /Library/Application Support/fcopy-agent. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.github.fcopy.agent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/fcopy-agent</string>
+        <string>--dir</string>
+        <string>/Library/Application Support/fcopy-agent</string>
+        <string>serve</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Library/Logs/fcopy-agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Library/Logs/fcopy-agent.log</string>
+</dict>
+</plist>

@@ -1,0 +1,34 @@
+# systemd unit for fcopy-agent. Install with:
+#   install -m 644 fcopy-agent.service /etc/systemd/system/
+#   systemctl enable --now fcopy-agent
+#
+# Add each share's path to ReadWritePaths, since ProtectSystem=strict makes
+# the rest of the disk read-only to the agent.
+
+[Unit]
+Description=fcopy agent: receives files from fcopy clients over QUIC
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fcopy-agent
+Group=fcopy-agent
+# Config, identity and known state live under /var/lib/fcopy-agent.
+StateDirectory=fcopy-agent
+ExecStart=/usr/bin/fcopy-agent --dir /var/lib/fcopy-agent serve
+Restart=on-failure
+RestartSec=5
+
+# Hardening: the agent needs the network, its state directory, and its shares.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+# ReadWritePaths=/srv/backup
+
+[Install]
+WantedBy=multi-user.target

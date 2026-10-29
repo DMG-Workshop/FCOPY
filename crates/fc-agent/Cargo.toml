@@ -1,0 +1,24 @@
+[package]
+name = "fc-agent"
+description = "fcopy-agent: receives files from fcopy clients over QUIC, as a daemon or service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fcopy-agent"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+ctrlc = "3.5.2"
+fc-remote = { path = "../fc-remote" }
+rpassword = "7"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8.1"
