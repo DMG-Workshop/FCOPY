@@ -2,11 +2,14 @@
 //! so a user can only see or change their own transfers. Admins see all.
 //! Pairing, settings and accounts are admin-only.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
-use axum::extract::{ConnectInfo, Path, State};
+use axum::body::Bytes;
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::StatusCode;
 use axum::http::header::{COOKIE, SET_COOKIE};
 use axum::response::{IntoResponse, Response};
@@ -16,9 +19,10 @@ use serde_json::json;
 use fc_engine::{ErrorPolicy, JobId, JobInfo, RetryPolicy, TransferRequest};
 use fc_remote::backend::RemoteBackend;
 use fc_remote::client::{ClientError, Connector, RemoteSpec, Session};
+use fc_torrent::{TorrentEngine, TorrentError};
 
 use crate::auth::{self, AuthError, Principal, Role, SESSION_COOKIE};
-use crate::telemetry::JobDto;
+use crate::telemetry::{JobDto, TorrentDto};
 use crate::{ApiError, AppState, within_roots};
 
 /// Most sources accepted in one request.
@@ -79,13 +83,15 @@ pub struct Info {
     pub scheme: &'static str,
     /// `SHA256:…` of the console's certificate.
     pub certificate: Option<String>,
+    /// Whether this console has a BitTorrent lane.
+    pub torrents: bool,
 }
 
 /// Public. The sign-in page shows the certificate fingerprint so it can be
 /// compared with the one the agent shows.
 pub async fn info(State(s): State<Arc<AppState>>) -> Json<Info> {
     let scheme = if s.cookie_secure { "https" } else { "http" };
-    Json(Info { scheme, certificate: s.certificate_fingerprint.clone() })
+    Json(Info { scheme, certificate: s.certificate_fingerprint.clone(), torrents: s.torrents.is_some() })
 }
 
 pub async fn me(p: Principal) -> Json<Me> {
@@ -443,5 +449,130 @@ pub async fn delete_user(State(s): State<Arc<AppState>>, p: Principal, Path(name
         return Err(ApiError::NotFound);
     }
     s.sessions.revoke_user(&name);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// BitTorrent: admin only. The engine is shared by the console, so its transfers
+// have no owner, the same as paired PCs.
+// ---------------------------------------------------------------------------
+
+/// Largest `.torrent` file accepted: 4 MiB. A metainfo file for a multi-terabyte
+/// set is still only a few megabytes.
+pub const MAX_TORRENT_FILE: usize = 4 << 20;
+/// Longest magnet link accepted.
+const MAX_MAGNET: usize = 8 << 10;
+/// How long an add waits for a magnet link's metadata before answering "pending".
+const METADATA_WAIT: Duration = Duration::from_secs(2);
+/// Most peer addresses given with one `.torrent` file.
+const MAX_PEERS: usize = 50;
+
+fn engine(s: &AppState) -> Result<&TorrentEngine, ApiError> {
+    s.torrents.as_ref().ok_or(ApiError::NotFound)
+}
+
+fn torrent_error(e: TorrentError) -> ApiError {
+    match e {
+        TorrentError::NotFound(_) => ApiError::NotFound,
+        other => ApiError::Remote(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    }
+}
+
+pub async fn list_torrents(State(s): State<Arc<AppState>>, p: Principal) -> Result<Json<Vec<TorrentDto>>, ApiError> {
+    require_admin(&p)?;
+    let rows = engine(&s)?.list().iter().map(TorrentDto::from_status).collect();
+    Ok(Json(rows))
+}
+
+#[derive(Deserialize)]
+pub struct MagnetReq {
+    pub magnet: String,
+}
+
+/// Add a magnet link. Its file list must come from peers first, so the call
+/// waits briefly: `201` with the id if it arrived, `202` with `pending` if not.
+/// The transfer then appears in the list by itself.
+pub async fn add_magnet(State(s): State<Arc<AppState>>, p: Principal, Json(req): Json<MagnetReq>) -> Result<Response, ApiError> {
+    require_admin(&p)?;
+    let engine = engine(&s)?;
+    let magnet = req.magnet.trim();
+    if !magnet.starts_with("magnet:?") || magnet.len() > MAX_MAGNET {
+        return Err(ApiError::BadRequest("paste a magnet link that starts with magnet:?".into()));
+    }
+    match engine.add_magnet(magnet, false, METADATA_WAIT).await {
+        Ok(id) => Ok((StatusCode::CREATED, Json(json!({ "id": id }))).into_response()),
+        Err(TorrentError::MetadataPending) => Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({ "pending": true, "error": TorrentError::MetadataPending.to_string() })),
+        )
+            .into_response()),
+        Err(e) => Err(ApiError::BadRequest(e.to_string())),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct TorrentFileQuery {
+    /// Comma-separated `host:port` peers to contact directly. Trackers are off,
+    /// so a file torrent with no peers given finds none.
+    pub peers: Option<String>,
+}
+
+/// Add a `.torrent` file. The body is the raw file.
+pub async fn add_torrent_file(
+    State(s): State<Arc<AppState>>,
+    p: Principal,
+    Query(q): Query<TorrentFileQuery>,
+    body: Bytes,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    require_admin(&p)?;
+    let engine = engine(&s)?;
+    // A metainfo file is a bencoded dictionary.
+    if body.first() != Some(&b'd') {
+        return Err(ApiError::BadRequest("that is not a .torrent file".into()));
+    }
+    let peers = parse_peers(q.peers.as_deref())?;
+    let id = engine.add_torrent_bytes(body.to_vec(), false, peers).await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok((StatusCode::CREATED, Json(json!({ "id": id }))))
+}
+
+fn parse_peers(raw: Option<&str>) -> Result<Vec<SocketAddr>, ApiError> {
+    let Some(raw) = raw.filter(|r| !r.trim().is_empty()) else { return Ok(vec![]) };
+    let peers: Vec<SocketAddr> = raw
+        .split(',')
+        .map(|p| p.trim().parse().map_err(|_| ApiError::BadRequest(format!("not a host:port address: {}", p.trim()))))
+        .collect::<Result<_, _>>()?;
+    if peers.len() > MAX_PEERS {
+        return Err(ApiError::BadRequest(format!("give at most {MAX_PEERS} peers")));
+    }
+    Ok(peers)
+}
+
+pub async fn pause_torrent(State(s): State<Arc<AppState>>, p: Principal, Path(id): Path<usize>) -> Result<StatusCode, ApiError> {
+    require_admin(&p)?;
+    engine(&s)?.pause(id).await.map_err(torrent_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn resume_torrent(State(s): State<Arc<AppState>>, p: Principal, Path(id): Path<usize>) -> Result<StatusCode, ApiError> {
+    require_admin(&p)?;
+    engine(&s)?.resume(id).await.map_err(torrent_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+pub struct RemoveTorrentQuery {
+    /// Also delete the downloaded data. Off unless asked for.
+    #[serde(default)]
+    pub delete_files: bool,
+}
+
+pub async fn remove_torrent(
+    State(s): State<Arc<AppState>>,
+    p: Principal,
+    Path(id): Path<usize>,
+    Query(q): Query<RemoveTorrentQuery>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&p)?;
+    engine(&s)?.remove(id, q.delete_files).await.map_err(torrent_error)?;
     Ok(StatusCode::NO_CONTENT)
 }

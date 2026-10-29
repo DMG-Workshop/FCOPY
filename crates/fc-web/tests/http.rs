@@ -39,6 +39,7 @@ async fn setup() -> App {
             hash_cost: HashCost { m_kib: 256, t: 1, p: 1 },
             state_dir: None,
             certificate_fingerprint: None,
+            torrents: None,
         },
     )
     .unwrap();

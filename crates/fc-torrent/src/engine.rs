@@ -82,10 +82,32 @@ pub struct TorrentStatus {
     pub error: Option<String>,
 }
 
+/// The one word a UI shows for a transfer's situation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TorrentPhase {
+    /// Checking the data already on disk against the torrent.
+    Checking,
+    Downloading,
+    /// Every piece is here; the transfer keeps uploading until it is removed.
+    Seeding,
+    Paused,
+    Failed,
+}
+
 impl TorrentStatus {
     /// 0.0 to 100.0.
     pub fn percent(&self) -> f64 {
         if self.total_bytes == 0 { 0.0 } else { self.progress_bytes as f64 * 100.0 / self.total_bytes as f64 }
+    }
+
+    pub fn phase(&self) -> TorrentPhase {
+        match self.state {
+            TorrentState::Initializing => TorrentPhase::Checking,
+            TorrentState::Paused => TorrentPhase::Paused,
+            TorrentState::Error => TorrentPhase::Failed,
+            TorrentState::Live if self.finished => TorrentPhase::Seeding,
+            TorrentState::Live => TorrentPhase::Downloading,
+        }
     }
 }
 

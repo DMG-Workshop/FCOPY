@@ -1558,6 +1558,7 @@ dependencies = [
  "base64 0.23.1",
  "fc-engine",
  "fc-remote",
+ "fc-torrent",
  "rustls",
  "serde",
  "serde_json",

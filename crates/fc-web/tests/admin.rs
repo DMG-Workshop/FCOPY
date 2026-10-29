@@ -65,6 +65,7 @@ async fn env() -> Env {
             hash_cost: HashCost { m_kib: 256, t: 1, p: 1 },
             state_dir: Some(state_dir.path().to_path_buf()),
             certificate_fingerprint: None,
+            torrents: None,
         },
     )
     .unwrap();

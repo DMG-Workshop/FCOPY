@@ -58,6 +58,14 @@ const STATE_LABELS = {
 
 const STATUS_LABELS = { online: 'online', offline: 'offline', identity_changed: 'identity changed' };
 
+const TORRENT_PHASE_LABELS = {
+  checking: 'Checking',
+  downloading: 'Downloading',
+  seeding: 'Seeding',
+  paused: 'Paused',
+  failed: 'Failed',
+};
+
 const FILTERS = [
   { id: 'all', label: 'All items' },
   { id: 'running', label: 'Copying' },
@@ -106,9 +114,19 @@ function fcopy() {
     pairNotice: '',
     clientTimer: null,
 
+    // BitTorrent (admins only; rows arrive in the telemetry frames)
+    torrentsEnabled: false,
+    torrents: [],
+    torrentForm: { magnet: '', peers: '', file: null },
+    torrentNotice: '',
+
     async start() {
       const info = await fetch("/api/info", { credentials: "same-origin" });
-      if (info.ok) this.certificate = (await info.json()).certificate;
+      if (info.ok) {
+        const body = await info.json();
+        this.certificate = body.certificate;
+        this.torrentsEnabled = body.torrents;
+      }
       const r = await this.api('GET', '/api/me');
       if (r.ok) {
         this.user = await r.json();
@@ -160,6 +178,7 @@ function fcopy() {
       this.jobs = {};
       this.logs = [];
       this.selected = {};
+      this.torrents = [];
     },
 
     // ---------- live queue ----------
@@ -206,6 +225,77 @@ function fcopy() {
       if (frame.logs && frame.logs.length) {
         this.logs = [...frame.logs.reverse(), ...this.logs].slice(0, LOG_LIMIT);
       }
+      // The whole list arrives whenever it changes; absent means unchanged.
+      if (frame.torrents) this.torrents = frame.torrents;
+    },
+
+    // ---------- BitTorrent ----------
+
+    torrentPhaseLabel(phase) {
+      return TORRENT_PHASE_LABELS[phase] || phase;
+    },
+
+    torrentPhaseClass(phase) {
+      if (phase === 'failed') return 'text-bad';
+      if (phase === 'seeding') return 'text-ok';
+      if (phase === 'downloading') return 'text-brand-light';
+      if (phase === 'paused') return 'text-warn';
+      return 'text-dim';
+    },
+
+    async torrentAct(t, verb) {
+      const r = await this.api('POST', `/api/torrents/${t.id}/${verb}`);
+      if (!r.ok) this.notify(await errorText(r));
+    },
+
+    async removeTorrent(t, deleteFiles) {
+      const msg = deleteFiles
+        ? `Remove ${t.name} and delete its downloaded files? This cannot be undone.`
+        : `Remove ${t.name}? It stops; the downloaded files stay on disk.`;
+      if (!window.confirm(msg)) return;
+      const r = await this.api('DELETE', `/api/torrents/${t.id}?delete_files=${deleteFiles}`);
+      if (!r.ok) this.notify(await errorText(r));
+    },
+
+    async addTorrent() {
+      this.torrentNotice = '';
+      const magnet = this.torrentForm.magnet.trim();
+      const file = this.torrentForm.file;
+      let r;
+      if (magnet) {
+        r = await this.api('POST', '/api/torrents/magnet', { magnet });
+      } else if (file) {
+        const peers = this.torrentForm.peers.trim();
+        const query = peers ? `?peers=${encodeURIComponent(peers)}` : '';
+        // The body is the raw file, not JSON.
+        r = await fetch(`/api/torrents/file${query}`, {
+          method: 'POST',
+          headers: { ...CSRF_HEADERS, 'Content-Type': 'application/x-bittorrent' },
+          body: file,
+          credentials: 'same-origin',
+        });
+      } else {
+        this.torrentNotice = 'Paste a magnet link or choose a .torrent file.';
+        return;
+      }
+
+      if (r.status === 201) {
+        this.resetTorrentForm();
+        this.closeModal();
+      } else if (r.status === 202) {
+        // A magnet link is still waiting for its file list from peers; it
+        // appears in the list by itself, so say so where it can be seen.
+        this.resetTorrentForm();
+        this.closeModal();
+        this.notify('Magnet link added. It appears in the list once peers send its file list.');
+      } else {
+        this.torrentNotice = await errorText(r);
+      }
+    },
+
+    resetTorrentForm() {
+      this.torrentForm = { magnet: '', peers: '', file: null };
+      if (this.$refs.torrentFile) this.$refs.torrentFile.value = '';
     },
 
     allJobs() {
@@ -327,6 +417,7 @@ function fcopy() {
         this.pairNotice = '';
         this.pairForm.confirm = null;
       }
+      if (name === 'torrent') this.torrentNotice = '';
     },
 
     closeModal() {

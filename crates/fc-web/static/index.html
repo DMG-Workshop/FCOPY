@@ -45,7 +45,7 @@
       <nav class="flex gap-1 border border-line bg-base p-0.5" role="tablist" aria-label="Mode">
         <button role="tab" :aria-selected="mode === 'local'" class="mode-btn" :class="mode === 'local' && 'mode-on'" @click="mode = 'local'">Local copy</button>
         <button role="tab" x-show="isAdmin()" :aria-selected="mode === 'remote'" class="mode-btn" :class="mode === 'remote' && 'mode-on'" @click="setMode('remote')">Remote node</button>
-        <button role="tab" disabled aria-disabled="true" title="BitTorrent engine not built yet" class="mode-btn cursor-not-allowed opacity-40">BitTorrent <span class="text-[10px]">(not built yet)</span></button>
+        <button role="tab" x-show="isAdmin()" :disabled="!torrentsEnabled" :aria-selected="mode === 'torrent'" :title="torrentsEnabled ? '' : 'BitTorrent is not enabled on this console'" class="mode-btn" :class="{ 'mode-on': mode === 'torrent', 'cursor-not-allowed opacity-40': !torrentsEnabled }" @click="setMode('torrent')">BitTorrent<span x-show="!torrentsEnabled" class="text-[10px]"> (off)</span></button>
       </nav>
     </div>
 
@@ -85,6 +85,10 @@
         <div class="flex flex-wrap items-center gap-2" x-show="mode === 'remote'">
           <span class="font-mono text-[11px] text-dim">Paired PCs</span>
           <button class="btn-ghost h-7 px-2.5" @click="openModal('pair')">Pair a PC</button>
+        </div>
+        <div class="flex flex-wrap items-center gap-2" x-show="mode === 'torrent'" x-cloak>
+          <span class="font-mono text-[11px] text-dim">Downloads and seeds on this machine</span>
+          <button class="btn-ghost h-7 px-2.5" @click="openModal('torrent')">Add magnet or file</button>
         </div>
         <input x-show="mode === 'local'" x-model="search" placeholder="Search name or path" aria-label="Search transfers"
                class="field h-7 w-full font-mono sm:w-56">
@@ -164,6 +168,58 @@
             </div>
           </article>
         </template>
+      </div>
+
+      <!-- BitTorrent (admin only) -->
+      <div x-show="mode === 'torrent'" x-cloak class="min-h-0 flex-1 overflow-auto">
+        <table class="w-full table-fixed border-collapse text-left">
+          <thead class="sticky top-0 z-10 hidden border-b border-line bg-panel font-mono text-[11px] text-dim md:table-header-group">
+            <tr>
+              <th class="p-2">Name</th>
+              <th class="w-40 p-2 lg:w-52">Progress</th>
+              <th class="w-28 p-2 lg:w-36">Status</th>
+              <th class="w-28 p-2 text-right">Down / up</th>
+              <th class="hidden w-20 p-2 text-right lg:table-cell">Peers</th>
+              <th class="w-40 p-2 text-center">Actions</th>
+            </tr>
+          </thead>
+          <tbody class="font-mono">
+            <template x-for="t in torrents" :key="t.id">
+              <tr class="row block border-b border-line/60 px-3 py-2 md:table-row md:p-0">
+                <td class="block p-0 md:table-cell md:p-2">
+                  <div class="truncate font-sans text-[13px] font-semibold text-strong" x-text="t.name"></div>
+                  <div class="truncate text-[10px] text-faint" x-text="t.info_hash"></div>
+                </td>
+                <td class="mt-2 block p-0 md:table-cell md:p-2">
+                  <div class="flex items-center gap-2">
+                    <div class="h-1.5 flex-1 overflow-hidden bg-raised" role="progressbar" :aria-valuenow="Math.round(t.percent)" aria-valuemin="0" aria-valuemax="100" :aria-label="t.name">
+                      <div class="h-full transition-[width] duration-200" :class="t.finished ? 'bg-ok' : 'bg-brand'" :style="`width:${t.percent}%`"></div>
+                    </div>
+                    <span class="w-10 text-right text-[10px] tabular-nums text-body" x-text="`${Math.round(t.percent)}%`"></span>
+                  </div>
+                </td>
+                <td class="block p-0 md:table-cell md:p-2">
+                  <div class="font-medium" :class="torrentPhaseClass(t.phase)" x-text="torrentPhaseLabel(t.phase)"></div>
+                  <div class="truncate text-[10px] text-bad" x-show="t.error" x-text="t.error"></div>
+                </td>
+                <td class="hidden p-2 text-right tabular-nums text-body md:table-cell">
+                  <div x-text="fmtRate(t.rate_bps)"></div>
+                  <div class="text-dim" x-text="fmtRate(t.upload_bps)"></div>
+                </td>
+                <td class="hidden p-2 text-right tabular-nums text-dim lg:table-cell" x-text="t.live_peers"></td>
+                <td class="block p-0 md:table-cell md:p-2">
+                  <div class="flex justify-end gap-1">
+                    <button x-show="t.phase !== 'paused' && t.phase !== 'failed'" class="btn-mini" @click="torrentAct(t, 'pause')">Pause</button>
+                    <button x-show="t.phase === 'paused'" class="btn-mini" @click="torrentAct(t, 'resume')">Resume</button>
+                    <button class="btn-mini hover:text-bad" @click="removeTorrent(t, false)">Remove</button>
+                    <button class="btn-mini hover:text-bad" title="Remove and delete the downloaded files" @click="removeTorrent(t, true)">Delete data</button>
+                  </div>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+        <p x-show="torrents.length === 0" class="px-4 py-10 text-center text-dim">No BitTorrent transfers. Add a magnet link or a .torrent file.</p>
       </div>
 
       <!-- Selection footer -->
@@ -315,6 +371,22 @@
         <p x-show="userNotice" x-text="userNotice" role="status" class="font-mono text-[11px] text-dim"></p>
       </div>
     </div>
+
+    <!-- Add BitTorrent: a magnet link, or a .torrent file -->
+    <form x-show="modal === 'torrent'" class="modal" @submit.prevent="addTorrent()" role="dialog" aria-modal="true" aria-label="Add BitTorrent transfer">
+      <header class="modal-head"><h3>Add BitTorrent transfer</h3><button type="button" class="btn-mini" @click="closeModal()">Close</button></header>
+      <div class="grid gap-3 p-4">
+        <label class="grid gap-1"><span class="text-[11px] text-dim">Magnet link</span>
+          <textarea rows="2" x-model="torrentForm.magnet" spellcheck="false" class="field font-mono" placeholder="magnet:?xt=urn:btih:…"></textarea></label>
+        <p class="text-center text-[11px] text-faint">or</p>
+        <label class="grid gap-1"><span class="text-[11px] text-dim">.torrent file</span>
+          <input type="file" accept=".torrent" x-ref="torrentFile" @change="torrentForm.file = $event.target.files[0] || null" class="field font-mono"></label>
+        <label class="grid gap-1"><span class="text-[11px] text-dim">Peers to contact, host:port separated by commas (needed for a .torrent file, since trackers are off)</span>
+          <input x-model="torrentForm.peers" spellcheck="false" class="field font-mono" placeholder="192.168.1.20:6881"></label>
+        <p x-show="torrentNotice" x-text="torrentNotice" role="status" class="font-mono text-[11px] text-dim"></p>
+      </div>
+      <footer class="modal-foot"><button type="button" class="btn-ghost h-8 px-3" @click="closeModal()">Cancel</button><button class="btn-primary h-8 px-4">Add transfer</button></footer>
+    </form>
 
     <!-- Pair a PC: step 1 finds the fingerprint, step 2 pins it -->
     <form x-show="modal === 'pair'" class="modal" @submit.prevent="pair()" role="dialog" aria-modal="true" aria-label="Pair a PC">

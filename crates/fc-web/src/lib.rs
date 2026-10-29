@@ -34,6 +34,7 @@ use tokio::sync::broadcast;
 
 use fc_engine::{Event, JobId, Queue};
 use fc_remote::access::LoginLimiter;
+use fc_torrent::TorrentEngine;
 use fc_remote::config::Limits;
 
 use auth::{ApiKeys, AuthError, HashCost, Principal, SessionStore, UserStore, SESSION_COOKIE};
@@ -58,6 +59,9 @@ pub struct AppState {
     pub cookie_secure: bool,
     /// The console certificate's fingerprint, shown on the sign-in page to compare by eye.
     pub certificate_fingerprint: Option<String>,
+    /// The BitTorrent lane. `None` when the console runs without one; the
+    /// torrent routes then answer 404 and the tab stays off.
+    pub torrents: Option<TorrentEngine>,
 }
 
 /// Settings for [`build`].
@@ -69,11 +73,20 @@ pub struct Config {
     /// Where paired clients are saved. `None` keeps them in memory.
     pub state_dir: Option<PathBuf>,
     pub certificate_fingerprint: Option<String>,
+    pub torrents: Option<TorrentEngine>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { roots: vec![], cookie_secure: true, session_ttl: Duration::from_secs(12 * 3600), hash_cost: HashCost::default(), state_dir: None, certificate_fingerprint: None }
+        Self {
+            roots: vec![],
+            cookie_secure: true,
+            session_ttl: Duration::from_secs(12 * 3600),
+            hash_cost: HashCost::default(),
+            state_dir: None,
+            certificate_fingerprint: None,
+            torrents: None,
+        }
     }
 }
 
@@ -108,6 +121,7 @@ pub fn build(queue: Queue, events: std::sync::mpsc::Receiver<Event>, config: Con
         clients: clients::ClientStore::open(config.state_dir.map(|d| d.join("clients.json")))?,
         cookie_secure: config.cookie_secure,
         certificate_fingerprint: config.certificate_fingerprint,
+        torrents: config.torrents,
     });
     telemetry::spawn_producer(state.clone(), events);
     Ok(state)
@@ -160,6 +174,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/settings", get(api::get_settings).put(api::put_settings))
         .route("/api/users", get(api::list_users).post(api::create_user))
         .route("/api/users/{name}", delete(api::delete_user))
+        .route("/api/torrents", get(api::list_torrents))
+        .route("/api/torrents/magnet", post(api::add_magnet))
+        .route(
+            "/api/torrents/file",
+            post(api::add_torrent_file).layer(axum::extract::DefaultBodyLimit::max(api::MAX_TORRENT_FILE)),
+        )
+        .route("/api/torrents/{id}", delete(api::remove_torrent))
+        .route("/api/torrents/{id}/pause", post(api::pause_torrent))
+        .route("/api/torrents/{id}/resume", post(api::resume_torrent))
         .route("/ws/telemetry", get(telemetry::ws_handler))
         .with_state(state)
 }

@@ -33,6 +33,7 @@ async fn console() -> (Arc<AppState>, SocketAddr, String) {
             hash_cost: HashCost { m_kib: 256, t: 1, p: 1 },
             state_dir: None,
             certificate_fingerprint: Some(fingerprint.clone()),
+            torrents: None,
         },
     )
     .unwrap();

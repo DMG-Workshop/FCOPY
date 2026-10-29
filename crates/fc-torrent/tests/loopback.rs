@@ -4,7 +4,7 @@
 use std::net::{SocketAddr, TcpListener};
 use std::time::{Duration, Instant};
 
-use fc_torrent::{EngineConfig, TorrentEngine, TorrentState};
+use fc_torrent::{EngineConfig, TorrentEngine, TorrentPhase, TorrentState};
 
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
@@ -50,13 +50,15 @@ async fn a_file_downloads_from_a_seed_on_loopback_and_matches() {
     let torrent = TorrentEngine::create_file_torrent(&source, Some("data.bin")).await.expect("create torrent");
 
     let seed_id = seed.add_torrent_bytes(torrent.clone(), false, vec![]).await.expect("add to seed");
-    wait_for(&seed, seed_id, 60, |s| s.finished).await;
+    let seeding = wait_for(&seed, seed_id, 60, |s| s.finished).await;
+    assert_eq!(seeding.phase(), TorrentPhase::Seeding);
 
     let leech = TorrentEngine::start(EngineConfig::new(leech_dir.path())).await.expect("leech engine");
     let peer: SocketAddr = format!("127.0.0.1:{seed_port}").parse().unwrap();
     let id = leech.add_torrent_bytes(torrent, false, vec![peer]).await.expect("add to leech");
     let done = wait_for(&leech, id, 90, |s| s.finished).await;
     assert_eq!(done.state, TorrentState::Live);
+    assert_eq!(done.phase(), TorrentPhase::Seeding);
     assert_eq!(done.percent(), 100.0);
 
     let got = std::fs::read(leech_dir.path().join("data.bin")).unwrap();
@@ -76,16 +78,44 @@ async fn pause_resume_and_remove_a_transfer() {
     let engine = TorrentEngine::start(EngineConfig::new(dir.path().join("out"))).await.unwrap();
     let id = engine.add_torrent_bytes(torrent, true, vec![]).await.unwrap();
     let s = wait_for(&engine, id, 30, |s| s.state == TorrentState::Paused).await;
-    assert_eq!(s.state, TorrentState::Paused);
+    assert_eq!(s.phase(), TorrentPhase::Paused);
 
     engine.resume(id).await.unwrap();
     engine.pause(id).await.unwrap();
-    assert_eq!(engine.status(id).unwrap().state, TorrentState::Paused);
+    assert_eq!(engine.status(id).unwrap().phase(), TorrentPhase::Paused);
 
     engine.remove(id, false).await.unwrap();
     assert!(engine.list().iter().all(|t| t.id != id));
     assert!(engine.status(id).is_err());
     engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remove_with_delete_files_deletes_the_download() {
+    let seed_dir = tempfile::tempdir().unwrap();
+    let leech_dir = tempfile::tempdir().unwrap();
+    let source = seed_dir.path().join("gone.bin");
+    std::fs::write(&source, data(256 * 1024)).unwrap();
+    let torrent = TorrentEngine::create_file_torrent(&source, Some("gone.bin")).await.unwrap();
+
+    let seed_port = free_port();
+    let seed = TorrentEngine::start(EngineConfig { listen_port: Some(seed_port), ..EngineConfig::new(seed_dir.path()) })
+        .await
+        .unwrap();
+    let seed_id = seed.add_torrent_bytes(torrent.clone(), false, vec![]).await.unwrap();
+    wait_for(&seed, seed_id, 60, |s| s.finished).await;
+
+    let leech = TorrentEngine::start(EngineConfig::new(leech_dir.path())).await.unwrap();
+    let peer: SocketAddr = format!("127.0.0.1:{seed_port}").parse().unwrap();
+    let id = leech.add_torrent_bytes(torrent, false, vec![peer]).await.unwrap();
+    wait_for(&leech, id, 90, |s| s.finished).await;
+    let copy = leech_dir.path().join("gone.bin");
+    assert!(copy.exists());
+
+    leech.remove(id, true).await.unwrap();
+    assert!(!copy.exists(), "remove with delete_files takes the data with it");
+    leech.shutdown().await;
+    seed.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

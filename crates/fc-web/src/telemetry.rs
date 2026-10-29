@@ -20,9 +20,65 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 
 use fc_engine::{Event, JobId, JobInfo, JobState};
+use fc_torrent::{TorrentEngine, TorrentPhase, TorrentStatus};
 
 use crate::AppState;
 use crate::auth::Principal;
+
+/// One BitTorrent transfer, as the console shows it. Admins only.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct TorrentDto {
+    pub id: usize,
+    /// The torrent's name, or its info hash until the name is known.
+    pub name: String,
+    pub info_hash: String,
+    /// `checking`, `downloading`, `seeding`, `paused`, or `failed`.
+    pub phase: &'static str,
+    pub finished: bool,
+    /// 0–100.
+    pub percent: f64,
+    pub progress_bytes: u64,
+    pub total_bytes: u64,
+    pub rate_bps: f64,
+    pub upload_bps: f64,
+    pub uploaded_bytes: u64,
+    pub live_peers: u32,
+    pub error: Option<String>,
+}
+
+const MIB: f64 = 1024.0 * 1024.0;
+
+impl TorrentDto {
+    pub fn from_status(s: &TorrentStatus) -> Self {
+        let phase = match s.phase() {
+            TorrentPhase::Checking => "checking",
+            TorrentPhase::Downloading => "downloading",
+            TorrentPhase::Seeding => "seeding",
+            TorrentPhase::Paused => "paused",
+            TorrentPhase::Failed => "failed",
+        };
+        Self {
+            id: s.id,
+            name: s.name.clone().unwrap_or_else(|| s.info_hash.clone()),
+            info_hash: s.info_hash.clone(),
+            phase,
+            finished: s.finished,
+            percent: s.percent(),
+            progress_bytes: s.progress_bytes,
+            total_bytes: s.total_bytes,
+            rate_bps: s.download_mbps * MIB,
+            upload_bps: s.upload_mbps * MIB,
+            uploaded_bytes: s.uploaded_bytes,
+            live_peers: s.live_peers,
+            error: s.error.clone(),
+        }
+    }
+}
+
+/// The torrent lane's rows, or nothing when it is not configured.
+fn torrent_rows(engine: &TorrentEngine) -> Vec<TorrentDto> {
+    engine.list().iter().map(TorrentDto::from_status).collect()
+}
 
 /// Frame interval: 10 Hz.
 pub const TICK: Duration = Duration::from_millis(100);
@@ -100,6 +156,10 @@ pub struct Frame {
     pub jobs: Vec<JobDto>,
     pub removed: Vec<JobId>,
     pub logs: Vec<LogLine>,
+    /// The whole torrent list, sent when it changed. `None` leaves the page's
+    /// list as it is. Only administrators ever receive it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub torrents: Option<Vec<TorrentDto>>,
 }
 
 /// Start the producer: a blocking thread drains the queue's (std) receiver
@@ -122,6 +182,8 @@ pub fn spawn_producer(state: Arc<AppState>, events: std::sync::mpsc::Receiver<Ev
         let mut dirty = BTreeSet::new();
         let mut removed = Vec::new();
         let mut logs = Vec::new();
+        // Torrent stats change without queue events, so the lane is compared each tick.
+        let mut last_torrents: Option<Vec<TorrentDto>> = None;
         loop {
             tokio::select! {
                 ev = rx.recv() => match ev {
@@ -129,10 +191,15 @@ pub fn spawn_producer(state: Arc<AppState>, events: std::sync::mpsc::Receiver<Ev
                     None => break,
                 },
                 _ = tick.tick() => {
-                    if dirty.is_empty() && removed.is_empty() && logs.is_empty() {
+                    let torrents = state.torrents.as_ref().map(torrent_rows).filter(|now| last_torrents.as_ref() != Some(now));
+                    if torrents.is_some() {
+                        last_torrents = torrents.clone();
+                    }
+                    if dirty.is_empty() && removed.is_empty() && logs.is_empty() && torrents.is_none() {
                         continue;
                     }
-                    let frame = build_frame(&state, &dirty, std::mem::take(&mut removed), std::mem::take(&mut logs));
+                    let mut frame = build_frame(&state, &dirty, std::mem::take(&mut removed), std::mem::take(&mut logs));
+                    frame.torrents = torrents;
                     dirty.clear();
                     // No subscribers is fine: nobody is watching.
                     let _ = state.telemetry.send(Arc::new(frame));
@@ -187,7 +254,7 @@ fn build_frame(state: &AppState, dirty: &BTreeSet<JobId>, removed: Vec<JobId>, l
             JobDto::from_info(&info, owner)
         })
         .collect();
-    Frame { jobs, removed, logs }
+    Frame { jobs, removed, logs, torrents: None }
 }
 
 /// What one user may see of a frame. Returns `None` if nothing is left.
@@ -195,10 +262,11 @@ pub fn visible(frame: &Frame, who: &Principal, owners: &BTreeMap<JobId, String>)
     let mine = |job: JobId| who.is_admin() || owners.get(&job).is_some_and(|o| *o == who.name);
     let jobs: Vec<JobDto> = frame.jobs.iter().filter(|j| mine(j.id)).cloned().collect();
     let logs: Vec<LogLine> = frame.logs.iter().filter(|l| mine(l.job)).cloned().collect();
-    if jobs.is_empty() && logs.is_empty() && frame.removed.is_empty() {
+    let torrents = if who.is_admin() { frame.torrents.clone() } else { None };
+    if jobs.is_empty() && logs.is_empty() && frame.removed.is_empty() && torrents.is_none() {
         return None;
     }
-    Some(Frame { jobs, removed: frame.removed.clone(), logs })
+    Some(Frame { jobs, removed: frame.removed.clone(), logs, torrents })
 }
 
 fn owners_snapshot(state: &AppState) -> BTreeMap<JobId, String> {
@@ -214,7 +282,8 @@ fn full_snapshot(state: &AppState, who: &Principal) -> Frame {
         .iter()
         .map(|info| JobDto::from_info(info, owners.get(&info.id).map(String::as_str)))
         .collect();
-    visible(&Frame { jobs, removed: vec![], logs: vec![] }, who, &owners).unwrap_or_default()
+    let torrents = state.torrents.as_ref().map(torrent_rows);
+    visible(&Frame { jobs, removed: vec![], logs: vec![], torrents }, who, &owners).unwrap_or_default()
 }
 
 pub async fn ws_handler(State(state): State<Arc<AppState>>, who: Principal, ws: WebSocketUpgrade) -> Response {
@@ -283,6 +352,7 @@ mod tests {
                 LogLine { job: 1, kind: "failed", message: "a".into() },
                 LogLine { job: 2, kind: "failed", message: "b".into() },
             ],
+            torrents: None,
         };
         let bob = Principal { name: "bob".into(), role: crate::auth::Role::User };
         let f = visible(&frame, &bob, &owners).unwrap();
@@ -296,9 +366,19 @@ mod tests {
     #[test]
     fn empty_frames_are_dropped_for_a_user_with_nothing_to_see() {
         let owners: BTreeMap<JobId, String> = [(1, "alice".into())].into();
-        let frame = Frame { jobs: vec![dto(1, "alice")], removed: vec![], logs: vec![] };
+        let frame = Frame { jobs: vec![dto(1, "alice")], removed: vec![], logs: vec![], torrents: None };
         let eve = Principal { name: "eve".into(), role: crate::auth::Role::User };
         assert!(visible(&frame, &eve, &owners).is_none());
+    }
+
+    #[test]
+    fn torrents_reach_administrators_only() {
+        let owners = BTreeMap::new();
+        let frame = Frame { torrents: Some(vec![]), ..Default::default() };
+        let bob = Principal { name: "bob".into(), role: crate::auth::Role::User };
+        assert!(visible(&frame, &bob, &owners).is_none(), "a torrent-only frame is nothing to a user");
+        let admin = Principal { name: "root".into(), role: crate::auth::Role::Admin };
+        assert_eq!(visible(&frame, &admin, &owners).unwrap().torrents, Some(vec![]));
     }
 
     #[test]

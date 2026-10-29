@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use fc_engine::{CopyOptions, Queue, QueueConfig};
 use fc_remote::tls::{Identity, https_server_config};
+use fc_torrent::{EngineConfig, TorrentEngine};
 use fc_web::auth::{HashCost, Role};
 use fc_web::https::TlsListener;
 use fc_web::{Config, build, router, serve};
@@ -31,16 +32,19 @@ async fn main() {
         options: CopyOptions::default(),
         ..Default::default()
     });
+    // BitTorrent downloads go to a folder of their own, below the share root.
+    let torrents = TorrentEngine::start(EngineConfig::new(root.join("BitTorrent"))).await.expect("torrent engine");
     let state = build(
         queue,
         events,
         Config {
-            roots: vec![root],
+            roots: vec![root.clone()],
             cookie_secure: !plain,
             session_ttl: Duration::from_secs(12 * 3600),
             hash_cost: HashCost::default(),
             state_dir: None,
             certificate_fingerprint: Some(fingerprint.clone()),
+            torrents: Some(torrents),
         },
     )
     .expect("start console");

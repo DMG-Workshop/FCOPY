@@ -16,6 +16,7 @@ crates/
   fc-gui/      `fcopy-gui` binary (egui 0.32): dashboard, queue, log drawer, decisions,
                desktop integration (--install-integration)
   fc-remote/   IN PROGRESS: QUIC (quinn) remote transfer, SCRAM-Argon2 auth
+  fc-torrent/  BitTorrent engine over librqbit; its own lane beside the copy queue
 packaging/     .desktop/servicemenu/nemo, PKGBUILD, deb/rpm metadata (in fc-gui/Cargo.toml),
                Windows manifest/.rc/.reg, macOS Info.plist + bundle README, icon
 docs/          PLATFORM.md (OS quirks guide), gui-screenshot.png
@@ -152,5 +153,10 @@ Done since the handoff, each with tests:
 Still open:
 - Windows service: verified on this PC (elevated): install, start, listening on UDP 47800, stop, uninstall. It writes no logs yet. End to end (packaging/windows/test-service.ps1): a file copied over QUIC into the running service matched byte for byte.
 - Pull (download) direction, not planned yet.
-- BitTorrent engine (web and desktop tabs are disabled and labelled).
+- BitTorrent (fc-torrent, librqbit 9): own lane, not the copy queue, since a torrent
+  holds the one-job worker until its download finishes. Web console: admin-only tab
+  with magnet and .torrent add (optional peer addresses), pause, resume, remove,
+  delete data; rows arrive in telemetry frames. Desktop tab still disabled.
+  Gaps: no persistence across restarts; a magnet has no row until its file list
+  arrives from peers; trackers and DHT off by default.
 - Public certificate for the web console; the self-signed one needs trusting once.
