@@ -12,6 +12,7 @@
 //! frames at 10 Hz and fans them out, so cost doesn't grow with browser count.
 
 pub mod api;
+pub mod clients;
 pub mod auth;
 pub mod telemetry;
 
@@ -52,6 +53,7 @@ pub struct AppState {
     /// Which account created each job.
     pub owners: RwLock<HashMap<JobId, String>>,
     pub telemetry: broadcast::Sender<Arc<telemetry::Frame>>,
+    pub clients: clients::ClientStore,
     pub cookie_secure: bool,
 }
 
@@ -61,11 +63,13 @@ pub struct Config {
     pub cookie_secure: bool,
     pub session_ttl: Duration,
     pub hash_cost: HashCost,
+    /// Where paired clients are saved. `None` keeps them in memory.
+    pub state_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { roots: vec![], cookie_secure: true, session_ttl: Duration::from_secs(12 * 3600), hash_cost: HashCost::default() }
+        Self { roots: vec![], cookie_secure: true, session_ttl: Duration::from_secs(12 * 3600), hash_cost: HashCost::default(), state_dir: None }
     }
 }
 
@@ -75,6 +79,8 @@ pub enum BuildError {
     Auth(#[from] AuthError),
     #[error("share root {0} does not exist or is not a directory")]
     BadRoot(PathBuf),
+    #[error(transparent)]
+    Store(#[from] clients::StoreError),
 }
 
 /// Create the shared state and start the telemetry producer. Must be called
@@ -95,6 +101,7 @@ pub fn build(queue: Queue, events: std::sync::mpsc::Receiver<Event>, config: Con
         roots,
         owners: RwLock::new(HashMap::new()),
         telemetry,
+        clients: clients::ClientStore::open(config.state_dir.map(|d| d.join("clients.json")))?,
         cookie_secure: config.cookie_secure,
     });
     telemetry::spawn_producer(state.clone(), events);
@@ -139,6 +146,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/transfers/{id}", delete(api::cancel_transfer))
         .route("/api/transfers/{id}/pause", post(api::pause_transfer))
         .route("/api/transfers/{id}/resume", post(api::resume_transfer))
+        .route("/api/queue/pause", post(api::pause_queue))
+        .route("/api/queue/resume", post(api::resume_queue))
+        .route("/api/clients", get(api::list_clients).post(api::pair_client))
+        .route("/api/clients/{id}", delete(api::unpair_client))
+        .route("/api/settings", get(api::get_settings).put(api::put_settings))
+        .route("/api/users", get(api::list_users).post(api::create_user))
+        .route("/api/users/{name}", delete(api::delete_user))
         .route("/ws/telemetry", get(telemetry::ws_handler))
         .with_state(state)
 }
@@ -181,6 +195,8 @@ pub enum ApiError {
     BadRequest(String),
     Conflict(String),
     LockedOut(Duration),
+    /// A call to a paired agent failed; the status says whether it was refused or unreachable.
+    Remote(StatusCode, String),
 }
 
 impl IntoResponse for ApiError {
@@ -191,6 +207,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
+            ApiError::Remote(status, m) => (*status, m.clone()),
             ApiError::LockedOut(wait) => (
                 StatusCode::TOO_MANY_REQUESTS,
                 format!("too many failed sign-ins; try again in {} s", wait.as_secs().max(1)),

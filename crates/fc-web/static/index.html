@@ -3,128 +3,320 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light dark">
   <title>fcopy</title>
   <link rel="stylesheet" href="/static/app.css">
   <script defer src="/static/alpine.min.js"></script>
   <script src="/static/app.js"></script>
 </head>
-<body class="min-h-dvh bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100" x-data="fcopy()" x-init="start()">
+<body class="flex h-dvh flex-col overflow-hidden bg-base font-sans text-xs text-body antialiased select-none" x-data="fcopy()" x-init="start()">
 
-<!-- ---------- Login ---------- -->
-<main x-show="!user" x-cloak class="mx-auto flex min-h-dvh max-w-sm flex-col justify-center px-4">
-  <h1 class="mb-6 text-2xl font-semibold">fcopy</h1>
-  <form class="space-y-4" @submit.prevent="login()">
-    <label class="block">
-      <span class="text-sm">Username</span>
-      <input name="user" x-model="form.user" autocomplete="username" required
-             class="mt-1 min-h-11 w-full rounded-lg border border-zinc-300 bg-white px-3 dark:border-zinc-700 dark:bg-zinc-900">
+<!-- ============ Sign in ============ -->
+<main x-show="!user" x-cloak class="mx-auto grid min-h-dvh w-full max-w-xs content-center gap-8 px-5">
+  <div>
+    <p class="font-mono text-[11px] tracking-[0.2em] text-dim uppercase">fcopy daemon</p>
+    <h1 class="mt-1 text-2xl font-semibold text-strong">Sign in</h1>
+  </div>
+  <form class="grid gap-4" @submit.prevent="login()">
+    <label class="grid gap-1.5">
+      <span class="text-[11px] text-dim">Account</span>
+      <input x-model="form.user" autocomplete="username" required class="field h-10 font-mono">
     </label>
-    <label class="block">
-      <span class="text-sm">Password</span>
-      <input name="password" type="password" x-model="form.password" autocomplete="current-password" required
-             class="mt-1 min-h-11 w-full rounded-lg border border-zinc-300 bg-white px-3 dark:border-zinc-700 dark:bg-zinc-900">
+    <label class="grid gap-1.5">
+      <span class="text-[11px] text-dim">Password</span>
+      <input type="password" x-model="form.password" autocomplete="current-password" required class="field h-10 font-mono">
     </label>
-    <p x-show="error" x-text="error" role="alert" class="text-sm text-red-600"></p>
-    <button type="submit" :disabled="busy"
-            class="min-h-11 w-full rounded-lg bg-emerald-600 font-medium text-white hover:bg-emerald-700 disabled:opacity-60">
-      Sign in
-    </button>
+    <p x-show="error" x-text="error" role="alert" class="text-bad"></p>
+    <button type="submit" :disabled="busy" class="btn-primary h-10">Sign in</button>
   </form>
 </main>
 
-<!-- ---------- Dashboard ---------- -->
-<div x-show="user" x-cloak class="mx-auto max-w-5xl px-4 pb-24 pt-4">
-  <header class="flex items-center justify-between gap-2">
-    <h1 class="text-xl font-semibold">fcopy</h1>
-    <div class="flex items-center gap-3 text-sm">
-      <span class="hidden sm:inline" x-text="user?.name"></span>
-      <span class="rounded-full px-2 py-0.5 text-xs"
-            :class="live ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900 dark:text-emerald-200' : 'bg-zinc-200 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300'"
-            x-text="live ? 'live' : 'reconnecting…'"></span>
-      <button class="min-h-11 rounded-lg border border-zinc-300 px-3 dark:border-zinc-700" @click="logout()">Sign out</button>
+<!-- ============ Workspace ============ -->
+<template x-if="user">
+<div class="flex h-dvh min-h-0 flex-col">
+
+  <!-- Top bar -->
+  <header class="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-line bg-panel px-3 py-1.5">
+    <div class="flex items-center gap-4">
+      <div class="flex items-center gap-2 border-r border-line pr-3">
+        <span class="size-2.5 rounded-sm bg-brand"></span>
+        <span class="font-mono text-sm font-bold tracking-tight text-strong">fcopy <span class="font-normal text-xs text-brand-light">daemon</span></span>
+      </div>
+      <nav class="flex gap-1 border border-line bg-base p-0.5" role="tablist" aria-label="Mode">
+        <button role="tab" :aria-selected="mode === 'local'" class="mode-btn" :class="mode === 'local' && 'mode-on'" @click="mode = 'local'">Local copy</button>
+        <button role="tab" x-show="isAdmin()" :aria-selected="mode === 'remote'" class="mode-btn" :class="mode === 'remote' && 'mode-on'" @click="setMode('remote')">Remote node</button>
+        <button role="tab" disabled title="Not built yet" class="mode-btn cursor-not-allowed opacity-40">BitTorrent</button>
+      </nav>
+    </div>
+
+    <div class="flex items-center gap-3 font-mono text-[11px]">
+      <div class="hidden items-center gap-3 border border-line bg-base px-2.5 py-1 lg:flex">
+        <span class="flex items-center gap-1 text-ok"><span class="size-1.5 rounded-full" :class="live ? 'bg-ok' : 'bg-faint'"></span> <span x-text="live ? 'connected' : 'reconnecting'"></span></span>
+        <span class="text-faint">|</span>
+        <span>Copy <strong class="tabular-nums text-brand-light" x-text="fmtRate(totalRate())"></strong></span>
+        <span class="text-faint">|</span>
+        <span class="text-dim" x-text="user.name"></span>
+      </div>
+      <div class="flex items-center gap-1.5">
+        <button class="btn-primary h-7 px-2.5" @click="openModal('add')">+ Add task</button>
+        <button class="btn-ghost h-7 px-2.5" @click="pauseAll()" x-show="!queuePaused">Pause all</button>
+        <button class="btn-ghost h-7 px-2.5" @click="resumeAll()" x-show="queuePaused">Resume all</button>
+        <button x-show="isAdmin()" class="btn-ghost h-7 px-2" title="Settings" aria-label="Settings" @click="openModal('settings')">Settings</button>
+        <button class="btn-ghost h-7 px-2" @click="signOut()">Sign out</button>
+      </div>
     </div>
   </header>
 
-  <!-- New transfer -->
-  <section class="mt-6 rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
-    <h2 class="mb-3 font-medium">New transfer</h2>
-    <form class="grid gap-3 md:grid-cols-2" @submit.prevent="create()">
-      <label class="md:col-span-2">
-        <span class="text-sm">Sources (one absolute path per line)</span>
-        <textarea rows="2" x-model="newJob.sources" required
-                  class="mt-1 w-full rounded-lg border border-zinc-300 bg-white p-2 font-mono text-sm dark:border-zinc-700 dark:bg-zinc-950"></textarea>
-      </label>
-      <label>
-        <span class="text-sm">Destination folder</span>
-        <input x-model="newJob.dest" required class="mt-1 min-h-11 w-full rounded-lg border border-zinc-300 bg-white px-3 font-mono text-sm dark:border-zinc-700 dark:bg-zinc-950">
-      </label>
-      <label>
-        <span class="text-sm">Label (optional)</span>
-        <input x-model="newJob.label" class="mt-1 min-h-11 w-full rounded-lg border border-zinc-300 bg-white px-3 dark:border-zinc-700 dark:bg-zinc-950">
-      </label>
-      <p x-show="notice" x-text="notice" role="status" class="text-sm md:col-span-2"></p>
-      <div class="md:col-span-2">
-        <button type="submit" class="min-h-11 rounded-lg bg-emerald-600 px-5 font-medium text-white hover:bg-emerald-700">Start copy</button>
+  <!-- Split panel -->
+  <main class="flex min-h-0 flex-1 flex-col overflow-y-auto lg:flex-row lg:overflow-hidden">
+
+    <!-- Left: queue or nodes -->
+    <section class="flex min-h-[60dvh] min-w-0 flex-1 flex-col border-line lg:min-h-0 lg:border-r">
+
+      <!-- Filters -->
+      <div class="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-line bg-panel px-3 py-1.5">
+        <div class="flex flex-wrap gap-1" x-show="mode === 'local'">
+          <template x-for="f in filters" :key="f.id">
+            <button class="chip" :class="filter === f.id && 'chip-on'" @click="filter = f.id">
+              <span x-text="f.label"></span> (<span class="tabular-nums" x-text="countFor(f.id)"></span>)
+            </button>
+          </template>
+        </div>
+        <div class="flex flex-wrap items-center gap-2" x-show="mode === 'remote'">
+          <span class="font-mono text-[11px] text-dim">Paired PCs</span>
+          <button class="btn-ghost h-7 px-2.5" @click="openModal('pair')">Pair a PC</button>
+        </div>
+        <input x-show="mode === 'local'" x-model="search" placeholder="Search name or path" aria-label="Search transfers"
+               class="field h-7 w-full font-mono sm:w-56">
       </div>
+
+      <!-- Local queue table -->
+      <div x-show="mode === 'local'" class="min-h-0 flex-1 overflow-auto">
+        <table class="w-full table-fixed border-collapse text-left">
+          <thead class="sticky top-0 z-10 hidden border-b border-line bg-panel font-mono text-[11px] text-dim md:table-header-group">
+            <tr>
+              <th class="w-8 p-2 text-center"><input type="checkbox" class="accent-brand" :checked="allSelected()" @change="toggleAll($event.target.checked)" aria-label="Select all"></th>
+              <th class="p-2">Name and path</th>
+              <th class="w-24 p-2 text-right">Size</th>
+              <th class="w-52 p-2">Progress</th>
+              <th class="w-36 p-2">Status</th>
+              <th class="w-32 p-2 text-right">Rate</th>
+              <th class="w-24 p-2 text-right">Files</th>
+              <th class="w-24 p-2 text-center">Actions</th>
+            </tr>
+          </thead>
+          <tbody class="font-mono">
+            <template x-for="job in visibleJobs()" :key="job.id">
+              <tr class="row block border-b border-line/60 px-3 py-2 md:table-row md:p-0">
+                <td class="hidden p-2 text-center md:table-cell"><input type="checkbox" class="accent-brand" :checked="!!selected[job.id]" @change="selected[job.id] = $event.target.checked" :aria-label="`Select ${job.label}`"></td>
+                <td class="block p-0 md:table-cell md:p-2">
+                  <div class="flex items-center gap-2">
+                    <span class="truncate font-sans text-[13px] font-semibold text-strong" x-text="job.label"></span>
+                  </div>
+                  <div class="truncate text-[10px] text-faint" x-text="job.current_file || job.owner || '—'"></div>
+                </td>
+                <td class="hidden p-2 text-right tabular-nums text-body md:table-cell" x-text="fmtBytes(job.bytes_total)"></td>
+                <td class="mt-2 block p-0 md:table-cell md:p-2">
+                  <div class="flex items-center gap-2">
+                    <div class="h-1.5 flex-1 overflow-hidden bg-raised" role="progressbar" :aria-valuenow="Math.round(job.percent)" aria-valuemin="0" aria-valuemax="100" :aria-label="job.label">
+                      <div class="h-full transition-[width] duration-200" :class="job.state === 'completed' ? 'bg-ok' : 'bg-brand'" :style="`width:${job.percent}%`"></div>
+                    </div>
+                    <span class="w-10 text-right text-[10px] tabular-nums text-body" x-text="`${Math.round(job.percent)}%`"></span>
+                  </div>
+                </td>
+                <td class="block p-0 md:table-cell md:p-2">
+                  <div class="font-medium" :class="stateClass(job.state)" x-text="stateLabel(job.state)"></div>
+                  <div class="text-[10px] text-faint" x-text="job.state === 'running' ? `ETA ${fmtEta(job.eta_secs)}` : ''"></div>
+                </td>
+                <td class="hidden p-2 text-right tabular-nums text-body md:table-cell" x-text="fmtRate(job.rate_bps)"></td>
+                <td class="hidden p-2 text-right tabular-nums text-dim md:table-cell" x-text="`${job.files_done}/${job.files_total}`"></td>
+                <td class="block p-0 md:table-cell md:p-2">
+                  <div class="flex justify-end gap-1">
+                    <button x-show="job.state === 'running'" class="btn-mini" @click="act(job, 'pause')">Pause</button>
+                    <button x-show="job.state === 'paused'" class="btn-mini" @click="act(job, 'resume')">Resume</button>
+                    <button x-show="isActive(job.state)" class="btn-mini hover:text-bad" @click="cancel(job)">Cancel</button>
+                    <button x-show="!isActive(job.state)" class="btn-mini" @click="cancel(job)">Remove</button>
+                  </div>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+        <p x-show="visibleJobs().length === 0" class="px-4 py-10 text-center text-dim">Nothing here.</p>
+      </div>
+
+      <!-- Remote nodes -->
+      <div x-show="mode === 'remote'" x-cloak class="min-h-0 flex-1 overflow-auto">
+        <p x-show="clients.length === 0" class="px-4 py-10 text-center text-dim">No PCs paired. Pair one to copy to it.</p>
+        <template x-for="c in clients" :key="c.id">
+          <article class="grid grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-1 border-b border-line/60 px-3 py-2.5">
+            <div class="min-w-0">
+              <p class="flex items-center gap-2 font-semibold text-strong">
+                <span class="size-2 rounded-full" :class="statusDot(c.status)" aria-hidden="true"></span>
+                <span x-text="c.name"></span>
+              </p>
+              <p class="truncate font-mono text-[11px] text-dim" x-text="c.target"></p>
+              <p class="truncate font-mono text-[10px] text-faint" x-text="c.fingerprint"></p>
+            </div>
+            <div class="flex flex-col items-end justify-between gap-2">
+              <span class="font-mono text-[11px]" :class="statusText(c.status)" x-text="statusLabel(c.status)"></span>
+              <button class="btn-mini hover:text-bad" @click="unpair(c)">Unpair</button>
+            </div>
+          </article>
+        </template>
+      </div>
+
+      <!-- Selection footer -->
+      <div x-show="mode === 'local'" class="flex shrink-0 items-center justify-between border-t border-line bg-panel px-3 py-1.5 font-mono text-[11px] text-dim">
+        <span>Selected: <strong class="text-brand-light" x-text="selectedIds().length"></strong></span>
+        <span>Total: <strong class="text-body" x-text="fmtBytes(totalBytes())"></strong></span>
+      </div>
+    </section>
+
+    <!-- Right: monitor and engine -->
+    <aside class="flex min-h-0 w-full shrink-0 flex-col divide-y divide-line overflow-y-auto bg-panel lg:w-96">
+
+      <div class="p-3">
+        <div class="mb-2 flex items-center justify-between">
+          <h2 class="font-mono text-xs font-bold tracking-wider text-strong uppercase">Performance</h2>
+          <span class="border border-ok/40 bg-ok/10 px-1.5 py-0.5 font-mono text-[10px] text-ok">live</span>
+        </div>
+        <div class="relative mb-2 border border-line bg-base p-2">
+          <div class="mb-1 flex justify-between font-mono text-[10px] text-dim">
+            <span class="text-brand-light">Copy throughput</span>
+            <span x-text="fmtRate(totalRate())"></span>
+          </div>
+          <svg class="h-24 w-full overflow-visible" viewBox="0 0 300 80" preserveAspectRatio="none" aria-hidden="true">
+            <line x1="0" y1="20" x2="300" y2="20" stroke="#262a36" stroke-dasharray="2,2"/>
+            <line x1="0" y1="40" x2="300" y2="40" stroke="#262a36" stroke-dasharray="2,2"/>
+            <line x1="0" y1="60" x2="300" y2="60" stroke="#262a36" stroke-dasharray="2,2"/>
+            <path :d="graphPath()" fill="none" stroke="#ea580c" stroke-width="1.5"/>
+          </svg>
+        </div>
+        <div class="grid grid-cols-2 gap-1.5 font-mono text-[11px]">
+          <div class="tile"><div class="tile-k">Throughput</div><div class="tile-v text-brand-light" x-text="fmtRate(totalRate())"></div></div>
+          <div class="tile"><div class="tile-k">Active jobs</div><div class="tile-v" x-text="activeCount()"></div></div>
+          <div class="tile"><div class="tile-k">Done today</div><div class="tile-v text-ok" x-text="doneCount()"></div></div>
+          <div class="tile"><div class="tile-k">Errors</div><div class="tile-v" :class="logs.length ? 'text-warn' : ''" x-text="logs.length"></div></div>
+        </div>
+      </div>
+
+      <div class="grid content-start gap-3 p-3">
+        <h2 class="font-mono text-xs font-bold tracking-wider text-strong uppercase">Engine</h2>
+
+        <div>
+          <div class="mb-1 flex justify-between font-mono text-[11px]">
+            <label for="speed" class="text-dim">Global bandwidth cap</label>
+            <span class="font-bold text-brand-light" x-text="limitLabel()"></span>
+          </div>
+          <input id="speed" type="range" min="0" max="1024" step="8" x-model.number="settingsForm.limitMiB"
+                 :disabled="!isAdmin()" @change="saveSettings()" class="w-full">
+          <div class="mt-0.5 flex justify-between font-mono text-[9px] text-faint"><span>0</span><span>512 MiB/s</span><span>Unlimited</span></div>
+        </div>
+
+        <div>
+          <span class="mb-1 block font-mono text-[11px] text-dim">When a file fails</span>
+          <div class="grid grid-cols-2 gap-px border border-line bg-line">
+            <button class="seg" :class="settingsForm.policy === 'retry' && 'seg-on'" :disabled="!isAdmin()" @click="settingsForm.policy = 'retry'; saveSettings()">Retry</button>
+            <button class="seg" :class="settingsForm.policy === 'skip' && 'seg-on'" :disabled="!isAdmin()" @click="settingsForm.policy = 'skip'; saveSettings()">Skip</button>
+          </div>
+        </div>
+
+        <div>
+          <label class="mb-1 block font-mono text-[11px] text-dim" for="integrity">Integrity check</label>
+          <select id="integrity" class="field h-8 w-full font-mono" disabled title="Not wired yet">
+            <option>Read-back, xxHash3</option>
+          </select>
+        </div>
+
+        <div class="grid gap-2 border-t border-line pt-3">
+          <label class="flex items-center gap-2 text-body"><input type="checkbox" checked disabled class="accent-brand"> Resume interrupted copies</label>
+          <label class="flex items-center gap-2 text-faint"><input type="checkbox" disabled class="accent-brand"> Delete source after verify <span class="text-[10px]">(not yet)</span></label>
+          <label class="flex items-center gap-2 text-faint"><input type="checkbox" disabled class="accent-brand"> Keep timestamps <span class="text-[10px]">(not yet)</span></label>
+        </div>
+        <p x-show="settingsNotice" x-text="settingsNotice" role="status" class="font-mono text-[11px] text-dim"></p>
+      </div>
+    </aside>
+  </main>
+
+  <!-- Log console -->
+  <section x-show="logOpen" x-cloak class="max-h-48 shrink-0 overflow-auto border-t border-line bg-base px-3 py-2 font-mono text-[11px]">
+    <p x-show="logs.length === 0" class="text-faint">No errors or skipped files.</p>
+    <template x-for="(line, i) in logs" :key="i">
+      <p :class="line.kind === 'skipped' ? 'text-warn' : 'text-bad'" x-text="`${line.kind}  job ${line.job}  ${line.message}`"></p>
+    </template>
+  </section>
+
+  <!-- Footer -->
+  <footer class="flex shrink-0 items-center justify-between gap-3 border-t border-line bg-panel px-3 py-1 font-mono text-[11px] text-dim">
+    <span class="truncate">Engine: <strong class="text-body">Tokio + copy engine</strong> &nbsp;|&nbsp; Console: <strong class="text-body" x-text="location.host"></strong></span>
+    <button class="text-brand hover:underline" @click="logOpen = !logOpen" x-text="logOpen ? 'Hide log' : 'Log console'"></button>
+  </footer>
+
+  <!-- ============ Modals ============ -->
+  <div x-show="modal" x-cloak class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/70 p-4 md:items-center" @keydown.escape.window="closeModal()">
+
+    <!-- Add task -->
+    <form x-show="modal === 'add'" class="modal" @submit.prevent="create()" role="dialog" aria-modal="true" aria-label="Add transfer task">
+      <header class="modal-head"><h3>Add transfer task</h3><button type="button" class="btn-mini" @click="closeModal()">Close</button></header>
+      <div class="grid gap-3 p-4">
+        <label class="grid gap-1"><span class="text-[11px] text-dim">Sources, one absolute path per line</span>
+          <textarea rows="3" x-model="addForm.sources" required spellcheck="false" class="field font-mono"></textarea></label>
+        <label class="grid gap-1"><span class="text-[11px] text-dim">Destination folder</span>
+          <input x-model="addForm.dest" required spellcheck="false" class="field font-mono"></label>
+        <div class="grid grid-cols-2 gap-2">
+          <label class="grid gap-1"><span class="text-[11px] text-dim">Mode</span>
+            <select class="field font-mono" disabled><option>Local filesystem copy</option></select></label>
+          <label class="grid gap-1"><span class="text-[11px] text-dim">Label</span>
+            <input x-model="addForm.label" class="field"></label>
+        </div>
+        <p x-show="addNotice" x-text="addNotice" role="status" class="font-mono text-[11px] text-dim"></p>
+      </div>
+      <footer class="modal-foot"><button type="button" class="btn-ghost h-8 px-3" @click="closeModal()">Cancel</button><button class="btn-primary h-8 px-4">Queue transfer</button></footer>
     </form>
-  </section>
 
-  <!-- Active transfers -->
-  <section class="mt-6">
-    <h2 class="mb-3 font-medium">Transfers</h2>
-    <p x-show="jobList().length === 0" class="text-sm text-zinc-500">No transfers yet.</p>
-    <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
-      <template x-for="job in jobList()" :key="job.id">
-        <article class="min-w-0 rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
-          <header class="flex items-start justify-between gap-2">
-            <h3 class="truncate font-medium" x-text="job.label"></h3>
-            <span class="shrink-0 rounded-full bg-zinc-100 px-2 py-0.5 text-xs dark:bg-zinc-800" x-text="stateLabel(job.state)"></span>
-          </header>
-          <p class="mt-1 truncate font-mono text-xs text-zinc-500" x-text="job.current_file || ' '"></p>
-
-          <div class="mt-3 h-2 overflow-hidden rounded bg-zinc-200 dark:bg-zinc-800"
-               role="progressbar" :aria-valuenow="Math.round(job.percent)" aria-valuemin="0" aria-valuemax="100"
-               :aria-label="job.label">
-            <div class="h-2 bg-emerald-500 transition-[width] duration-200" :style="`width:${job.percent}%`"></div>
-          </div>
-
-          <div class="mt-2 flex flex-wrap justify-between gap-x-4 text-sm">
-            <span x-text="`${Math.round(job.percent)}%`"></span>
-            <span x-text="fmtRate(job.rate_bps)"></span>
-            <span x-text="`ETA ${fmtEta(job.eta_secs)}`"></span>
-            <span class="text-zinc-500" x-text="`${job.files_done}/${job.files_total} files`"></span>
-          </div>
-
-          <canvas class="mt-2 h-10 w-full" width="300" height="40" :data-job="job.id" aria-hidden="true"></canvas>
-
-          <div class="mt-3 flex gap-2">
-            <button x-show="job.state === 'running'" class="min-h-11 flex-1 rounded-lg border border-zinc-300 dark:border-zinc-700"
-                    @click="act(job, 'pause')">Pause</button>
-            <button x-show="job.state === 'paused'" class="min-h-11 flex-1 rounded-lg border border-zinc-300 dark:border-zinc-700"
-                    @click="act(job, 'resume')">Resume</button>
-            <button x-show="job.state === 'pending' || job.state === 'running' || job.state === 'paused'"
-                    class="min-h-11 flex-1 rounded-lg border border-red-300 text-red-700 dark:border-red-900 dark:text-red-300"
-                    @click="cancel(job)">Cancel</button>
-            <button x-show="!['pending','running','paused'].includes(job.state)"
-                    class="min-h-11 flex-1 rounded-lg border border-zinc-300 dark:border-zinc-700"
-                    @click="cancel(job)">Remove</button>
-          </div>
-        </article>
-      </template>
+    <!-- Settings: accounts -->
+    <div x-show="modal === 'settings'" class="modal" role="dialog" aria-modal="true" aria-label="Accounts">
+      <header class="modal-head"><h3>Accounts</h3><button class="btn-mini" @click="closeModal()">Close</button></header>
+      <div class="grid gap-3 p-4">
+        <div class="border border-line">
+          <template x-for="u in users" :key="u.name">
+            <div class="flex items-center justify-between border-b border-line/60 px-3 py-2 last:border-b-0">
+              <span class="font-mono text-body" x-text="u.name"></span>
+              <span class="flex items-center gap-3">
+                <span class="font-mono text-[10px] text-faint uppercase" x-text="u.role"></span>
+                <button x-show="u.name !== user.name" class="btn-mini hover:text-bad" @click="removeUser(u)">Remove</button>
+              </span>
+            </div>
+          </template>
+        </div>
+        <form class="grid gap-2 md:grid-cols-[1fr_1fr_auto_auto] md:items-end" @submit.prevent="addUser()">
+          <label class="grid gap-1"><span class="text-[11px] text-dim">Name</span><input x-model="userForm.name" required pattern="[A-Za-z0-9._-]{1,64}" class="field font-mono"></label>
+          <label class="grid gap-1"><span class="text-[11px] text-dim">Password, 8+ characters</span><input type="password" x-model="userForm.password" required minlength="8" autocomplete="new-password" class="field font-mono"></label>
+          <label class="grid gap-1"><span class="sr-only">Role</span><select x-model="userForm.role" class="field h-8 font-mono"><option value="user">user</option><option value="admin">admin</option></select></label>
+          <button class="btn-primary h-8 px-4">Add</button>
+        </form>
+        <p x-show="userNotice" x-text="userNotice" role="status" class="font-mono text-[11px] text-dim"></p>
+      </div>
     </div>
-  </section>
 
-  <!-- Errors and skipped files -->
-  <details class="mt-6 rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
-    <summary class="min-h-11 cursor-pointer font-medium">Errors and skipped files (<span x-text="logs.length"></span>)</summary>
-    <ul class="mt-3 max-h-64 space-y-1 overflow-auto font-mono text-xs">
-      <template x-for="(line, i) in logs" :key="i">
-        <li :class="line.kind === 'skipped' ? 'text-amber-700 dark:text-amber-300' : 'text-red-700 dark:text-red-300'"
-            x-text="`[${line.kind}] job ${line.job}: ${line.message}`"></li>
-      </template>
-    </ul>
-  </details>
+    <!-- Pair a PC: step 1 finds the fingerprint, step 2 pins it -->
+    <form x-show="modal === 'pair'" class="modal" @submit.prevent="pair()" role="dialog" aria-modal="true" aria-label="Pair a PC">
+      <header class="modal-head"><h3>Pair a PC</h3><button type="button" class="btn-mini" @click="closeModal()">Close</button></header>
+      <div class="grid gap-3 p-4">
+        <label class="grid gap-1"><span class="text-[11px] text-dim">Name</span><input x-model="pairForm.name" required class="field"></label>
+        <label class="grid gap-1"><span class="text-[11px] text-dim">Target, for example alice@nas:/backup</span><input x-model="pairForm.target" required spellcheck="false" class="field font-mono"></label>
+        <label class="grid gap-1"><span class="text-[11px] text-dim">Password or access key, used once and not stored</span><input type="password" x-model="pairForm.password" autocomplete="off" class="field font-mono"></label>
+        <div x-show="pairForm.confirm" x-cloak class="grid gap-2 border border-warn p-3">
+          <p class="text-warn">Check this fingerprint on the other PC before you continue.</p>
+          <p class="break-all font-mono text-[11px] text-body" x-text="pairForm.confirm"></p>
+          <button type="button" class="btn-primary h-9" @click="pair(pairForm.confirm)">It matches, pair</button>
+        </div>
+        <p x-show="pairNotice" x-text="pairNotice" role="status" class="font-mono text-[11px] text-dim"></p>
+      </div>
+      <footer class="modal-foot" x-show="!pairForm.confirm"><button type="button" class="btn-ghost h-8 px-3" @click="closeModal()">Cancel</button><button class="btn-primary h-8 px-4">Find PC</button></footer>
+    </form>
+  </div>
 </div>
+</template>
 </body>
 </html>

@@ -167,6 +167,23 @@ impl UserStore {
         account.filter(|_| ok)
     }
 
+    /// All accounts, sorted by name, without password hashes.
+    pub fn list(&self) -> Vec<(String, Role)> {
+        let mut out: Vec<(String, Role)> = self
+            .accounts
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(|a| (a.name.clone(), a.role))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    pub fn remove(&self, name: &str) -> bool {
+        self.accounts.write().unwrap_or_else(|e| e.into_inner()).remove(name).is_some()
+    }
+
     pub fn len(&self) -> usize {
         self.accounts.read().unwrap_or_else(|e| e.into_inner()).len()
     }
@@ -212,6 +229,11 @@ impl SessionStore {
         let sessions = self.sessions.read().unwrap_or_else(|e| e.into_inner());
         let entry = sessions.get(&key)?;
         (entry.expires > Instant::now()).then(|| entry.principal.clone())
+    }
+
+    /// End every session of `name` (used when an account is deleted).
+    pub fn revoke_user(&self, name: &str) {
+        self.sessions.write().unwrap_or_else(|e| e.into_inner()).retain(|_, s| s.principal.name != name);
     }
 
     pub fn revoke(&self, token: &str) {

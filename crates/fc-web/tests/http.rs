@@ -37,6 +37,7 @@ async fn setup() -> App {
             cookie_secure: false,
             session_ttl: Duration::from_secs(3600),
             hash_cost: HashCost { m_kib: 256, t: 1, p: 1 },
+            state_dir: None,
         },
     )
     .unwrap();

@@ -27,7 +27,7 @@ async fn main() {
     let state = build(
         queue,
         events,
-        Config { roots: vec![root], cookie_secure: false, session_ttl: Duration::from_secs(12 * 3600), hash_cost: HashCost::default() },
+        Config { roots: vec![root], cookie_secure: false, session_ttl: Duration::from_secs(12 * 3600), hash_cost: HashCost::default(), state_dir: None },
     )
     .expect("start dashboard");
 

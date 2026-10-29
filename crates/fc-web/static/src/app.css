@@ -2,4 +2,83 @@
 @source "../index.html";
 @source "../app.js";
 
+/* Palette taken from the console mockup: near-black panels, hairline borders,
+   one orange accent. Nothing here is a stock Tailwind colour. */
+@theme {
+  --color-base: #0d0e11;
+  --color-panel: #12141a;
+  --color-raised: #181b22;
+  --color-line: #262a36;
+  --color-body: #9ca3af;
+  --color-strong: #f3f4f6;
+  --color-dim: #6b7280;
+  --color-faint: #4b5563;
+  --color-brand: #ea580c;
+  --color-brand-light: #fb923c;
+  --color-brand-dark: #c2410c;
+  --color-ok: #34d399;
+  --color-warn: #fbbf24;
+  --color-bad: #f87171;
+
+  --font-sans: ui-sans-serif, "Segoe UI", system-ui, sans-serif;
+  --font-mono: ui-monospace, "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+}
+
+@layer components {
+  .field {
+    @apply h-9 border border-line bg-base px-2.5 text-body placeholder:text-faint focus:border-brand focus:outline-none;
+  }
+  .btn-primary {
+    @apply flex items-center justify-center bg-brand px-3 font-semibold text-white hover:bg-brand-dark disabled:opacity-50;
+  }
+  .btn-ghost {
+    @apply flex items-center justify-center border border-line bg-raised px-3 text-body hover:border-dim hover:text-strong;
+  }
+  .btn-mini {
+    @apply h-6 border border-line bg-raised px-2 font-mono text-[10px] text-dim hover:border-brand hover:text-brand-light;
+  }
+  .chip {
+    @apply h-6 border border-line bg-base px-2 font-mono text-[11px] text-dim hover:text-body;
+  }
+  .chip-on {
+    @apply border-brand bg-brand text-white hover:text-white;
+  }
+  .mode-btn {
+    @apply px-3 py-1 text-xs font-medium text-dim hover:text-body disabled:hover:text-dim;
+  }
+  .mode-on {
+    @apply border border-line bg-raised text-brand-light;
+  }
+  .seg {
+    @apply h-8 bg-base font-mono text-[11px] text-dim uppercase hover:text-body disabled:opacity-50;
+  }
+  .seg-on {
+    @apply bg-raised text-brand-light;
+  }
+  .tile {
+    @apply border border-line bg-base p-2;
+  }
+  .tile-k {
+    @apply text-[10px] text-faint uppercase;
+  }
+  .tile-v {
+    @apply text-sm font-bold text-strong;
+  }
+  .modal {
+    @apply w-full max-w-lg border border-line bg-panel shadow-2xl;
+  }
+  .modal-head {
+    @apply flex items-center justify-between border-b border-line px-4 py-2.5 font-mono text-sm font-bold text-strong;
+  }
+  .modal-foot {
+    @apply flex justify-end gap-2 border-t border-line px-4 py-2.5;
+  }
+  .row {
+    @apply hover:bg-raised;
+  }
+}
+
 [x-cloak] { display: none !important; }
+html { color-scheme: dark; }
+:focus-visible { outline: 2px solid var(--color-brand); outline-offset: 1px; }
+input[type="range"] { accent-color: var(--color-brand); }
