@@ -44,6 +44,12 @@ enum Command {
     /// Copy files and folders.
     #[command(override_usage = "fcopy copy [OPTIONS] <SOURCE>... <DEST>")]
     Copy(CopyArgs),
+    /// List PCs running fcopy-agent on this network.
+    Peers {
+        /// How long to listen, in seconds.
+        #[arg(long, default_value_t = 3)]
+        timeout: u64,
+    },
     /// Print checksums in `sha256sum`-compatible format.
     Hash {
         #[arg(long, value_enum, default_value_t = Algo::Sha256)]
@@ -66,6 +72,18 @@ struct CopyArgs {
     /// that path; otherwise everything is copied *into* the destination folder.
     #[arg(required = true, num_args = 2.., value_name = "PATH")]
     paths: Vec<PathBuf>,
+
+    /// Password for a remote destination. Visible in process listings: prefer FCOPY_PASSWORD or the prompt.
+    #[arg(long, value_name = "PASSWORD")]
+    password: Option<String>,
+
+    /// Read the remote password from a file (first line).
+    #[arg(long, value_name = "FILE", conflicts_with = "password")]
+    password_file: Option<PathBuf>,
+
+    /// Trust this certificate fingerprint for a remote destination the first time.
+    #[arg(long, value_name = "SHA256:…")]
+    accept_fingerprint: Option<String>,
 
     /// Integrity check.
     #[arg(long, value_enum, default_value_t = Verify::Off)]
@@ -166,6 +184,7 @@ enum OnError {
 fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Copy(args) => copy(args),
+        Command::Peers { timeout } => peers(timeout),
         Command::Hash { algo, files } => hash(algo.into(), &files),
         Command::Check { algo, manifest } => check(algo.into(), &manifest),
     }
@@ -188,6 +207,13 @@ fn build_request(paths: &[PathBuf]) -> TransferRequest {
 
 fn copy(args: CopyArgs) -> ExitCode {
     let interactive = io::stdin().is_terminal();
+    let remote = match remote_destination(&args) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    };
     let show_progress = !args.quiet && io::stderr().is_terminal();
     let on_error = args.on_error.unwrap_or(if interactive { OnError::Ask } else { OnError::Auto });
     let policy = match on_error {
@@ -243,7 +269,14 @@ fn copy(args: CopyArgs) -> ExitCode {
         });
     }
 
-    let request = build_request(&args.paths);
+    let request = match remote {
+        Some(backend) => {
+            let (dest, sources) = args.paths.split_last().expect("clap enforces >= 2 paths");
+            let _ = dest;
+            TransferRequest::to_backend(sources.to_vec(), backend)
+        }
+        None => build_request(&args.paths),
+    };
     let manifest_root = match &request.target {
         Target::IntoDir(d) => d.clone(),
         Target::FileTo(p) => p.parent().map(Path::to_path_buf).unwrap_or_default(),
@@ -479,4 +512,111 @@ fn check(algo: Algorithm, manifest: &Path) -> ExitCode {
     }
     eprintln!("{good} OK, {bad} failed");
     if bad == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+// ---------------------------------------------------------------------------
+// remote destinations and peers
+// ---------------------------------------------------------------------------
+
+/// The remote backend for `copy`, if the destination is `user@host:/share/dir`.
+/// Returns `Ok(None)` for a local copy.
+fn remote_destination(args: &CopyArgs) -> Result<Option<Arc<dyn TransferBackend>>, String> {
+    use fc_remote::backend::RemoteBackend;
+    use fc_remote::client::{Connector, RemoteSpec};
+    use fc_remote::config::{KnownHosts, default_client_dir};
+
+    let dest = args.paths.last().expect("clap enforces >= 2 paths").to_string_lossy().to_string();
+    // A local path is never a valid `host:/share` target, so a parse failure means local.
+    let Ok(spec) = RemoteSpec::parse(&dest) else { return Ok(None) };
+
+    let known_path = default_client_dir().join("known_hosts");
+    let known = KnownHosts::load(&known_path);
+    let host_port = spec.host_port();
+    let pinned = known.get(&host_port).map(str::to_string);
+
+    let password = read_password(args, &spec)?;
+    let mut connector = Connector::new(spec).password(password).pinned(pinned.clone());
+    if pinned.is_none() {
+        // First contact. The callback runs after the certificate arrives and
+        // before anything is sent. It trusts the fingerprint only if it matches
+        // --accept-fingerprint, or the user says yes at the prompt, and it saves
+        // trust only then.
+        let known_path = known_path.clone();
+        let accepted = args.accept_fingerprint.clone();
+        let interactive = io::stdin().is_terminal();
+        connector = connector.on_unknown_host(Arc::new(move |host, fp| {
+            if accepted.as_deref() == Some(fp) {
+                save_trust(&known_path, host, fp);
+                return true;
+            }
+            eprintln!("the PC at {host} presents fingerprint {fp}");
+            if !interactive {
+                eprintln!("not trusted: pass --accept-fingerprint {fp} to trust it");
+                return false;
+            }
+            eprint!("trust this PC? [y/N] ");
+            let mut answer = String::new();
+            if io::stdin().lock().read_line(&mut answer).is_err() || !answer.trim().eq_ignore_ascii_case("y") {
+                return false;
+            }
+            save_trust(&known_path, host, fp);
+            true
+        }));
+    }
+    let backend = RemoteBackend::new(connector).map_err(|e| format!("cannot start the remote transfer engine: {e}"))?;
+    Ok(Some(Arc::new(backend)))
+}
+
+/// The password, from --password, --password-file, FCOPY_PASSWORD, or a prompt.
+fn read_password(args: &CopyArgs, spec: &fc_remote::client::RemoteSpec) -> Result<String, String> {
+    if let Some(p) = &args.password {
+        eprintln!("warning: --password is visible to other users in process listings");
+        return Ok(p.clone());
+    }
+    if let Some(path) = &args.password_file {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        return Ok(text.lines().next().unwrap_or_default().to_string());
+    }
+    if let Ok(p) = std::env::var("FCOPY_PASSWORD") {
+        return Ok(p);
+    }
+    if io::stdin().is_terminal() {
+        return rpassword::prompt_password(format!("password for {spec}: ")).map_err(|e| e.to_string());
+    }
+    Err("no password: set FCOPY_PASSWORD, use --password-file, or run from a terminal".into())
+}
+
+fn peers(timeout: u64) -> ExitCode {
+    use fc_remote::config::{KnownHosts, default_client_dir};
+    use fc_remote::discovery::browse;
+
+    eprintln!("listening for {timeout} s…");
+    let found = match browse(Duration::from_secs(timeout)) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if found.is_empty() {
+        eprintln!("no PCs found. Check that their agents are running and on this network.");
+        return ExitCode::FAILURE;
+    }
+    let known = KnownHosts::load(&default_client_dir().join("known_hosts"));
+    for p in &found {
+        let addr = p.addresses.first().map(|a| a.to_string()).unwrap_or_else(|| p.host.clone());
+        let trust = match known.get(&format!("{addr}:{}", p.port)) {
+            Some(fp) if fp == p.fingerprint => "trusted",
+            Some(_) => "FINGERPRINT CHANGED",
+            None => "new",
+        };
+        println!("{}\t{addr}:{}\t{}\t{trust}", p.name, p.port, p.fingerprint);
+    }
+    ExitCode::SUCCESS
+}
+
+fn save_trust(path: &Path, host: &str, fingerprint: &str) {
+    let mut known = fc_remote::config::KnownHosts::load(path);
+    known.set(host, fingerprint);
+    let _ = known.save(path);
 }

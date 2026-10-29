@@ -1082,7 +1082,10 @@ dependencies = [
  "clap",
  "ctrlc",
  "fc-engine",
+ "fc-remote",
+ "rpassword",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

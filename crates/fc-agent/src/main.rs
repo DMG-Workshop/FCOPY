@@ -212,11 +212,27 @@ fn serve(dir: &Path) -> Result<(), String> {
     let identity = Identity::load_or_create(dir, &cfg.name).map_err(|e| e.to_string())?;
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     runtime.block_on(async {
+        let (name, discovery) = (cfg.name.clone(), cfg.discovery);
         let server = Server::bind(cfg, &identity).map_err(|e| e.to_string())?;
         let handle = server.handle();
         let addr = handle.local_addr().map_err(|e| e.to_string())?;
         println!("listening on {addr}");
         println!("fingerprint: {}", handle.fingerprint());
+        // Held for the life of the server: dropping it withdraws the announcement.
+        let _announcement = if discovery {
+            match fc_remote::discovery::advertise(&name, addr.port(), handle.fingerprint()) {
+                Ok(ad) => {
+                    println!("announcing '{name}' on the local network");
+                    Some(ad)
+                }
+                Err(e) => {
+                    println!("not announcing on the local network: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let stop = handle.clone();
         ctrlc::set_handler(move || stop.shutdown()).map_err(|e| e.to_string())?;
         server.run().await;
