@@ -37,7 +37,7 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -342,6 +342,8 @@ struct Inner {
     events: Sender<Event>,
     notify: Option<Arc<dyn Fn() + Send + Sync>>,
     limiter: Arc<RateLimiter>,
+    /// Read on every error, so it can change while a job runs.
+    policy: RwLock<ErrorPolicy>,
 }
 
 impl Inner {
@@ -382,11 +384,12 @@ impl Queue {
             events: tx,
             notify: config.on_event.clone(),
             limiter: limiter.clone(),
+            policy: RwLock::new(config.policy),
         });
 
         let mut options = config.options;
         options.rate_limit = Some(limiter.clone());
-        let handler: Arc<dyn ErrorHandler> = Arc::new(QueueHandler::new(inner.clone(), config.policy));
+        let handler: Arc<dyn ErrorHandler> = Arc::new(QueueHandler::new(inner.clone()));
         let copier = Copier::new(options, handler.clone());
         let engines = Engines { default: copier, handler, limiter };
 
@@ -581,6 +584,16 @@ impl Queue {
         for id in ids {
             self.remove(id);
         }
+    }
+
+    /// How recoverable errors are answered from now on. Applies to the file
+    /// in progress as well as later ones.
+    pub fn set_error_policy(&self, policy: ErrorPolicy) {
+        *self.inner.policy.write().unwrap_or_else(PoisonError::into_inner) = policy;
+    }
+
+    pub fn error_policy(&self) -> ErrorPolicy {
+        self.inner.policy.read().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
     /// Cap total throughput (bytes/s); `None` removes the cap. Applies immediately.
@@ -791,17 +804,11 @@ fn run_job(
 
 struct QueueHandler {
     inner: Arc<Inner>,
-    policy: ErrorPolicy,
-    auto: AutoHandler,
 }
 
 impl QueueHandler {
-    fn new(inner: Arc<Inner>, policy: ErrorPolicy) -> Self {
-        let auto = match &policy {
-            ErrorPolicy::Auto(p) => AutoHandler::new(p.clone()),
-            _ => AutoHandler::default(),
-        };
-        Self { inner, policy, auto }
+    fn new(inner: Arc<Inner>) -> Self {
+        Self { inner }
     }
 
     fn ask(&self, ctx: &ErrorContext<'_>) -> ErrorAction {
@@ -839,8 +846,9 @@ impl QueueHandler {
 
 impl ErrorHandler for QueueHandler {
     fn on_error(&self, ctx: &ErrorContext<'_>) -> ErrorAction {
-        match &self.policy {
-            ErrorPolicy::Auto(_) => self.auto.on_error(ctx),
+        let policy = self.inner.policy.read().unwrap_or_else(PoisonError::into_inner).clone();
+        match policy {
+            ErrorPolicy::Auto(p) => AutoHandler::new(p).on_error(ctx),
             ErrorPolicy::Skip => ErrorAction::Skip,
             ErrorPolicy::Cancel => ErrorAction::Cancel,
             ErrorPolicy::Ask => self.ask(ctx),
@@ -848,8 +856,9 @@ impl ErrorHandler for QueueHandler {
     }
 
     fn retry_delay(&self, ctx: &ErrorContext<'_>) -> Duration {
-        match &self.policy {
-            ErrorPolicy::Auto(_) => self.auto.retry_delay(ctx),
+        let policy = self.inner.policy.read().unwrap_or_else(PoisonError::into_inner).clone();
+        match policy {
+            ErrorPolicy::Auto(p) => AutoHandler::new(p).retry_delay(ctx),
             _ => Duration::ZERO,
         }
     }

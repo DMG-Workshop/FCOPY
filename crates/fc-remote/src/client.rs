@@ -385,24 +385,8 @@ impl Session {
     }
 
     async fn open_with(c: &Connector, auth: Auth<'_>) -> Result<Self, ClientError> {
-        let addr = resolve(&c.spec).await?;
-        let bind = if addr.is_ipv6() { SocketAddr::from(([0u16; 8], 0)) } else { SocketAddr::from(([0, 0, 0, 0], 0)) };
-        let endpoint = quinn::Endpoint::client(bind).map_err(|e| ClientError::Connect(e.to_string()))?;
-
         let pinned = c.pinned_fingerprint();
-        let verifier = PinnedVerifier::new(pinned.clone());
-        let config = client_config(verifier.clone()).map_err(|e| ClientError::Connect(e.to_string()))?;
-        let connecting = endpoint.connect_with(config, addr, SERVER_NAME).map_err(|e| ClientError::Connect(e.to_string()))?;
-        let conn = match connecting.await {
-            Ok(conn) => conn,
-            Err(e) => {
-                return Err(match (pinned, verifier.seen()) {
-                    (Some(expected), Some(presented)) if expected != presented => ClientError::HostKeyChanged { expected, presented },
-                    _ => ClientError::Connect(e.to_string()),
-                });
-            }
-        };
-        let fingerprint = verifier.seen().ok_or_else(|| ClientError::Protocol("server presented no certificate".into()))?;
+        let (endpoint, conn, fingerprint) = connect_pinned(&c.spec, pinned.clone()).await?;
 
         // Trust on first use, decided before any credential leaves this machine.
         let mut newly_trusted = false;
@@ -741,6 +725,47 @@ impl Session {
         }
     }
 }
+
+/// Connect over TLS with the pin checked during the handshake. Returns the
+/// endpoint, the connection, and the fingerprint the server presented. A pin
+/// that no longer matches fails here, before anything else is sent.
+async fn connect_pinned(
+    spec: &RemoteSpec,
+    pinned: Option<String>,
+) -> Result<(quinn::Endpoint, quinn::Connection, String), ClientError> {
+    let addr = resolve(spec).await?;
+    let bind = if addr.is_ipv6() { SocketAddr::from(([0u16; 8], 0)) } else { SocketAddr::from(([0, 0, 0, 0], 0)) };
+    let endpoint = quinn::Endpoint::client(bind).map_err(|e| ClientError::Connect(e.to_string()))?;
+
+    let verifier = PinnedVerifier::new(pinned.clone());
+    let config = client_config(verifier.clone()).map_err(|e| ClientError::Connect(e.to_string()))?;
+    let connecting = endpoint.connect_with(config, addr, SERVER_NAME).map_err(|e| ClientError::Connect(e.to_string()))?;
+    let conn = match connecting.await {
+        Ok(conn) => conn,
+        Err(e) => {
+            return Err(match (pinned, verifier.seen()) {
+                (Some(expected), Some(presented)) if expected != presented => ClientError::HostKeyChanged { expected, presented },
+                _ => ClientError::Connect(e.to_string()),
+            });
+        }
+    };
+    let fingerprint = verifier.seen().ok_or_else(|| ClientError::Protocol("server presented no certificate".into()))?;
+    Ok((endpoint, conn, fingerprint))
+}
+
+/// Check that an agent is reachable and answers with the expected identity,
+/// without logging in. Returns the fingerprint it presented. Used to show
+/// online/offline and to read a fingerprint for pairing.
+pub async fn probe(spec: &RemoteSpec, pinned: Option<String>) -> Result<String, ClientError> {
+    let (_endpoint, conn, fingerprint) = tokio::time::timeout(PROBE_TIMEOUT, connect_pinned(spec, pinned))
+        .await
+        .map_err(|_| ClientError::Connect("timed out".into()))??;
+    conn.close(0u32.into(), b"probe");
+    Ok(fingerprint)
+}
+
+/// How long a reachability check may take.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn resolve(spec: &RemoteSpec) -> Result<SocketAddr, ClientError> {
     let mut addrs = tokio::net::lookup_host((spec.host.as_str(), spec.port))

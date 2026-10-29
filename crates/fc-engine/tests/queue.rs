@@ -367,3 +367,14 @@ fn pause_and_resume_job_report_unknown_and_finished_jobs() {
     assert!(!q.resume_job(9_999));
     q.shutdown();
 }
+
+#[test]
+fn error_policy_can_change_at_runtime() {
+    let (q, _rx) = start(quick_policy(), None);
+    assert!(matches!(q.error_policy(), ErrorPolicy::Auto(_)));
+    q.set_error_policy(ErrorPolicy::Skip);
+    assert!(matches!(q.error_policy(), ErrorPolicy::Skip));
+    q.set_error_policy(quick_policy());
+    assert!(matches!(q.error_policy(), ErrorPolicy::Auto(_)));
+    q.shutdown();
+}
