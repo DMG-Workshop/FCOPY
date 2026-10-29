@@ -146,6 +146,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/transfers/{id}", delete(api::cancel_transfer))
         .route("/api/transfers/{id}/pause", post(api::pause_transfer))
         .route("/api/transfers/{id}/resume", post(api::resume_transfer))
+        .route("/api/queue", get(api::queue_state))
         .route("/api/queue/pause", post(api::pause_queue))
         .route("/api/queue/resume", post(api::resume_queue))
         .route("/api/clients", get(api::list_clients).post(api::pair_client))

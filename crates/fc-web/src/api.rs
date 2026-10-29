@@ -175,6 +175,16 @@ pub async fn resume_transfer(State(s): State<Arc<AppState>>, p: Principal, Path(
 // Admin only: paired clients, settings, accounts
 // ---------------------------------------------------------------------------
 
+#[derive(Serialize)]
+pub struct QueueState {
+    pub paused: bool,
+}
+
+/// Whether the whole queue is paused. Any signed-in user may read it.
+pub async fn queue_state(State(s): State<Arc<AppState>>, _p: Principal) -> Json<QueueState> {
+    Json(QueueState { paused: s.queue.is_paused() })
+}
+
 /// Pause or resume the whole queue. Admins only: it affects every user's jobs.
 pub async fn pause_queue(State(s): State<Arc<AppState>>, p: Principal) -> Result<StatusCode, ApiError> {
     require_admin(&p)?;

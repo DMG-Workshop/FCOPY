@@ -307,3 +307,14 @@ async fn pause_and_resume_the_whole_queue_is_admin_only() {
     assert_eq!(send(&e, "POST", "/api/queue/resume", Some(&admin), None).await.status, StatusCode::NO_CONTENT);
     assert!(!e.state.queue.is_paused());
 }
+
+#[tokio::test]
+async fn any_user_can_read_whether_the_queue_is_paused() {
+    let e = env().await;
+    let admin = login(&e, "admin", "admin-password").await;
+    let bob = login(&e, "bob", "bobs-password").await;
+    assert_eq!(send(&e, "GET", "/api/queue", Some(&bob), None).await.json["paused"], false);
+    send(&e, "POST", "/api/queue/pause", Some(&admin), None).await;
+    assert_eq!(send(&e, "GET", "/api/queue", Some(&bob), None).await.json["paused"], true);
+    send(&e, "POST", "/api/queue/resume", Some(&admin), None).await;
+}

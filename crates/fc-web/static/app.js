@@ -111,6 +111,7 @@ function fcopy() {
         this.user = await r.json();
         this.connect();
         if (this.isAdmin()) this.loadSettings();
+        this.loadQueueState();
       }
       this.paint(0);
     },
@@ -287,6 +288,11 @@ function fcopy() {
       const r = await this.api('DELETE', `/api/transfers/${job.id}`);
       if (r.ok) delete this.jobs[job.id];
       else this.notify(await errorText(r));
+    },
+
+    async loadQueueState() {
+      const r = await this.api('GET', '/api/queue');
+      if (r.ok) this.queuePaused = (await r.json()).paused;
     },
 
     async pauseAll() {
