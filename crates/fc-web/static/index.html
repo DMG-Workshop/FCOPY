@@ -44,7 +44,7 @@
       <nav class="flex gap-1 border border-line bg-base p-0.5" role="tablist" aria-label="Mode">
         <button role="tab" :aria-selected="mode === 'local'" class="mode-btn" :class="mode === 'local' && 'mode-on'" @click="mode = 'local'">Local copy</button>
         <button role="tab" x-show="isAdmin()" :aria-selected="mode === 'remote'" class="mode-btn" :class="mode === 'remote' && 'mode-on'" @click="setMode('remote')">Remote node</button>
-        <button role="tab" disabled title="Not built yet" class="mode-btn cursor-not-allowed opacity-40">BitTorrent</button>
+        <button role="tab" disabled aria-disabled="true" title="BitTorrent engine not built yet" class="mode-btn cursor-not-allowed opacity-40">BitTorrent <span class="text-[10px]">(not built yet)</span></button>
       </nav>
     </div>
 
