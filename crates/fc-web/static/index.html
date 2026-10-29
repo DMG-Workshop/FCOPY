@@ -97,11 +97,11 @@
             <tr>
               <th class="w-8 p-2 text-center"><input type="checkbox" class="accent-brand" :checked="allSelected()" @change="toggleAll($event.target.checked)" aria-label="Select all"></th>
               <th class="p-2">Name and path</th>
-              <th class="w-24 p-2 text-right">Size</th>
-              <th class="w-52 p-2">Progress</th>
-              <th class="w-36 p-2">Status</th>
-              <th class="w-32 p-2 text-right">Rate</th>
-              <th class="w-24 p-2 text-right">Files</th>
+              <th class="w-20 p-2 text-right lg:w-24">Size</th>
+              <th class="w-40 p-2 lg:w-52">Progress</th>
+              <th class="w-28 p-2 lg:w-36">Status</th>
+              <th class="w-24 p-2 text-right lg:w-32">Rate</th>
+              <th class="hidden w-20 p-2 text-right lg:table-cell">Files</th>
               <th class="w-24 p-2 text-center">Actions</th>
             </tr>
           </thead>
@@ -129,7 +129,7 @@
                   <div class="text-[10px] text-faint" x-text="job.state === 'running' ? `ETA ${fmtEta(job.eta_secs)}` : ''"></div>
                 </td>
                 <td class="hidden p-2 text-right tabular-nums text-body md:table-cell" x-text="fmtRate(job.rate_bps)"></td>
-                <td class="hidden p-2 text-right tabular-nums text-dim md:table-cell" x-text="`${job.files_done}/${job.files_total}`"></td>
+                <td class="hidden p-2 text-right tabular-nums text-dim lg:table-cell" x-text="`${job.files_done}/${job.files_total}`"></td>
                 <td class="block p-0 md:table-cell md:p-2">
                   <div class="flex justify-end gap-1">
                     <button x-show="job.state === 'running'" class="btn-mini" @click="act(job, 'pause')">Pause</button>
