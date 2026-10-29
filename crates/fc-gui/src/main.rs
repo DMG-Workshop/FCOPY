@@ -29,6 +29,7 @@
 
 mod app;
 mod integration;
+mod remote;
 mod state;
 
 use fc_engine::units::parse_size;

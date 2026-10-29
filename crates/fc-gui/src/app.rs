@@ -13,6 +13,7 @@ use fc_engine::{
     TransferRequest, VerifyMode,
 };
 
+use crate::remote::{self, PeerSearch, RemoteForm};
 use crate::state::{AppState, LogKind};
 use crate::Startup;
 
@@ -27,6 +28,7 @@ struct NewTransfer {
     dest: String,
     verify: VerifyMode,
     overwrite: bool,
+    remote: RemoteForm,
 }
 
 pub struct FcApp {
@@ -40,6 +42,9 @@ pub struct FcApp {
     /// "Do this for all errors of this kind" answers.
     remembered: HashMap<ErrorClass, ErrorAction>,
     remember_choice: bool,
+    peers: PeerSearch,
+    peer_list: Vec<fc_remote::discovery::Peer>,
+    notice: Option<String>,
 }
 
 impl FcApp {
@@ -65,12 +70,16 @@ impl FcApp {
                 dest: startup.dest.map(|d| d.display().to_string()).unwrap_or_default(),
                 verify: if startup.verify { VerifyMode::ReadBack } else { VerifyMode::Off },
                 overwrite: false,
+                remote: RemoteForm::default(),
             },
             log_open: false,
             limit_on: startup.limit.is_some(),
             limit_mb: startup.limit.map(|l| l as f64 / 1e6).unwrap_or(50.0),
             remembered: HashMap::new(),
             remember_choice: false,
+            peers: PeerSearch::default(),
+            peer_list: Vec::new(),
+            notice: None,
         };
         app.state.speed_limit = startup.limit;
         if !app.form.sources.is_empty() && !app.form.dest.is_empty() {
@@ -95,12 +104,27 @@ impl FcApp {
     }
 
     fn start_transfer(&mut self) {
-        let dest = PathBuf::from(self.form.dest.trim());
         let sources = std::mem::take(&mut self.form.sources);
-        let request = if sources.len() == 1 && sources[0].is_file() && !dest.is_dir() {
-            TransferRequest::file_to(&sources[0], &dest)
+        let (request, target) = if self.form.remote.enabled {
+            let backend = match remote::backend_for(&self.form.remote) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.form.sources = sources;
+                    self.notice = Some(e);
+                    return;
+                }
+            };
+            let target = format!("{}/{}", self.form.remote.address.trim(), self.form.remote.folder.trim().trim_matches('/'));
+            self.form.remote.password.clear();
+            (TransferRequest::to_backend(sources.clone(), backend), target)
         } else {
-            TransferRequest::into_dir(sources.clone(), &dest)
+            let dest = PathBuf::from(self.form.dest.trim());
+            let request = if sources.len() == 1 && sources[0].is_file() && !dest.is_dir() {
+                TransferRequest::file_to(&sources[0], &dest)
+            } else {
+                TransferRequest::into_dir(sources.clone(), &dest)
+            };
+            (request, dest.display().to_string())
         };
         let options = CopyOptions {
             verify: self.form.verify,
@@ -108,8 +132,9 @@ impl FcApp {
             overwrite: self.form.overwrite,
             ..Default::default()
         };
+        self.notice = None;
         let id = self.queue.add(request.with_options(options));
-        self.state.details.insert(id, (sources, dest.display().to_string()));
+        self.state.details.insert(id, (sources, target));
     }
 
     // ----- panels -----
@@ -279,6 +304,20 @@ impl FcApp {
                     ui.end_row();
                 }
             });
+            if let Some(link) = &t.link {
+                ui.separator();
+                ui.weak(format!("Link to {}", link.peer));
+                egui::Grid::new("link").num_columns(4).spacing([28.0, 6.0]).show(ui, |ui| {
+                    stat(ui, "Round trip", &format!("{} ms", link.rtt.as_millis()));
+                    stat(ui, "Sent", &human_bytes(link.sent_bytes));
+                    stat(ui, "Acknowledged", &human_bytes(link.acked_bytes));
+                    ui.end_row();
+                    stat(ui, "Reconnects", &link.reconnects.to_string());
+                    stat(ui, "Lost packets", &link.lost_packets.to_string());
+                    stat(ui, "PC paused", if link.remote_paused { "yes" } else { "no" });
+                    ui.end_row();
+                });
+            }
         });
     }
 
@@ -305,10 +344,18 @@ impl FcApp {
             if let Some(i) = remove {
                 self.form.sources.remove(i);
             }
-            ui.horizontal(|ui| {
-                ui.label("Destination");
-                ui.add(egui::TextEdit::singleline(&mut self.form.dest).hint_text("folder (or new file name for a single file)").desired_width(f32::INFINITY));
-            });
+            ui.checkbox(&mut self.form.remote.enabled, "Copy to a PC on the network");
+            if self.form.remote.enabled {
+                self.remote_fields(ui);
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label("Destination");
+                    ui.add(egui::TextEdit::singleline(&mut self.form.dest).hint_text("folder (or new file name for a single file)").desired_width(f32::INFINITY));
+                });
+            }
+            if let Some(msg) = &self.notice {
+                ui.colored_label(WARN, msg);
+            }
             ui.horizontal(|ui| {
                 ui.label("Verify");
                 egui::ComboBox::from_id_salt("verify")
@@ -329,6 +376,51 @@ impl FcApp {
                 }
             });
         });
+    }
+
+    /// The remote destination: a PC from discovery, or an address typed by hand.
+    fn remote_fields(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("PC");
+            let before = self.peer_list.clone();
+            egui::ComboBox::from_id_salt("peers").selected_text("Found on the network…").show_ui(ui, |ui| {
+                if before.is_empty() {
+                    ui.weak("No PCs found yet. Search, or type the address below.");
+                }
+                for peer in &before {
+                    let addr = remote::address_for("", peer);
+                    if ui.selectable_label(false, format!("{}  {addr}", peer.name)).clicked() {
+                        self.form.remote.address = remote::address_for(&self.form.remote.address, peer);
+                        self.form.remote.fingerprint = peer.fingerprint.clone();
+                        self.form.remote.fingerprint_checked = false;
+                    }
+                }
+            });
+            if ui.add_enabled(!self.peers.busy(), egui::Button::new("Search")).clicked() {
+                self.peers.start();
+            }
+            if self.peers.busy() {
+                ui.spinner();
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Address");
+            ui.add(egui::TextEdit::singleline(&mut self.form.remote.address).hint_text("user@host:port").desired_width(220.0));
+            ui.label("Folder");
+            ui.add(egui::TextEdit::singleline(&mut self.form.remote.folder).hint_text("backup/photos").desired_width(f32::INFINITY));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Password");
+            ui.add(egui::TextEdit::singleline(&mut self.form.remote.password).password(true).hint_text("used for this job only").desired_width(220.0));
+        });
+        if let Some(trusted) = remote::trusted_fingerprint(&self.form.remote.address) {
+            ui.weak(format!("Trusted: {trusted}"));
+        } else if !self.form.remote.fingerprint.is_empty() {
+            ui.weak(format!("The PC presents {}", self.form.remote.fingerprint));
+            ui.checkbox(&mut self.form.remote.fingerprint_checked, "I checked this matches the PC's own fingerprint");
+        } else {
+            ui.weak("First time with this PC: pick it from the list, so its fingerprint can be checked.");
+        }
     }
 
     fn log_drawer(&mut self, ui: &mut egui::Ui) {
@@ -436,6 +528,12 @@ impl eframe::App for FcApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_events();
         self.handle_drops(ctx);
+        if let Some(found) = self.peers.poll() {
+            match found {
+                Ok(list) => self.peer_list = list,
+                Err(e) => self.notice = Some(format!("discovery failed: {e}")),
+            }
+        }
 
         // Panel order matters in egui: edges first, central last.
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {

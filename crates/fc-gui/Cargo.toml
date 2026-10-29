@@ -10,6 +10,7 @@ license.workspace = true
 eframe = { version = "0.32.3", default-features = false, features = ["glow", "x11", "wayland", "default_fonts"] }
 egui = "0.32.3"
 fc-engine = { path = "../fc-engine" }
+fc-remote = { path = "../fc-remote" }
 
 [[bin]]
 name = "fcopy-gui"
