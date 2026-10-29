@@ -34,6 +34,7 @@ pub struct JobRow {
     pub id: JobId,
     pub label: String,
     pub state: JobState,
+    pub paused: bool,
     pub fraction: f64,
     pub files_total: u64,
     pub bytes_total: u64,
@@ -95,6 +96,7 @@ impl AppState {
                 id: job,
                 label,
                 state: JobState::Pending,
+                paused: false,
                 fraction: 0.0,
                 files_total: 0,
                 bytes_total: 0,
@@ -136,6 +138,16 @@ impl AppState {
             Event::Decision(d) => self.decisions.push_back(d),
             Event::Paused => self.paused = true,
             Event::Resumed => self.paused = false,
+            Event::JobPaused { job } => {
+                if let Some(r) = self.row_mut(job) {
+                    r.paused = true;
+                }
+            }
+            Event::JobResumed { job } => {
+                if let Some(r) = self.row_mut(job) {
+                    r.paused = false;
+                }
+            }
             Event::SpeedLimit(l) => self.speed_limit = l,
             Event::Finished { job, state, summary } => {
                 if let JobState::Failed(msg) = &state {

@@ -193,6 +193,9 @@ pub struct JobInfo {
     pub sources: Vec<PathBuf>,
     pub target: Target,
     pub state: JobState,
+    /// Held by [`Queue::pause_job`]. A paused pending job is skipped by the
+    /// scheduler; a paused running job holds the worker at its next chunk.
+    pub paused: bool,
     pub files_total: u64,
     pub bytes_total: u64,
     pub files_copied: u64,
@@ -257,6 +260,8 @@ pub enum Event {
     Decision(DecisionRequest),
     Paused,
     Resumed,
+    JobPaused { job: JobId },
+    JobResumed { job: JobId },
     SpeedLimit(Option<u64>),
     Finished { job: JobId, state: JobState, summary: JobSummary },
     Removed { job: JobId },
@@ -324,8 +329,9 @@ impl QState {
         let id = self.active?;
         self.jobs.iter().find(|j| j.info.id == id).map(|j| (id, j.control.clone()))
     }
+    /// A job the scheduler could start now (pending and not held).
     fn has_pending(&self) -> bool {
-        self.jobs.iter().any(|j| j.info.state == JobState::Pending)
+        self.jobs.iter().any(|j| j.info.state == JobState::Pending && !j.info.paused)
     }
 }
 
@@ -409,6 +415,7 @@ impl Queue {
                     sources: request.sources.clone(),
                     target: request.target.clone(),
                     state: JobState::Pending,
+                    paused: false,
                     files_total: 0,
                     bytes_total: 0,
                     files_copied: 0,
@@ -452,12 +459,59 @@ impl Queue {
                 return;
             }
             st.paused = false;
-            if let Some((_, c)) = st.active_control() {
-                c.resume();
+            // A job the user paused on its own stays paused.
+            if let Some((id, c)) = st.active_control() {
+                if !st.job_mut(id).is_some_and(|j| j.info.paused) {
+                    c.resume();
+                }
             }
         }
         self.inner.wake.notify_all();
         self.inner.emit(Event::Resumed);
+    }
+
+    /// Hold one job. A pending job is passed over until it is resumed, so
+    /// later jobs run first. A running job is paused at its next chunk, which
+    /// holds the queue there (jobs run one at a time). Returns false if the job
+    /// is unknown or already finished.
+    pub fn pause_job(&self, id: JobId) -> bool {
+        {
+            let mut st = self.inner.lock();
+            let Some(job) = st.job_mut(id) else { return false };
+            if job.info.state.is_finished() {
+                return false;
+            }
+            if job.info.paused {
+                return true;
+            }
+            job.info.paused = true;
+            if job.info.state == JobState::Running {
+                job.control.pause();
+            }
+        }
+        self.inner.emit(Event::JobPaused { job: id });
+        true
+    }
+
+    /// Release a job held by [`pause_job`](Self::pause_job). A running job
+    /// continues from the exact byte. Has no effect while the whole queue is
+    /// paused, because that pause still applies.
+    pub fn resume_job(&self, id: JobId) -> bool {
+        {
+            let mut st = self.inner.lock();
+            let global_paused = st.paused;
+            let Some(job) = st.job_mut(id) else { return false };
+            if !job.info.paused {
+                return true;
+            }
+            job.info.paused = false;
+            if job.info.state == JobState::Running && !global_paused {
+                job.control.resume();
+            }
+        }
+        self.inner.wake.notify_all();
+        self.inner.emit(Event::JobResumed { job: id });
+        true
     }
 
     pub fn is_paused(&self) -> bool {
@@ -598,7 +652,7 @@ fn worker_loop(inner: Arc<Inner>, engines: Engines, plan_opts: PlanOptions, inte
                     return;
                 }
                 if !st.paused {
-                    if let Some(i) = st.jobs.iter().position(|j| j.info.state == JobState::Pending) {
+                    if let Some(i) = st.jobs.iter().position(|j| j.info.state == JobState::Pending && !j.info.paused) {
                         let job = &mut st.jobs[i];
                         job.info.state = JobState::Running;
                         let picked = (job.info.id, job.request.clone(), job.control.clone());

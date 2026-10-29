@@ -293,3 +293,77 @@ fn per_job_options_override_queue_defaults() {
     assert_eq!(q.job(j).unwrap().label, "verified");
     q.shutdown();
 }
+
+#[test]
+fn held_pending_job_is_passed_over_until_resumed() {
+    let dir = tempfile::tempdir().unwrap();
+    let a_src = dir.path().join("a.bin");
+    let b_src = dir.path().join("b.bin");
+    fs::write(&a_src, data(200_000, 7)).unwrap();
+    fs::write(&b_src, data(200_000, 8)).unwrap();
+    let out = dir.path().join("out");
+
+    let (q, rx) = start(quick_policy(), None);
+    q.pause(); // hold the queue so both jobs stay pending
+    let a = q.add(TransferRequest::into_dir(vec![a_src.clone()], &out));
+    let b = q.add(TransferRequest::into_dir(vec![b_src.clone()], &out));
+    assert!(q.pause_job(a));
+    assert!(q.job(a).unwrap().paused);
+    wait_for(&rx, Duration::from_secs(5), |e| matches!(e, Event::JobPaused { job } if *job == a));
+
+    q.resume(); // the held job must not block the one behind it
+    let (state, _, _) = finished(&rx, b);
+    assert_eq!(state, JobState::Completed);
+    assert_eq!(q.job(a).unwrap().state, JobState::Pending, "held job must not start");
+
+    assert!(q.resume_job(a));
+    let (state, _, _) = finished(&rx, a);
+    assert_eq!(state, JobState::Completed);
+    assert!(same(&a_src, &out.join("a.bin")));
+    q.shutdown();
+}
+
+#[test]
+fn paused_running_job_stays_frozen_through_a_global_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("big.bin");
+    fs::write(&src, data(6_000_000, 9)).unwrap();
+    let out = dir.path().join("out");
+
+    let (q, rx) = start(quick_policy(), Some(10_000_000));
+    let j = q.add(TransferRequest::into_dir(vec![src.clone()], &out));
+    wait_for(&rx, Duration::from_secs(10), |e| matches!(e, Event::Progress { telemetry, .. } if telemetry.bytes_copied > 1_000_000));
+
+    assert!(q.pause_job(j));
+    std::thread::sleep(Duration::from_millis(150));
+    let frozen = q.job(j).unwrap().telemetry.unwrap().bytes_copied;
+
+    // A whole-queue pause and resume must not release a job held on its own.
+    q.pause();
+    q.resume();
+    std::thread::sleep(Duration::from_millis(400));
+    let still = q.job(j).unwrap().telemetry.unwrap().bytes_copied;
+    assert_eq!(frozen, still, "per-job pause must survive a global resume");
+    assert_eq!(q.job(j).unwrap().state, JobState::Running);
+
+    assert!(q.resume_job(j));
+    let (state, summary, _) = finished(&rx, j);
+    assert_eq!(state, JobState::Completed);
+    assert_eq!(summary.bytes_copied, 6_000_000);
+    assert!(same(&src, &out.join("big.bin")), "resumed copy must be byte-identical");
+    q.shutdown();
+}
+
+#[test]
+fn pause_and_resume_job_report_unknown_and_finished_jobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("s.bin");
+    fs::write(&src, data(10_000, 10)).unwrap();
+    let (q, rx) = start(quick_policy(), None);
+    let j = q.add(TransferRequest::into_dir(vec![src], dir.path().join("out")));
+    finished(&rx, j);
+    assert!(!q.pause_job(j), "finished job cannot be paused");
+    assert!(!q.pause_job(9_999), "unknown job");
+    assert!(!q.resume_job(9_999));
+    q.shutdown();
+}
