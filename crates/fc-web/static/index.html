@@ -381,7 +381,7 @@
         <p class="text-center text-[11px] text-faint">or</p>
         <label class="grid gap-1"><span class="text-[11px] text-dim">.torrent file</span>
           <input type="file" accept=".torrent" x-ref="torrentFile" @change="torrentForm.file = $event.target.files[0] || null" class="field font-mono"></label>
-        <label class="grid gap-1"><span class="text-[11px] text-dim">Peers to contact, host:port separated by commas (needed for a .torrent file, since trackers are off)</span>
+        <label class="grid gap-1"><span class="text-[11px] text-dim">Peers to contact, host:port separated by commas (needed when trackers are off, which is always here)</span>
           <input x-model="torrentForm.peers" spellcheck="false" class="field font-mono" placeholder="192.168.1.20:6881"></label>
         <p x-show="torrentNotice" x-text="torrentNotice" role="status" class="font-mono text-[11px] text-dim"></p>
       </div>

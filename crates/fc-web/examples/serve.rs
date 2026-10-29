@@ -33,7 +33,14 @@ async fn main() {
         ..Default::default()
     });
     // BitTorrent downloads go to a folder of their own, below the share root.
-    let torrents = TorrentEngine::start(EngineConfig::new(root.join("BitTorrent"))).await.expect("torrent engine");
+    // Transfers and waiting magnets are kept in the agent's folder, so they survive a restart.
+    let torrent_state = fc_remote::config::default_agent_dir().join("torrents");
+    let torrents = TorrentEngine::start(EngineConfig {
+        state_dir: Some(torrent_state),
+        ..EngineConfig::new(root.join("BitTorrent"))
+    })
+    .await
+    .expect("torrent engine");
     let state = build(
         queue,
         events,

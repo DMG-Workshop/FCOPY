@@ -5,7 +5,6 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::Json;
 use axum::body::Bytes;
@@ -462,8 +461,6 @@ pub async fn delete_user(State(s): State<Arc<AppState>>, p: Principal, Path(name
 pub const MAX_TORRENT_FILE: usize = 4 << 20;
 /// Longest magnet link accepted.
 const MAX_MAGNET: usize = 8 << 10;
-/// How long an add waits for a magnet link's metadata before answering "pending".
-const METADATA_WAIT: Duration = Duration::from_secs(2);
 /// Most peer addresses given with one `.torrent` file.
 const MAX_PEERS: usize = 50;
 
@@ -487,27 +484,23 @@ pub async fn list_torrents(State(s): State<Arc<AppState>>, p: Principal) -> Resu
 #[derive(Deserialize)]
 pub struct MagnetReq {
     pub magnet: String,
+    /// Comma-separated `host:port` peers to ask for the file list. Trackers are off.
+    pub peers: Option<String>,
 }
 
-/// Add a magnet link. Its file list must come from peers first, so the call
-/// waits briefly: `201` with the id if it arrived, `202` with `pending` if not.
-/// The transfer then appears in the list by itself.
-pub async fn add_magnet(State(s): State<Arc<AppState>>, p: Principal, Json(req): Json<MagnetReq>) -> Result<Response, ApiError> {
+/// Add a magnet link. The transfer is listed at once, as waiting for its file
+/// list until peers send it, then it becomes an ordinary download under the
+/// same id.
+pub async fn add_magnet(State(s): State<Arc<AppState>>, p: Principal, Json(req): Json<MagnetReq>) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     require_admin(&p)?;
     let engine = engine(&s)?;
     let magnet = req.magnet.trim();
     if !magnet.starts_with("magnet:?") || magnet.len() > MAX_MAGNET {
         return Err(ApiError::BadRequest("paste a magnet link that starts with magnet:?".into()));
     }
-    match engine.add_magnet(magnet, false, METADATA_WAIT).await {
-        Ok(id) => Ok((StatusCode::CREATED, Json(json!({ "id": id }))).into_response()),
-        Err(TorrentError::MetadataPending) => Ok((
-            StatusCode::ACCEPTED,
-            Json(json!({ "pending": true, "error": TorrentError::MetadataPending.to_string() })),
-        )
-            .into_response()),
-        Err(e) => Err(ApiError::BadRequest(e.to_string())),
-    }
+    let peers = parse_peers(req.peers.as_deref())?;
+    let id = engine.add_magnet(magnet, false, peers).await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok((StatusCode::CREATED, Json(json!({ "id": id }))))
 }
 
 #[derive(Deserialize)]

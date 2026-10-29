@@ -7,16 +7,31 @@
 //! a session on a LAN or in tests never reaches the public internet. Peers
 //! come from the `.torrent` file's trackers when they are enabled, or from
 //! peers given explicitly.
+//!
+//! A magnet link has no file list until peers send one, so `librqbit` does not
+//! register it until then. The engine keeps those magnets itself: they show up
+//! in [`TorrentEngine::list`] at once, with [`TorrentPhase::WaitingForMetadata`],
+//! and become ordinary transfers when the list arrives. With a `state_dir`, both
+//! the transfers and the waiting magnets survive a restart.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use librqbit::spawn_utils::BlockingSpawner;
 use librqbit::{
     AddTorrent, AddTorrentOptions, CreateTorrentOptions, ListenerMode, ListenerOptions, Session, SessionOptions,
-    TorrentStatsState, create_torrent,
+    SessionPersistenceConfig, TorrentStatsState, create_torrent,
 };
-use librqbit::spawn_utils::BlockingSpawner;
+use serde::{Deserialize, Serialize};
+
+/// Ids at or above this belong to magnets still waiting for metadata. The
+/// session's own ids are small counters, so the two ranges never meet.
+pub const PENDING_ID_BASE: usize = 1 << 48;
+
+/// Waiting magnets are saved here, inside the state directory.
+const PENDING_FILE: &str = "pending-magnets.json";
 
 #[derive(Debug, thiserror::Error)]
 pub enum TorrentError {
@@ -24,8 +39,6 @@ pub enum TorrentError {
     Engine(String),
     #[error("no transfer with id {0}")]
     NotFound(usize),
-    #[error("the magnet link is still waiting for metadata from peers; it will appear in the list when it arrives")]
-    MetadataPending,
 }
 
 impl From<anyhow::Error> for TorrentError {
@@ -34,11 +47,20 @@ impl From<anyhow::Error> for TorrentError {
     }
 }
 
+impl From<std::io::Error> for TorrentError {
+    fn from(e: std::io::Error) -> Self {
+        TorrentError::Engine(e.to_string())
+    }
+}
+
 /// Settings for [`TorrentEngine::start`].
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Where downloads are written, and where seeds are read from.
     pub output_dir: PathBuf,
+    /// Where transfers and waiting magnets are kept between runs. `None` keeps
+    /// nothing: the engine starts empty and forgets everything on exit.
+    pub state_dir: Option<PathBuf>,
     /// TCP port for incoming peers. `None` listens for nothing: outgoing only.
     pub listen_port: Option<u16>,
     /// Use the DHT to find peers. Off by default.
@@ -49,7 +71,7 @@ pub struct EngineConfig {
 
 impl EngineConfig {
     pub fn new(output_dir: impl Into<PathBuf>) -> Self {
-        Self { output_dir: output_dir.into(), listen_port: None, dht: false, trackers: false }
+        Self { output_dir: output_dir.into(), state_dir: None, listen_port: None, dht: false, trackers: false }
     }
 }
 
@@ -64,6 +86,20 @@ pub enum TorrentState {
     Error,
 }
 
+/// The one word a UI shows for a transfer's situation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TorrentPhase {
+    /// A magnet link, waiting for peers to send its file list.
+    WaitingForMetadata,
+    /// Checking the data already on disk against the torrent.
+    Checking,
+    Downloading,
+    /// Every piece is here; the transfer keeps uploading until it is removed.
+    Seeding,
+    Paused,
+    Failed,
+}
+
 /// One transfer, as the UI shows it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TorrentStatus {
@@ -71,6 +107,8 @@ pub struct TorrentStatus {
     pub info_hash: String,
     pub name: Option<String>,
     pub state: TorrentState,
+    /// True while a magnet link is still waiting for its file list.
+    pub metadata_pending: bool,
     /// True once every piece is present and verified.
     pub finished: bool,
     pub progress_bytes: u64,
@@ -82,18 +120,6 @@ pub struct TorrentStatus {
     pub error: Option<String>,
 }
 
-/// The one word a UI shows for a transfer's situation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TorrentPhase {
-    /// Checking the data already on disk against the torrent.
-    Checking,
-    Downloading,
-    /// Every piece is here; the transfer keeps uploading until it is removed.
-    Seeding,
-    Paused,
-    Failed,
-}
-
 impl TorrentStatus {
     /// 0.0 to 100.0.
     pub fn percent(&self) -> f64 {
@@ -102,36 +128,76 @@ impl TorrentStatus {
 
     pub fn phase(&self) -> TorrentPhase {
         match self.state {
-            TorrentState::Initializing => TorrentPhase::Checking,
-            TorrentState::Paused => TorrentPhase::Paused,
             TorrentState::Error => TorrentPhase::Failed,
+            TorrentState::Paused => TorrentPhase::Paused,
+            TorrentState::Initializing if self.metadata_pending => TorrentPhase::WaitingForMetadata,
+            TorrentState::Initializing => TorrentPhase::Checking,
             TorrentState::Live if self.finished => TorrentPhase::Seeding,
             TorrentState::Live => TorrentPhase::Downloading,
         }
     }
 }
 
+/// A magnet link still waiting for its file list.
+struct Pending {
+    id: usize,
+    magnet: String,
+    paused: bool,
+    peers: Vec<SocketAddr>,
+    /// The task that waits for metadata. `None` once it has finished.
+    task: Option<tokio::task::JoinHandle<()>>,
+    error: Option<String>,
+    /// The session's id, once the file list has arrived. The transfer keeps
+    /// this entry's id, so a row in the UI does not change identity.
+    resolved: Option<usize>,
+}
+
+/// What is written to disk for a waiting magnet.
+#[derive(Serialize, Deserialize)]
+struct SavedMagnet {
+    magnet: String,
+    paused: bool,
+    peers: Vec<SocketAddr>,
+}
+
+type PendingList = Arc<Mutex<Vec<Pending>>>;
+
 pub struct TorrentEngine {
     session: Arc<Session>,
+    pending: PendingList,
+    next_pending: AtomicUsize,
+    pending_file: Option<PathBuf>,
 }
 
 impl TorrentEngine {
-    /// Start a session. Must be called from inside a Tokio runtime.
+    /// Start a session. Must be called from inside a Tokio runtime. With a
+    /// `state_dir`, transfers and waiting magnets saved by an earlier run come back.
     pub async fn start(config: EngineConfig) -> Result<Self, TorrentError> {
         let listen = config.listen_port.map(|port| ListenerOptions {
             mode: ListenerMode::TcpOnly,
             listen_addr: SocketAddr::from(([0, 0, 0, 0], port)),
             ..Default::default()
         });
+        let persistence = config.state_dir.clone().map(|folder| SessionPersistenceConfig::Json { folder: Some(folder) });
         let options = SessionOptions {
             dht: if config.dht { Default::default() } else { None },
             disable_trackers: !config.trackers,
-            persistence: None,
+            persistence,
             listen,
             ..Default::default()
         };
         let session = Session::new_with_opts(config.output_dir, options).await?;
-        Ok(Self { session })
+        let engine = Self {
+            session,
+            pending: Arc::new(Mutex::new(Vec::new())),
+            next_pending: AtomicUsize::new(PENDING_ID_BASE),
+            pending_file: config.state_dir.map(|d| d.join(PENDING_FILE)),
+        };
+        for saved in load_saved(engine.pending_file.as_deref())? {
+            let peers = saved.peers.clone();
+            engine.spawn_magnet(&saved.magnet, saved.paused, peers)?;
+        }
+        Ok(engine)
     }
 
     /// The TCP address peers can connect to, if listening.
@@ -139,42 +205,68 @@ impl TorrentEngine {
         self.session.listen_addr()
     }
 
-    /// Add by magnet link. A magnet has no file list, so the transfer is only
-    /// registered once peers have sent the metadata. Waits up to `wait` for that.
-    /// If it hasn't arrived, returns [`TorrentError::MetadataPending`]; the
-    /// attempt goes on in the background and the transfer appears in `list`
-    /// when the metadata arrives.
-    pub async fn add_magnet(&self, magnet: &str, paused: bool, wait: std::time::Duration) -> Result<usize, TorrentError> {
-        // `add_torrent` does not return until the file list has arrived from peers,
-        // which can take minutes. So run it in the background and return as soon
-        // as the transfer appears in the session. The metadata wait goes on in the
-        // background task.
-        let before: std::collections::HashSet<usize> = self.ids().into_iter().collect();
-        let options = AddTorrentOptions { paused, ..Default::default() };
-        let session = self.session.clone();
-        let url = magnet.to_string();
-        let task = tokio::spawn(async move { session.add_torrent(AddTorrent::from_url(url), Some(options)).await.map(|_| ()) });
-        let deadline = std::time::Instant::now() + wait;
-        loop {
-            if let Some(id) = self.ids().into_iter().find(|id| !before.contains(id)) {
-                return Ok(id);
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(TorrentError::MetadataPending);
-            }
-            if task.is_finished() {
-                return match task.await {
-                    Ok(Ok(())) => Err(TorrentError::Engine("the magnet link was not added".into())),
-                    Ok(Err(e)) => Err(e.into()),
-                    Err(e) => Err(TorrentError::Engine(e.to_string())),
-                };
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+    /// Add a magnet link and return its id at once. Until its file list has
+    /// arrived from peers the transfer is listed as waiting for metadata; `peers`
+    /// are contacted for that list. Waiting magnets are saved with the state
+    /// directory, so they are still waiting after a restart.
+    pub async fn add_magnet(&self, magnet: &str, paused: bool, peers: Vec<SocketAddr>) -> Result<usize, TorrentError> {
+        self.spawn_magnet(magnet, paused, peers)
     }
 
-    fn ids(&self) -> Vec<usize> {
-        self.session.with_torrents(|torrents| torrents.map(|(id, _)| id).collect())
+    /// Start waiting for one magnet's metadata in the background, and list it.
+    fn spawn_magnet(&self, magnet: &str, paused: bool, peers: Vec<SocketAddr>) -> Result<usize, TorrentError> {
+        if !magnet.starts_with("magnet:?") || magnet_param(magnet, "xt").and_then(|x| x.strip_prefix("urn:btih:").map(str::to_string)).is_none() {
+            return Err(TorrentError::Engine("not a magnet link with an info hash".into()));
+        }
+        let id = PENDING_ID_BASE + self.next_pending.fetch_add(1, Ordering::Relaxed);
+        let mut list = lock(&self.pending);
+        let session = self.session.clone();
+        let shared = self.pending.clone();
+        let file = self.pending_file.clone();
+        let url = magnet.to_string();
+        let options = AddTorrentOptions { paused, initial_peers: (!peers.is_empty()).then(|| peers.clone()), ..Default::default() };
+        // The task locks the list before it reports anything, so the entry below is
+        // always in place by the time it does.
+        let task = tokio::spawn(async move {
+            let result = session.add_torrent(AddTorrent::from_url(url), Some(options)).await;
+            let mut list = lock(&shared);
+            if let Some(p) = list.iter_mut().find(|p| p.id == id) {
+                p.task = None;
+                match result {
+                    Ok(response) => match response.into_handle() {
+                        Some(handle) => p.resolved = Some(handle.id()),
+                        None => p.error = Some("the magnet link is already in the session".into()),
+                    },
+                    Err(e) => p.error = Some(format!("{e:#}")),
+                }
+            }
+            // Every change rewrites the whole file. A failed write is retried by the next change.
+            let _ = save_pending(file.as_deref(), &list);
+        });
+        list.push(Pending { id, magnet: magnet.to_string(), paused, peers, task: Some(task), error: None, resolved: None });
+        save_pending(self.pending_file.as_deref(), &list)?;
+        Ok(id)
+    }
+
+    /// Every transfer the session knows about, waiting magnets included. A magnet
+    /// that has resolved is listed under the id it had while waiting.
+    pub fn list(&self) -> Vec<TorrentStatus> {
+        let pending = lock(&self.pending);
+        let mut out: Vec<TorrentStatus> = self.session.with_torrents(|torrents| {
+            torrents
+                .map(|(real, handle)| {
+                    let id = pending.iter().find(|p| p.resolved == Some(real)).map_or(real, |p| p.id);
+                    status_of(id, handle)
+                })
+                .collect()
+        });
+        out.extend(pending.iter().filter(|p| p.resolved.is_none()).map(pending_status));
+        out.sort_by_key(|s| s.id);
+        out
+    }
+
+    pub fn status(&self, id: usize) -> Result<TorrentStatus, TorrentError> {
+        self.list().into_iter().find(|s| s.id == id).ok_or(TorrentError::NotFound(id))
     }
 
     /// Add a `.torrent` file's bytes. `peers` are contacted directly, which is
@@ -191,19 +283,6 @@ impl TorrentEngine {
         Ok(handle.id())
     }
 
-    /// Every transfer the session knows about.
-    pub fn list(&self) -> Vec<TorrentStatus> {
-        let mut out: Vec<TorrentStatus> = self.session.with_torrents(|torrents| {
-            torrents.map(|(id, handle)| status_of(id, handle)).collect()
-        });
-        out.sort_by_key(|s| s.id);
-        out
-    }
-
-    pub fn status(&self, id: usize) -> Result<TorrentStatus, TorrentError> {
-        self.list().into_iter().find(|s| s.id == id).ok_or(TorrentError::NotFound(id))
-    }
-
     pub async fn pause(&self, id: usize) -> Result<(), TorrentError> {
         let handle = self.handle(id)?;
         self.session.pause(&handle).await?;
@@ -216,10 +295,31 @@ impl TorrentEngine {
         Ok(())
     }
 
-    /// Stop and forget a transfer. `delete_files` also removes its data.
+    /// Stop and forget a transfer. `delete_files` also removes its data. A
+    /// magnet still waiting has no data yet, so it is only forgotten.
     pub async fn remove(&self, id: usize, delete_files: bool) -> Result<(), TorrentError> {
-        self.session.delete(librqbit::api::TorrentIdOrHash::Id(id), delete_files).await?;
+        // The list is locked only inside `forget`, never across the await below.
+        if let Some(real) = self.forget(id)? {
+            self.session.delete(librqbit::api::TorrentIdOrHash::Id(real), delete_files).await?;
+        }
         Ok(())
+    }
+
+    /// Drop the bookkeeping for `id`. Returns the session id to delete, if any:
+    /// none for a magnet that never resolved.
+    fn forget(&self, id: usize) -> Result<Option<usize>, TorrentError> {
+        let mut list = lock(&self.pending);
+        if id < PENDING_ID_BASE {
+            list.retain(|p| p.resolved != Some(id));
+            return Ok(Some(id));
+        }
+        let index = list.iter().position(|p| p.id == id).ok_or(TorrentError::NotFound(id))?;
+        let removed = list.remove(index);
+        if let Some(task) = removed.task {
+            task.abort();
+        }
+        save_pending(self.pending_file.as_deref(), &list)?;
+        Ok(removed.resolved)
     }
 
     /// Build a `.torrent` file for a file or folder, with the given name and piece size.
@@ -230,12 +330,111 @@ impl TorrentEngine {
         Ok(result.as_bytes()?.to_vec())
     }
 
+    /// Stop the session. Waiting magnets stop waiting, but stay saved.
     pub async fn shutdown(&self) {
+        for p in lock(&self.pending).iter_mut() {
+            if let Some(task) = p.task.take() {
+                task.abort();
+            }
+        }
         self.session.stop().await;
     }
 
+    /// The session's id behind a listed id. A magnet that is still waiting has none yet.
+    fn real_id(&self, id: usize) -> Result<usize, TorrentError> {
+        if id < PENDING_ID_BASE {
+            return Ok(id);
+        }
+        let list = lock(&self.pending);
+        let p = list.iter().find(|p| p.id == id).ok_or(TorrentError::NotFound(id))?;
+        p.resolved.ok_or_else(|| TorrentError::Engine("a magnet link cannot be paused until its file list arrives".into()))
+    }
+
     fn handle(&self, id: usize) -> Result<Arc<librqbit::ManagedTorrent>, TorrentError> {
-        self.session.get(librqbit::api::TorrentIdOrHash::Id(id)).ok_or(TorrentError::NotFound(id))
+        let real = self.real_id(id)?;
+        self.session.get(librqbit::api::TorrentIdOrHash::Id(real)).ok_or(TorrentError::NotFound(id))
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn load_saved(path: Option<&Path>) -> Result<Vec<SavedMagnet>, TorrentError> {
+    let Some(path) = path else { return Ok(vec![]) };
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| TorrentError::Engine(format!("{}: {e}", path.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Write the magnets still waiting, with a temporary file and a rename so a
+/// crash never leaves half a file behind. Magnets that failed or have resolved
+/// are not kept: a resolved one is a session transfer, saved by librqbit.
+fn save_pending(path: Option<&Path>, list: &[Pending]) -> Result<(), TorrentError> {
+    let Some(path) = path else { return Ok(()) };
+    let saved: Vec<SavedMagnet> = list
+        .iter()
+        .filter(|p| p.error.is_none() && p.resolved.is_none())
+        .map(|p| SavedMagnet { magnet: p.magnet.clone(), paused: p.paused, peers: p.peers.clone() })
+        .collect();
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(&saved).map_err(|e| TorrentError::Engine(e.to_string()))?;
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// One query parameter of a magnet link, as written (not decoded).
+fn magnet_param(magnet: &str, key: &str) -> Option<String> {
+    let query = magnet.strip_prefix("magnet:?")?;
+    query.split('&').find_map(|pair| pair.strip_prefix(key)?.strip_prefix('=').map(str::to_string))
+}
+
+/// Decode `%XX` escapes and `+` in a magnet's display name.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < bytes.len() => {
+                match std::str::from_utf8(&bytes[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    Some(byte) => {
+                        out.push(byte);
+                        i += 2;
+                    }
+                    None => out.push(b'%'),
+                }
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn pending_status(p: &Pending) -> TorrentStatus {
+    let magnet_hash = magnet_param(&p.magnet, "xt")
+        .and_then(|x| x.strip_prefix("urn:btih:").map(str::to_string))
+        .unwrap_or_default();
+    let name = magnet_param(&p.magnet, "dn").map(|n| percent_decode(&n)).filter(|n| !n.is_empty());
+    TorrentStatus {
+        id: p.id,
+        info_hash: magnet_hash,
+        name,
+        state: if p.error.is_some() { TorrentState::Error } else { TorrentState::Initializing },
+        metadata_pending: p.task.is_some(),
+        finished: false,
+        progress_bytes: 0,
+        total_bytes: 0,
+        download_mbps: 0.0,
+        upload_mbps: 0.0,
+        uploaded_bytes: 0,
+        live_peers: 0,
+        error: p.error.clone(),
     }
 }
 
@@ -253,6 +452,7 @@ fn status_of(id: usize, handle: &librqbit::ManagedTorrent) -> TorrentStatus {
         info_hash: handle.info_hash().as_string(),
         name: handle.name(),
         state,
+        metadata_pending: false,
         finished: stats.finished,
         progress_bytes: stats.progress_bytes,
         total_bytes: stats.total_bytes,

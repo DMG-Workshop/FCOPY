@@ -59,6 +59,7 @@ const STATE_LABELS = {
 const STATUS_LABELS = { online: 'online', offline: 'offline', identity_changed: 'identity changed' };
 
 const TORRENT_PHASE_LABELS = {
+  waiting: 'Waiting for peers',
   checking: 'Checking',
   downloading: 'Downloading',
   seeding: 'Seeding',
@@ -262,10 +263,10 @@ function fcopy() {
       const magnet = this.torrentForm.magnet.trim();
       const file = this.torrentForm.file;
       let r;
+      const peers = this.torrentForm.peers.trim();
       if (magnet) {
-        r = await this.api('POST', '/api/torrents/magnet', { magnet });
+        r = await this.api('POST', '/api/torrents/magnet', { magnet, peers: peers || null });
       } else if (file) {
-        const peers = this.torrentForm.peers.trim();
         const query = peers ? `?peers=${encodeURIComponent(peers)}` : '';
         // The body is the raw file, not JSON.
         r = await fetch(`/api/torrents/file${query}`, {
@@ -280,14 +281,9 @@ function fcopy() {
       }
 
       if (r.status === 201) {
+        // A magnet link is listed at once as waiting for peers, then downloads under the same row.
         this.resetTorrentForm();
         this.closeModal();
-      } else if (r.status === 202) {
-        // A magnet link is still waiting for its file list from peers; it
-        // appears in the list by itself, so say so where it can be seen.
-        this.resetTorrentForm();
-        this.closeModal();
-        this.notify('Magnet link added. It appears in the list once peers send its file list.');
       } else {
         this.torrentNotice = await errorText(r);
       }

@@ -195,7 +195,13 @@ async fn a_magnet_link_answers_pending_when_no_peers_send_its_list() {
     let admin = login(&e, "admin", "admin-password").await;
     let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=example";
     let r = json_call(&e, "POST", "/api/torrents/magnet", Some(&admin), json!({ "magnet": magnet })).await;
-    assert_eq!(r.status, StatusCode::ACCEPTED);
-    assert_eq!(r.json["pending"], true);
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.json);
+    let id = r.json["id"].as_u64().unwrap();
+
+    // The row is listed at once, as waiting, under the id the add returned.
+    let list = send(&e, "GET", "/api/torrents", Some(&admin), Body::empty(), None).await;
+    let row = list.json.as_array().unwrap().iter().find(|t| t["id"] == id).cloned().unwrap_or_default();
+    assert_eq!(row["phase"], "waiting");
+    assert_eq!(row["name"], "example");
     e.state.torrents.as_ref().unwrap().shutdown().await;
 }

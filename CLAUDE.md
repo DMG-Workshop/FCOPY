@@ -157,6 +157,8 @@ Still open:
   holds the one-job worker until its download finishes. Web console: admin-only tab
   with magnet and .torrent add (optional peer addresses), pause, resume, remove,
   delete data; rows arrive in telemetry frames. Desktop tab still disabled.
-  Gaps: no persistence across restarts; a magnet has no row until its file list
-  arrives from peers; trackers and DHT off by default.
+  A magnet is listed at once as "waiting for peers", keeps its id when its file
+  list arrives, and both transfers and waiting magnets survive a restart when a
+  state directory is given (librqbit persistence plus pending-magnets.json).
+  Gaps: trackers and DHT off by default; magnets cannot be paused while waiting.
 - Public certificate for the web console; the self-signed one needs trusting once.

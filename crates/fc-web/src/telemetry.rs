@@ -51,6 +51,7 @@ const MIB: f64 = 1024.0 * 1024.0;
 impl TorrentDto {
     pub fn from_status(s: &TorrentStatus) -> Self {
         let phase = match s.phase() {
+            TorrentPhase::WaitingForMetadata => "waiting",
             TorrentPhase::Checking => "checking",
             TorrentPhase::Downloading => "downloading",
             TorrentPhase::Seeding => "seeding",
