@@ -96,11 +96,11 @@
             <tr>
               <th class="w-8 p-2 text-center"><input type="checkbox" class="accent-brand" :checked="allSelected()" @change="toggleAll($event.target.checked)" aria-label="Select all"></th>
               <th class="p-2">Name and path</th>
-              <th class="w-24 p-2 text-right">Size</th>
+              <th class="hidden w-24 p-2 text-right lg:table-cell">Size</th>
               <th class="w-52 p-2">Progress</th>
               <th class="w-36 p-2">Status</th>
               <th class="w-32 p-2 text-right">Rate</th>
-              <th class="w-24 p-2 text-right">Files</th>
+              <th class="hidden w-24 p-2 text-right lg:table-cell">Files</th>
               <th class="w-24 p-2 text-center">Actions</th>
             </tr>
           </thead>
@@ -112,9 +112,9 @@
                   <div class="flex items-center gap-2">
                     <span class="truncate font-sans text-[13px] font-semibold text-strong" x-text="job.label"></span>
                   </div>
-                  <div class="truncate text-[10px] text-faint" x-text="job.current_file || job.owner || '—'"></div>
+                  <div class="truncate text-[10px] text-faint" x-text="job.remote ? `→ ${job.destination}` : (job.current_file || job.owner || '—')"></div>
                 </td>
-                <td class="hidden p-2 text-right tabular-nums text-body md:table-cell" x-text="fmtBytes(job.bytes_total)"></td>
+                <td class="hidden p-2 text-right tabular-nums text-body lg:table-cell" x-text="fmtBytes(job.bytes_total)"></td>
                 <td class="mt-2 block p-0 md:table-cell md:p-2">
                   <div class="flex items-center gap-2">
                     <div class="h-1.5 flex-1 overflow-hidden bg-raised" role="progressbar" :aria-valuenow="Math.round(job.percent)" aria-valuemin="0" aria-valuemax="100" :aria-label="job.label">
@@ -128,7 +128,7 @@
                   <div class="text-[10px] text-faint" x-text="job.state === 'running' ? `ETA ${fmtEta(job.eta_secs)}` : ''"></div>
                 </td>
                 <td class="hidden p-2 text-right tabular-nums text-body md:table-cell" x-text="fmtRate(job.rate_bps)"></td>
-                <td class="hidden p-2 text-right tabular-nums text-dim md:table-cell" x-text="`${job.files_done}/${job.files_total}`"></td>
+                <td class="hidden p-2 text-right tabular-nums text-dim lg:table-cell" x-text="`${job.files_done}/${job.files_total}`"></td>
                 <td class="block p-0 md:table-cell md:p-2">
                   <div class="flex justify-end gap-1">
                     <button x-show="job.state === 'running'" class="btn-mini" @click="act(job, 'pause')">Pause</button>
@@ -261,13 +261,29 @@
       <div class="grid gap-3 p-4">
         <label class="grid gap-1"><span class="text-[11px] text-dim">Sources, one absolute path per line</span>
           <textarea rows="3" x-model="addForm.sources" required spellcheck="false" class="field font-mono"></textarea></label>
-        <label class="grid gap-1"><span class="text-[11px] text-dim">Destination folder</span>
-          <input x-model="addForm.dest" required spellcheck="false" class="field font-mono"></label>
+        <label class="grid gap-1"><span class="text-[11px] text-dim" x-text="addForm.mode === 'remote' ? 'Folder on the PC, below its share' : 'Destination folder'"></span>
+          <input x-model="addForm.dest" required spellcheck="false" class="field font-mono"
+                 :placeholder="addForm.mode === 'remote' ? 'backup/photos' : '/mnt/storage/downloads'"></label>
         <div class="grid grid-cols-2 gap-2">
           <label class="grid gap-1"><span class="text-[11px] text-dim">Mode</span>
-            <select class="field font-mono" disabled><option>Local filesystem copy</option></select></label>
+            <select x-model="addForm.mode" class="field font-mono">
+              <option value="local">Local filesystem copy</option>
+              <option value="remote" x-show="isAdmin()">Remote node (paired PC)</option>
+            </select></label>
           <label class="grid gap-1"><span class="text-[11px] text-dim">Label</span>
             <input x-model="addForm.label" class="field"></label>
+        </div>
+        <div x-show="addForm.mode === 'remote'" x-cloak class="grid gap-2 border border-line p-3">
+          <label class="grid gap-1"><span class="text-[11px] text-dim">Paired PC</span>
+            <select x-model="addForm.clientId" class="field font-mono">
+              <option value="">Choose a PC</option>
+              <template x-for="c in clients" :key="c.id">
+                <option :value="c.id" x-text="`${c.name} — ${c.target}`"></option>
+              </template>
+            </select></label>
+          <p x-show="clients.length === 0" class="text-[11px] text-warn">No PCs paired yet. Pair one from the Remote node tab first.</p>
+          <label class="grid gap-1"><span class="text-[11px] text-dim">That PC's password or access key, sent with this job only</span>
+            <input type="password" x-model="addForm.password" autocomplete="off" class="field font-mono"></label>
         </div>
         <p x-show="addNotice" x-text="addNotice" role="status" class="font-mono text-[11px] text-dim"></p>
       </div>

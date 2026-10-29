@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use fc_engine::{ErrorPolicy, JobId, JobInfo, RetryPolicy, TransferRequest};
+use fc_remote::backend::RemoteBackend;
 use fc_remote::client::{ClientError, Connector, RemoteSpec, Session};
 
 use crate::auth::{self, AuthError, Principal, Role, SESSION_COOKIE};
@@ -95,9 +96,28 @@ pub async fn list_transfers(State(s): State<Arc<AppState>>, p: Principal) -> Jso
 pub struct CreateTransfer {
     /// Absolute paths of files or folders to copy.
     pub sources: Vec<PathBuf>,
-    /// Destination folder. Created if missing.
+    /// Destination folder. Created if missing. On a remote job this is a folder
+    /// on the paired PC, below its share, for example `backup/photos`.
     pub dest: PathBuf,
     pub label: Option<String>,
+    /// Send to a paired PC instead of this machine. Admins only.
+    pub remote: Option<RemoteTarget>,
+}
+
+#[derive(Deserialize)]
+pub struct RemoteTarget {
+    pub client_id: u64,
+    /// Login for the PC. Used for this job only, never stored.
+    pub password: String,
+}
+
+/// The profile's address, with the path replaced by the job's folder. The
+/// profile's user and port are kept.
+fn remote_spec(target: &str, dest: &str) -> Result<RemoteSpec, fc_remote::client::SpecError> {
+    let base = RemoteSpec::parse(target)?;
+    let mut spec = RemoteSpec::parse(&format!("{}:/{}", base.host_port(), dest.trim_matches('/')))?;
+    spec.user = base.user;
+    Ok(spec)
 }
 
 #[derive(Serialize)]
@@ -118,11 +138,26 @@ pub async fn create_transfer(
             return Err(ApiError::BadRequest(format!("source not found inside a share: {}", src.display())));
         }
     }
-    if !within_roots(&s.roots, &req.dest) {
-        return Err(ApiError::BadRequest("destination is outside every share".into()));
-    }
-
-    let mut request = TransferRequest::into_dir(req.sources, &req.dest);
+    let mut request = match req.remote {
+        None => {
+            if !within_roots(&s.roots, &req.dest) {
+                return Err(ApiError::BadRequest("destination is outside every share".into()));
+            }
+            TransferRequest::into_dir(req.sources, &req.dest)
+        }
+        Some(remote) => {
+            require_admin(&p)?;
+            if remote.password.is_empty() {
+                return Err(ApiError::BadRequest("the PC's password or access key is required".into()));
+            }
+            let profile = s.clients.get(remote.client_id).ok_or(ApiError::NotFound)?;
+            let dest = req.dest.to_string_lossy().to_string();
+            let spec = remote_spec(&profile.target, &dest).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            let connector = Connector::new(spec).password(remote.password).pinned(Some(profile.fingerprint));
+            let backend = RemoteBackend::new(connector).map_err(|e| ApiError::Remote(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            TransferRequest::to_backend(req.sources, Arc::new(backend))
+        }
+    };
     if let Some(label) = req.label.filter(|l| !l.trim().is_empty()) {
         request = request.with_label(label);
     }

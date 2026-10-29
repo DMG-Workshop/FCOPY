@@ -23,6 +23,8 @@ use fc_web::{AppState, Config, build, router};
 
 struct Env {
     state: Arc<AppState>,
+    /// Local share root the dashboard may read from.
+    root: tempfile::TempDir,
     router: Router,
     state_dir: tempfile::TempDir,
     _share: tempfile::TempDir,
@@ -68,7 +70,7 @@ async fn env() -> Env {
     state.users.add("admin", "admin-password", Role::Admin).unwrap();
     state.users.add("bob", "bobs-password", Role::User).unwrap();
     let router = router(state.clone());
-    Env { state, router, state_dir, _share: share, agent, agent_port, agent_fp }
+    Env { state, router, root, state_dir, _share: share, agent, agent_port, agent_fp }
 }
 
 struct Reply {
@@ -317,4 +319,88 @@ async fn any_user_can_read_whether_the_queue_is_paused() {
     send(&e, "POST", "/api/queue/pause", Some(&admin), None).await;
     assert_eq!(send(&e, "GET", "/api/queue", Some(&bob), None).await.json["paused"], true);
     send(&e, "POST", "/api/queue/resume", Some(&admin), None).await;
+}
+
+/// Pair the test agent, then return the new client's id.
+async fn paired_client(e: &Env, admin: &str) -> u64 {
+    let r = send(e, "POST", "/api/clients", Some(admin), Some(pair_body(e, Some(&e.agent_fp), "agent-pass-1"))).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.json);
+    send(e, "GET", "/api/clients", Some(admin), None).await.json[0]["id"].as_u64().unwrap()
+}
+
+fn remote_job(e: &Env, client_id: u64, dest: &str, password: &str) -> Value {
+    let file = e.root.path().join("note.txt");
+    std::fs::write(&file, b"remote note").unwrap();
+    json!({
+        "sources": [file],
+        "dest": dest,
+        "label": "web remote",
+        "remote": { "client_id": client_id, "password": password },
+    })
+}
+
+async fn wait_for_state(e: &Env, cookie: &str, state: &str) -> Value {
+    for _ in 0..200 {
+        let list = send(e, "GET", "/api/transfers", Some(cookie), None).await.json;
+        if let Some(job) = list.as_array().and_then(|a| a.first()) {
+            if job["state"] == state {
+                return job.clone();
+            }
+            assert_ne!(job["state"], "failed", "job failed: {job}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("job never reached {state}");
+}
+
+#[tokio::test]
+async fn add_task_to_a_paired_pc_lands_the_files_there() {
+    let e = env().await;
+    let admin = login(&e, "admin", "admin-password").await;
+    let id = paired_client(&e, &admin).await;
+
+    let r = send(&e, "POST", "/api/transfers", Some(&admin), Some(remote_job(&e, id, "backup/from-web", "agent-pass-1"))).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.json);
+
+    let job = wait_for_state(&e, &admin, "completed").await;
+    assert_eq!(job["remote"], true);
+    assert!(job["destination"].as_str().unwrap().contains("backup/from-web"), "{job}");
+    assert_eq!(std::fs::read(e._share.path().join("from-web/note.txt")).unwrap(), b"remote note");
+    e.agent.shutdown();
+}
+
+#[tokio::test]
+async fn the_password_is_never_returned_by_the_api() {
+    let e = env().await;
+    let admin = login(&e, "admin", "admin-password").await;
+    let id = paired_client(&e, &admin).await;
+    send(&e, "POST", "/api/transfers", Some(&admin), Some(remote_job(&e, id, "backup/quiet", "agent-pass-1"))).await;
+    wait_for_state(&e, &admin, "completed").await;
+    let list = send(&e, "GET", "/api/transfers", Some(&admin), None).await;
+    assert!(!list.json.to_string().contains("agent-pass-1"));
+    e.agent.shutdown();
+}
+
+#[tokio::test]
+async fn remote_jobs_are_refused_for_users_and_bad_input() {
+    let e = env().await;
+    let admin = login(&e, "admin", "admin-password").await;
+    let bob = login(&e, "bob", "bobs-password").await;
+    let id = paired_client(&e, &admin).await;
+
+    let as_bob = send(&e, "POST", "/api/transfers", Some(&bob), Some(remote_job(&e, id, "backup/x", "agent-pass-1"))).await;
+    assert_eq!(as_bob.status, StatusCode::FORBIDDEN);
+
+    let unknown = send(&e, "POST", "/api/transfers", Some(&admin), Some(remote_job(&e, 999, "backup/x", "agent-pass-1"))).await;
+    assert_eq!(unknown.status, StatusCode::NOT_FOUND);
+
+    let no_password = send(&e, "POST", "/api/transfers", Some(&admin), Some(remote_job(&e, id, "backup/x", ""))).await;
+    assert_eq!(no_password.status, StatusCode::BAD_REQUEST);
+
+    let escape = send(&e, "POST", "/api/transfers", Some(&admin), Some(remote_job(&e, id, "backup/../../etc", "agent-pass-1"))).await;
+    assert_eq!(escape.status, StatusCode::BAD_REQUEST);
+
+    let no_share = send(&e, "POST", "/api/transfers", Some(&admin), Some(remote_job(&e, id, "", "agent-pass-1"))).await;
+    assert_eq!(no_share.status, StatusCode::BAD_REQUEST);
+    e.agent.shutdown();
 }

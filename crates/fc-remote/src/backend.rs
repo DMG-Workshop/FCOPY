@@ -51,7 +51,7 @@ const MAX_FILE_ATTEMPTS: u32 = 8;
 /// it holds the session and the token, so later jobs skip the password.
 pub struct RemoteBackend {
     connector: Connector,
-    runtime: Runtime,
+    runtime: Option<Runtime>,
     /// The live session, if any. Held across a reconnect, so concurrent files
     /// wait for one attempt instead of each starting their own.
     slot: AsyncMutex<Option<Arc<Session>>>,
@@ -74,7 +74,7 @@ impl RemoteBackend {
             .build()?;
         Ok(Self {
             connector,
-            runtime,
+            runtime: Some(runtime),
             slot: AsyncMutex::new(None),
             last_token: Mutex::new(None),
             opens: AtomicU32::new(0),
@@ -319,7 +319,8 @@ impl TransferBackend for RemoteBackend {
         self.acked.store(0, Ordering::Relaxed);
         self.publish_link(ctx.progress);
         let started = Instant::now();
-        let result = self.runtime.block_on(self.run_plan(plan, ctx, on_file));
+        let runtime = self.runtime.as_ref().expect("runtime lives until drop");
+        let result = runtime.block_on(self.run_plan(plan, ctx, on_file));
         result.map(|mut r| {
             r.elapsed = started.elapsed();
             r
@@ -388,5 +389,16 @@ async fn wait_unless_cancelled(d: Duration, control: &JobControl) -> bool {
             return true;
         }
         tokio::time::sleep((until - now).min(Duration::from_millis(100))).await;
+    }
+}
+
+impl Drop for RemoteBackend {
+    /// Shut the runtime down without waiting. A backend can be dropped from
+    /// inside async code (a web request removing a job), and dropping a runtime
+    /// there would panic.
+    fn drop(&mut self) {
+        if let Some(rt) = self.runtime.take() {
+            rt.shutdown_background();
+        }
     }
 }

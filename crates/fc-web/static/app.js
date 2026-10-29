@@ -93,7 +93,7 @@ function fcopy() {
 
     // modals and forms
     modal: null,
-    addForm: { sources: '', dest: '', label: '' },
+    addForm: { sources: '', dest: '', label: '', mode: 'local', clientId: '', password: '' },
     addNotice: '',
     settingsForm: { limitMiB: 0, policy: 'retry' },
     settingsNotice: '',
@@ -316,7 +316,10 @@ function fcopy() {
     openModal(name) {
       this.modal = name;
       if (name === 'settings') this.loadUsers();
-      if (name === 'add') this.addNotice = '';
+      if (name === 'add') {
+        this.addNotice = '';
+        if (this.isAdmin()) this.loadClients();
+      }
       if (name === 'pair') {
         this.pairNotice = '';
         this.pairForm.confirm = null;
@@ -341,9 +344,18 @@ function fcopy() {
       this.addNotice = '';
       const sources = this.addForm.sources.split('\n').map((s) => s.trim()).filter(Boolean);
       const body = { sources, dest: this.addForm.dest.trim(), label: this.addForm.label.trim() || null };
+      if (this.addForm.mode === 'remote') {
+        if (!this.addForm.clientId) {
+          this.addNotice = 'Choose a paired PC.';
+          return;
+        }
+        body.remote = { client_id: Number(this.addForm.clientId), password: this.addForm.password };
+      }
       const r = await this.api('POST', '/api/transfers', body);
+      // The password is cleared as soon as it has been sent, whatever the answer.
+      this.addForm.password = '';
       if (r.status === 202) {
-        this.addForm = { sources: '', dest: this.addForm.dest, label: '' };
+        this.addForm = { sources: '', dest: this.addForm.dest, label: '', mode: this.addForm.mode, clientId: this.addForm.clientId, password: '' };
         this.closeModal();
       } else {
         this.addNotice = await errorText(r);

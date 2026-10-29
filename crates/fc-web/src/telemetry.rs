@@ -33,6 +33,9 @@ pub struct JobDto {
     pub id: JobId,
     pub label: String,
     pub owner: Option<String>,
+    /// Where the job writes: a local folder, or the paired PC's address.
+    pub destination: String,
+    pub remote: bool,
     /// `pending`, `running`, `paused`, `completed`, `completed_with_errors`,
     /// `failed`, or `cancelled`.
     pub state: String,
@@ -65,6 +68,8 @@ impl JobDto {
             id: info.id,
             label: info.label.clone(),
             owner: owner.map(str::to_string),
+            destination: info.target.describe(),
+            remote: matches!(info.target, fc_engine::Target::Backend(_)),
             state: state.to_string(),
             paused: info.paused,
             percent: t.map_or(0.0, |t| t.fraction * 100.0),
@@ -252,6 +257,8 @@ mod tests {
             id,
             label: format!("job {id}"),
             owner: Some(owner.into()),
+            destination: "/tmp".into(),
+            remote: false,
             state: "running".into(),
             paused: false,
             percent: 10.0,
