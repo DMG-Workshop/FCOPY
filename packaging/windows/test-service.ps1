@@ -16,9 +16,9 @@ $work  = Join-Path $env:TEMP 'fcopy-service-test'
 
 # Native programs don't stop the script on error, so check the exit code.
 function Invoke-Native {
-    param([string]$Exe, [string[]]$Args)
-    & $Exe @Args
-    if ($LASTEXITCODE -ne 0) { throw "$Exe $($Args -join ' ') failed with exit code $LASTEXITCODE" }
+    param([string]$Exe, [string[]]$ArgList)
+    & $Exe @ArgList
+    if ($LASTEXITCODE -ne 0) { throw "$Exe $($ArgList -join " ") failed with exit code $LASTEXITCODE" }
 }
 
 New-Item -ItemType Directory -Force "$dir\share" | Out-Null
