@@ -174,6 +174,8 @@ impl AppState {
         }
     }
 
+    /// Log entries that are errors rather than warnings.
+    #[cfg(test)]
     pub fn error_count(&self) -> usize {
         self.log.iter().filter(|l| l.kind != LogKind::Warning).count()
     }

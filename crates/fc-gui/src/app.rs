@@ -1,4 +1,9 @@
 //! Drawing + commands. Reads [`AppState`], sends commands to the [`Queue`].
+//!
+//! Layout follows the desktop console: a tab bar and action bar on top, a
+//! navigation sidebar on the left, the queue table in the middle with the active
+//! transfer above it, and a status bar along the bottom. New transfers are
+//! entered in an "Add task" window.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -14,12 +19,67 @@ use fc_engine::{
 };
 
 use crate::remote::{self, PeerSearch, RemoteForm};
-use crate::state::{AppState, LogKind};
+use crate::state::{AppState, JobRow, LogKind};
 use crate::Startup;
 
 const OK: Color32 = Color32::from_rgb(110, 200, 120);
 const WARN: Color32 = Color32::from_rgb(230, 180, 80);
 const BAD: Color32 = Color32::from_rgb(235, 100, 90);
+const ACCENT: Color32 = Color32::from_rgb(234, 88, 12);
+const DIM: Color32 = Color32::from_rgb(120, 124, 134);
+
+/// Speed presets for the throttle menu. `None` is unlimited.
+const THROTTLE: [(&str, Option<u64>); 7] = [
+    ("Unlimited", None),
+    ("10 MB/s", Some(10_000_000)),
+    ("50 MB/s", Some(50_000_000)),
+    ("100 MB/s", Some(100_000_000)),
+    ("250 MB/s", Some(250_000_000)),
+    ("500 MB/s", Some(500_000_000)),
+    ("1 GB/s", Some(1_000_000_000)),
+];
+
+/// Which main panel is showing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    Queue,
+    Peers,
+    Logs,
+}
+
+/// Which jobs the queue table lists.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Filter {
+    All,
+    Active,
+    Queued,
+    Paused,
+    Done,
+    Errors,
+}
+
+impl Filter {
+    const ALL: [(Filter, &'static str); 6] = [
+        (Filter::All, "All items"),
+        (Filter::Active, "Copying"),
+        (Filter::Queued, "Queued"),
+        (Filter::Paused, "Paused"),
+        (Filter::Done, "Done"),
+        (Filter::Errors, "Errors"),
+    ];
+
+    fn matches(self, row: &JobRow) -> bool {
+        let done = matches!(row.state, JobState::Completed | JobState::CompletedWithErrors);
+        match self {
+            Filter::All => true,
+            Filter::Active => row.state == JobState::Running && !row.paused,
+            Filter::Queued => row.state == JobState::Pending,
+            Filter::Paused => row.paused,
+            Filter::Done => done,
+            Filter::Errors => matches!(row.state, JobState::Failed(_) | JobState::CompletedWithErrors),
+        }
+    }
+}
 
 /// Form for a new transfer.
 struct NewTransfer {
@@ -36,9 +96,12 @@ pub struct FcApp {
     events: Receiver<Event>,
     state: AppState,
     form: NewTransfer,
-    log_open: bool,
-    limit_on: bool,
-    limit_mb: f64,
+    view: View,
+    filter: Filter,
+    search: String,
+    show_add: bool,
+    /// Index into [`THROTTLE`].
+    throttle: usize,
     /// "Do this for all errors of this kind" answers.
     remembered: HashMap<ErrorClass, ErrorAction>,
     remember_choice: bool,
@@ -60,6 +123,8 @@ impl FcApp {
             ..Default::default()
         });
 
+        let throttle = THROTTLE.iter().position(|(_, l)| *l == startup.limit).unwrap_or(0);
+        cc.egui_ctx.set_visuals(accent_visuals());
         let mut app = Self {
             queue,
             events,
@@ -72,9 +137,11 @@ impl FcApp {
                 overwrite: false,
                 remote: RemoteForm::default(),
             },
-            log_open: false,
-            limit_on: startup.limit.is_some(),
-            limit_mb: startup.limit.map(|l| l as f64 / 1e6).unwrap_or(50.0),
+            view: View::Queue,
+            filter: Filter::All,
+            search: String::new(),
+            show_add: false,
+            throttle,
             remembered: HashMap::new(),
             remember_choice: false,
             peers: PeerSearch::default(),
@@ -135,247 +202,407 @@ impl FcApp {
         self.notice = None;
         let id = self.queue.add(request.with_options(options));
         self.state.details.insert(id, (sources, target));
+        self.show_add = false;
     }
 
-    // ----- panels -----
+    // ----- top of the window -----
 
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
+    fn tab_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("fcopy");
-            ui.separator();
+            ui.label(RichText::new("■").color(ACCENT));
+            ui.label(RichText::new("fcopy").strong().size(16.0));
+            ui.label(RichText::new("v1.0.0").weak().small());
+            ui.add_space(12.0);
+            if ui.selectable_label(self.view == View::Queue, "Local copy").clicked() {
+                self.view = View::Queue;
+            }
+            if ui.selectable_label(self.view == View::Peers, "Remote PCs").clicked() {
+                self.view = View::Peers;
+            }
+            ui.add_enabled(false, egui::Label::new("BitTorrent")).on_disabled_hover_text("Not built yet");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.weak("Tokio async engine");
+            });
+        });
+    }
+
+    fn action_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let add = egui::Button::new(RichText::new("+ Add task / files").strong().color(Color32::WHITE)).fill(ACCENT);
+            if ui.add(add).clicked() {
+                self.show_add = true;
+            }
             let running = self.state.active.is_some();
             if self.state.paused {
-                if ui.button("▶ Resume").clicked() {
+                if ui.button("▶ Resume all").clicked() {
                     self.queue.resume();
                 }
-            } else if ui.add_enabled(running, egui::Button::new("⏸ Pause")).clicked() {
+            } else if ui.add_enabled(running, egui::Button::new("⏸ Pause all")).clicked() {
                 self.queue.pause();
             }
             if ui.add_enabled(running, egui::Button::new("⏭ Skip file")).on_hover_text("Abandon the current file and continue").clicked() {
                 self.queue.skip_current_file();
             }
-            if ui.add_enabled(running, egui::Button::new("⏹ Cancel")).on_hover_text("Cancel the running transfer").clicked() {
-                if let Some(a) = &self.state.active {
-                    self.queue.cancel(a.job);
-                }
-            }
             if ui.button("Cancel all").clicked() {
                 self.queue.cancel_all();
             }
-
+            if ui.button("Clear finished").clicked() {
+                self.queue.clear_finished();
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let mut changed = ui
-                    .add_enabled(self.limit_on, egui::DragValue::new(&mut self.limit_mb).range(0.1..=10_000.0).speed(1.0).suffix(" MB/s"))
-                    .changed();
-                changed |= ui.checkbox(&mut self.limit_on, "Limit speed").changed();
-                if changed {
-                    let limit = self.limit_on.then_some((self.limit_mb * 1e6) as u64);
+                let before = self.throttle;
+                egui::ComboBox::from_id_salt("throttle").selected_text(THROTTLE[self.throttle].0).width(130.0).show_ui(ui, |ui| {
+                    for (i, (label, _)) in THROTTLE.iter().enumerate() {
+                        ui.selectable_value(&mut self.throttle, i, *label);
+                    }
+                });
+                ui.label("Throttle");
+                if self.throttle != before {
+                    let limit = THROTTLE[self.throttle].1;
                     self.queue.set_speed_limit(limit);
                 }
             });
         });
     }
 
-    fn queue_panel(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.strong("Queue");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Clear finished").clicked() {
-                    self.queue.clear_finished();
-                }
-            });
-        });
-        ui.separator();
-        if self.state.jobs.is_empty() {
-            ui.weak("No transfers yet.");
+    // ----- sidebar -----
+
+    fn sidebar(&mut self, ui: &mut egui::Ui) {
+        let jobs = &self.state.jobs;
+        let unfinished = jobs.iter().filter(|r| !matches!(r.state, JobState::Completed | JobState::CompletedWithErrors | JobState::Failed(_) | JobState::Cancelled)).count();
+        let done = jobs.iter().filter(|r| matches!(r.state, JobState::Completed | JobState::CompletedWithErrors)).count();
+
+        ui.add_space(6.0);
+        ui.label(RichText::new("TRANSFERS").small().color(DIM));
+        if ui.selectable_label(self.view == View::Queue && self.filter == Filter::All, format!("Active queue   {unfinished}")).clicked() {
+            self.view = View::Queue;
+            self.filter = Filter::All;
         }
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for row in &self.state.jobs {
-                let (icon, color) = match &row.state {
-                    JobState::Pending => ("⏳", ui.visuals().weak_text_color()),
-                    JobState::Running if self.state.paused => ("⏸", WARN),
-                    JobState::Running => ("▶", ui.visuals().text_color()),
-                    JobState::Completed => ("✔", OK),
-                    JobState::CompletedWithErrors => ("⚠", WARN),
-                    JobState::Failed(_) => ("✖", BAD),
-                    JobState::Cancelled => ("⊘", ui.visuals().weak_text_color()),
-                };
-                ui.horizontal(|ui| {
-                    ui.colored_label(color, icon);
-                    ui.add(egui::Label::new(&row.label).truncate());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let finished = row.state.is_finished();
-                        let tip = if finished { "Remove from list" } else { "Cancel" };
-                        if ui.small_button("✖").on_hover_text(tip).clicked() {
-                            if finished { self.queue.remove(row.id); } else { self.queue.cancel(row.id); }
-                        }
-                    });
-                });
-                if row.state == JobState::Running || row.state == JobState::Pending {
-                    ui.add(egui::ProgressBar::new(row.fraction as f32).desired_height(6.0));
-                } else if let Some(s) = &row.summary {
-                    ui.weak(format!(
-                        "{} files · {} · {}",
-                        s.files_copied,
-                        human_bytes(s.bytes_copied),
-                        human_rate(s.throughput_bps)
-                    ));
-                }
-                ui.add_space(6.0);
-            }
+        if ui.selectable_label(self.view == View::Queue && self.filter == Filter::Done, format!("Completed jobs   {done}")).clicked() {
+            self.view = View::Queue;
+            self.filter = Filter::Done;
+        }
+        if ui.selectable_label(self.view == View::Peers, format!("Network peers   {}", self.peer_list.len())).clicked() {
+            self.view = View::Peers;
+        }
+
+        ui.add_space(14.0);
+        ui.label(RichText::new("FEEDS & LOGS").small().color(DIM));
+        ui.add_enabled(false, egui::Label::new("Torrent feeds")).on_disabled_hover_text("Not built yet");
+        if ui.selectable_label(self.view == View::Logs, format!("System logs   {}", self.state.log.len())).clicked() {
+            self.view = View::Logs;
+            self.state.unseen = 0;
+        }
+        ui.add_enabled(false, egui::Label::new("Settings")).on_disabled_hover_text("Not built yet");
+
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            let running = self.state.jobs.iter().filter(|r| r.state == JobState::Running).count();
+            let failed = self.state.jobs.iter().filter(|r| matches!(r.state, JobState::Failed(_))).count();
+            ui.weak(format!("Failed jobs   {failed}"));
+            ui.weak(format!("Running jobs   {running}"));
+            ui.label(RichText::new("ENGINE").small().color(DIM));
+            ui.add_space(8.0);
         });
     }
 
-    fn dashboard(&mut self, ui: &mut egui::Ui) {
+    // ----- main panel -----
+
+    fn active_card(&self, ui: &mut egui::Ui) {
         let Some(active) = self.state.active.clone() else {
-            ui.add_space(8.0);
-            ui.weak("Idle. Add a transfer below or drop files onto the window.");
             return;
         };
-        let row = self.state.jobs.iter().find(|r| r.id == active.job).cloned();
-        let label = row.as_ref().map(|r| r.label.clone()).unwrap_or_default();
+        let Some(t) = &active.telemetry else {
+            ui.weak("Preparing…");
+            return;
+        };
         let (sources, target) = self.state.details.get(&active.job).cloned().unwrap_or_default();
-
+        let name = sources.first().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let phase = match t.phase {
+            Phase::Verifying => "verifying",
+            Phase::Finalizing => "finishing",
+            Phase::Preparing => "opening",
+            _ => "copying",
+        };
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(RichText::new(&label).strong().size(18.0));
+                ui.label(RichText::new("Active transfer").small().color(DIM));
+                ui.label(RichText::new(&name).strong());
+                ui.weak(format!("→ {target}"));
                 if self.state.paused {
                     ui.label(RichText::new(" PAUSED ").strong().color(Color32::BLACK).background_color(WARN));
                 }
             });
-            egui::Grid::new("paths").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
-                ui.weak("From");
-                let from = match sources.len() {
-                    0 => "—".to_string(),
-                    1 => sources[0].display().to_string(),
-                    n => format!("{} (+{} more)", sources[0].display(), n - 1),
-                };
-                ui.add(egui::Label::new(egui::RichText::new(from).monospace()).truncate());
-                ui.end_row();
-                ui.weak("To");
-                ui.add(egui::Label::new(egui::RichText::new(if target.is_empty() { "—".into() } else { target }).monospace()).truncate());
-                ui.end_row();
-            });
-            ui.separator();
-
-            let Some(t) = &active.telemetry else {
-                ui.weak("Preparing…");
-                return;
-            };
-            let file = t.current_file.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let phase = match t.phase {
-                Phase::Verifying => "Verifying",
-                Phase::Finalizing => "Finalizing",
-                Phase::Preparing => "Opening",
-                _ => "Copying",
-            };
-            ui.horizontal(|ui| {
-                ui.weak(phase);
-                ui.add(egui::Label::new(RichText::new(&file).strong()).truncate());
-            });
-            let file_frac = if t.file_bytes_total > 0 { t.file_bytes_done as f32 / t.file_bytes_total as f32 } else { 0.0 };
-            ui.add(
-                egui::ProgressBar::new(file_frac)
-                    .text(format!("{} / {}", human_bytes(t.file_bytes_done), human_bytes(t.file_bytes_total))),
-            );
-            ui.add_space(4.0);
-            ui.add(egui::ProgressBar::new(t.fraction as f32).show_percentage().desired_height(22.0));
-            ui.add_space(6.0);
-
-            egui::Grid::new("stats").num_columns(4).spacing([28.0, 6.0]).show(ui, |ui| {
+            ui.add(egui::ProgressBar::new(t.fraction as f32).show_percentage().desired_height(14.0).fill(ACCENT));
+            ui.horizontal_wrapped(|ui| {
                 let speed = if self.state.paused { "—".to_string() } else { human_rate(t.rate_bps) };
-                let eta = if self.state.paused { "paused".to_string() } else { t.eta.map(human_duration).unwrap_or_else(|| "—".into()) };
-                stat(ui, "Speed", &speed);
-                stat(ui, "ETA", &eta);
+                let eta = if self.state.paused { "paused".into() } else { t.eta.map(human_duration).unwrap_or_else(|| "—".into()) };
+                ui.label(format!("{} of {}", human_bytes(t.bytes_copied), human_bytes(t.bytes_total)));
+                ui.weak("·");
+                ui.label(speed);
+                ui.weak("·");
+                ui.label(format!("ETA {eta}"));
+                ui.weak("·");
+                ui.label(format!("{} / {} files, {phase}", t.files_done, t.files_total));
+            });
+            if let Some(link) = &t.link {
+                ui.weak(format!(
+                    "Link to {}: round trip {} ms · sent {} · acknowledged {} · {} reconnects{}",
+                    link.peer,
+                    link.rtt.as_millis(),
+                    human_bytes(link.sent_bytes),
+                    human_bytes(link.acked_bytes),
+                    link.reconnects,
+                    if link.remote_paused { " · PC paused" } else { "" }
+                ));
+            }
+        });
+    }
+
+    fn filter_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            for (f, label) in Filter::ALL {
+                let count = self.state.jobs.iter().filter(|r| f.matches(r)).count();
+                let text = format!("{label} ({count})");
+                if ui.selectable_label(self.filter == f, text).clicked() {
+                    self.filter = f;
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Search transfers").desired_width(200.0));
+            });
+        });
+    }
+
+    fn queue_table(&mut self, ui: &mut egui::Ui) {
+        let query = self.search.trim().to_lowercase();
+        let rows: Vec<JobRow> = self
+            .state
+            .jobs
+            .iter()
+            .filter(|r| self.filter.matches(r))
+            .filter(|r| {
+                query.is_empty()
+                    || self.state.details.get(&r.id).is_some_and(|(s, t)| {
+                        t.to_lowercase().contains(&query) || s.iter().any(|p| p.to_string_lossy().to_lowercase().contains(&query))
+                    })
+            })
+            .cloned()
+            .collect();
+
+        if rows.is_empty() {
+            ui.add_space(12.0);
+            ui.weak(if self.state.jobs.is_empty() { "No transfers yet. Use Add task / files to start one." } else { "Nothing matches this filter." });
+            return;
+        }
+
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            egui::Grid::new("queue").num_columns(8).striped(true).spacing([14.0, 8.0]).min_col_width(40.0).show(ui, |ui| {
+                for h in ["ST", "FILE / TARGET", "SIZE", "PROGRESS", "SPEED", "FILES", "STATUS", "ACTIONS"] {
+                    ui.label(RichText::new(h).small().color(DIM));
+                }
                 ui.end_row();
-                // Interpolate between telemetry ticks (slow, throttled transfers emit rarely).
-                let since = if self.state.paused { Duration::ZERO } else { active.received.elapsed() };
-                stat(ui, "Elapsed", &human_duration(t.elapsed + since));
-                stat(ui, "Files", &format!("{} / {}", t.files_done, t.files_total));
-                ui.end_row();
-                stat(ui, "Copied", &format!("{} / {}", human_bytes(t.bytes_copied), human_bytes(t.bytes_total)));
-                let problems = active.files_skipped + active.files_failed;
-                stat(ui, "Skipped/failed", &problems.to_string());
-                ui.end_row();
-                if let Some(l) = self.state.speed_limit {
-                    // Same decimal unit the user typed in the toolbar.
-                    stat(ui, "Limit", &format!("{:.1} MB/s", l as f64 / 1e6));
+
+                for row in &rows {
+                    let (sources, target) = self.state.details.get(&row.id).cloned().unwrap_or_default();
+                    let name = match sources.len() {
+                        0 => row.label.clone(),
+                        1 => sources[0].file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                        n => format!("{} items", n),
+                    };
+                    let (icon, color) = status_icon(&row.state, row.paused);
+                    ui.colored_label(color, icon);
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(&name).strong());
+                        ui.label(RichText::new(&target).small().color(DIM));
+                    });
+                    let size = row.bytes_total;
+                    ui.monospace(human_bytes(size));
+                    ui.horizontal(|ui| {
+                        ui.add(egui::ProgressBar::new(row.fraction as f32).desired_width(140.0).fill(progress_color(&row.state)));
+                        ui.monospace(format!("{:.0}%", row.fraction * 100.0));
+                    });
+                    let rate = self.state.active.as_ref().filter(|a| a.job == row.id).and_then(|a| a.telemetry.as_ref()).map(|t| t.rate_bps);
+                    ui.monospace(match (rate, row.state == JobState::Running && !row.paused) {
+                        (Some(r), true) => human_rate(r),
+                        _ => "—".into(),
+                    });
+                    ui.monospace(format!("{}/{}", row.files_total.min(row.summary.as_ref().map_or(0, |s| s.files_copied)), row.files_total));
+                    ui.label(status_text(&row.state, row.paused));
+                    ui.horizontal(|ui| {
+                        let held = row.paused || row.state == JobState::Pending;
+                        if held && matches!(row.state, JobState::Pending | JobState::Running) {
+                            if ui.small_button("▶").on_hover_text("Resume this transfer").clicked() {
+                                self.queue.resume_job(row.id);
+                            }
+                        } else if row.state == JobState::Running && ui.small_button("⏸").on_hover_text("Pause this transfer").clicked() {
+                            self.queue.pause_job(row.id);
+                        }
+                        if matches!(row.state, JobState::Pending | JobState::Running) {
+                            if ui.small_button("✖").on_hover_text("Cancel").clicked() {
+                                self.queue.cancel(row.id);
+                            }
+                        } else if ui.small_button("🗑").on_hover_text("Remove from the list").clicked() {
+                            self.queue.remove(row.id);
+                        }
+                    });
                     ui.end_row();
                 }
             });
-            if let Some(link) = &t.link {
-                ui.separator();
-                ui.weak(format!("Link to {}", link.peer));
-                egui::Grid::new("link").num_columns(4).spacing([28.0, 6.0]).show(ui, |ui| {
-                    stat(ui, "Round trip", &format!("{} ms", link.rtt.as_millis()));
-                    stat(ui, "Sent", &human_bytes(link.sent_bytes));
-                    stat(ui, "Acknowledged", &human_bytes(link.acked_bytes));
-                    ui.end_row();
-                    stat(ui, "Reconnects", &link.reconnects.to_string());
-                    stat(ui, "Lost packets", &link.lost_packets.to_string());
-                    stat(ui, "PC paused", if link.remote_paused { "yes" } else { "no" });
-                    ui.end_row();
+        });
+    }
+
+    fn queue_view(&mut self, ui: &mut egui::Ui) {
+        self.active_card(ui);
+        if self.state.active.is_some() {
+            ui.add_space(8.0);
+        }
+        self.filter_bar(ui);
+        ui.separator();
+        self.queue_table(ui);
+    }
+
+    fn peers_view(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("PCs on this network");
+            if ui.add_enabled(!self.peers.busy(), egui::Button::new("Search")).clicked() {
+                self.peers.start();
+            }
+            if self.peers.busy() {
+                ui.spinner();
+            }
+        });
+        ui.separator();
+        if self.peer_list.is_empty() {
+            ui.weak("No PCs found. Make sure their agents are running on this network, then search again.");
+            return;
+        }
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for peer in self.peer_list.clone() {
+                let addr = remote::address_for("", &peer);
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&peer.name).strong());
+                        ui.monospace(&addr);
+                        match remote::trusted_fingerprint(&addr) {
+                            Some(fp) if fp == peer.fingerprint => ui.colored_label(OK, "trusted"),
+                            Some(_) => ui.colored_label(BAD, "FINGERPRINT CHANGED"),
+                            None => ui.colored_label(WARN, "not yet trusted"),
+                        };
+                    });
+                    ui.weak(format!("fingerprint {}", peer.fingerprint));
+                    if ui.button("Copy to this PC").clicked() {
+                        self.form.remote.enabled = true;
+                        self.form.remote.address = remote::address_for(&self.form.remote.address, &peer);
+                        self.form.remote.fingerprint = peer.fingerprint.clone();
+                        self.form.remote.fingerprint_checked = false;
+                        self.show_add = true;
+                    }
                 });
             }
         });
     }
 
-    fn new_transfer(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("New transfer").default_open(true).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Source");
-                let resp = ui.add(egui::TextEdit::singleline(&mut self.form.add_path).hint_text("path, or drop files onto the window").desired_width(ui.available_width() - 60.0));
-                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if (ui.button("Add").clicked() || enter) && !self.form.add_path.trim().is_empty() {
-                    self.form.sources.push(PathBuf::from(self.form.add_path.trim()));
-                    self.form.add_path.clear();
-                }
-            });
-            let mut remove = None;
-            for (i, s) in self.form.sources.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    if ui.small_button("✖").clicked() {
-                        remove = Some(i);
-                    }
-                    ui.monospace(s.display().to_string());
-                });
-            }
-            if let Some(i) = remove {
-                self.form.sources.remove(i);
-            }
-            ui.checkbox(&mut self.form.remote.enabled, "Copy to a PC on the network");
-            if self.form.remote.enabled {
-                self.remote_fields(ui);
-            } else {
-                ui.horizontal(|ui| {
-                    ui.label("Destination");
-                    ui.add(egui::TextEdit::singleline(&mut self.form.dest).hint_text("folder (or new file name for a single file)").desired_width(f32::INFINITY));
-                });
-            }
-            if let Some(msg) = &self.notice {
-                ui.colored_label(WARN, msg);
-            }
-            ui.horizontal(|ui| {
-                ui.label("Verify");
-                egui::ComboBox::from_id_salt("verify")
-                    .selected_text(match self.form.verify {
-                        VerifyMode::Off => "Off",
-                        VerifyMode::SourceHash => "Hash source",
-                        VerifyMode::ReadBack => "Read back & compare",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.form.verify, VerifyMode::Off, "Off");
-                        ui.selectable_value(&mut self.form.verify, VerifyMode::SourceHash, "Hash source");
-                        ui.selectable_value(&mut self.form.verify, VerifyMode::ReadBack, "Read back & compare");
-                    });
-                ui.checkbox(&mut self.form.overwrite, "Overwrite existing");
-                let ready = !self.form.sources.is_empty() && !self.form.dest.trim().is_empty();
-                if ui.add_enabled(ready, egui::Button::new(RichText::new("Start copy").strong())).clicked() {
-                    self.start_transfer();
+    fn logs_view(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("System logs");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Clear").clicked() {
+                    self.state.log.clear();
                 }
             });
         });
+        ui.separator();
+        if self.state.log.is_empty() {
+            ui.weak("Nothing to report.");
+            return;
+        }
+        egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(false).show(ui, |ui| {
+            for e in self.state.log.iter().rev() {
+                let (tag, color) = match e.kind {
+                    LogKind::Skipped => ("SKIPPED", WARN),
+                    LogKind::Failed => ("FAILED ", BAD),
+                    LogKind::JobFailed => ("JOB    ", BAD),
+                    LogKind::Warning => ("warning", ui.visuals().weak_text_color()),
+                };
+                ui.horizontal(|ui| {
+                    let ago = e.at.elapsed().map(|d| human_duration(d) + " ago").unwrap_or_default();
+                    ui.weak(format!("#{}", e.job)).on_hover_text(ago);
+                    ui.colored_label(color, RichText::new(tag).monospace());
+                    let name = e.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
+                    let short = match &name {
+                        Some(n) => format!("{n} — {}", e.message),
+                        None => e.message.clone(),
+                    };
+                    let full = match &e.path {
+                        Some(p) => format!("{}\n{}", p.display(), e.message),
+                        None => e.message.clone(),
+                    };
+                    ui.add(egui::Label::new(short).truncate()).on_hover_text(full);
+                });
+            }
+        });
+    }
+
+    // ----- add task window -----
+
+    /// The new-transfer form, shown in the "Add task" window.
+    fn add_form(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Source");
+            let resp = ui.add(egui::TextEdit::singleline(&mut self.form.add_path).hint_text("path, or drop files onto the window").desired_width(ui.available_width() - 60.0));
+            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (ui.button("Add").clicked() || enter) && !self.form.add_path.trim().is_empty() {
+                self.form.sources.push(PathBuf::from(self.form.add_path.trim()));
+                self.form.add_path.clear();
+            }
+        });
+        let mut remove = None;
+        for (i, s) in self.form.sources.iter().enumerate() {
+            ui.horizontal(|ui| {
+                if ui.small_button("✖").clicked() {
+                    remove = Some(i);
+                }
+                ui.monospace(s.display().to_string());
+            });
+        }
+        if let Some(i) = remove {
+            self.form.sources.remove(i);
+        }
+        ui.add_space(4.0);
+        ui.checkbox(&mut self.form.remote.enabled, "Copy to a PC on the network");
+        if self.form.remote.enabled {
+            self.remote_fields(ui);
+        } else {
+            ui.horizontal(|ui| {
+                ui.label("Destination");
+                ui.add(egui::TextEdit::singleline(&mut self.form.dest).hint_text("folder (or new file name for a single file)").desired_width(f32::INFINITY));
+            });
+        }
+        ui.horizontal(|ui| {
+            ui.label("Verify");
+            egui::ComboBox::from_id_salt("verify")
+                .selected_text(match self.form.verify {
+                    VerifyMode::Off => "Off",
+                    VerifyMode::SourceHash => "Hash source",
+                    VerifyMode::ReadBack => "Read back & compare",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.form.verify, VerifyMode::Off, "Off");
+                    ui.selectable_value(&mut self.form.verify, VerifyMode::SourceHash, "Hash source");
+                    ui.selectable_value(&mut self.form.verify, VerifyMode::ReadBack, "Read back & compare");
+                });
+            ui.checkbox(&mut self.form.overwrite, "Overwrite existing");
+        });
+        if let Some(msg) = &self.notice {
+            ui.colored_label(WARN, msg);
+        }
+        ui.add_space(4.0);
+        let ready = !self.form.sources.is_empty() && (self.form.remote.enabled || !self.form.dest.trim().is_empty());
+        if ui.add_enabled(ready, egui::Button::new(RichText::new("Start copy").strong())).clicked() {
+            self.start_transfer();
+        }
     }
 
     /// The remote destination: a PC from discovery, or an address typed by hand.
@@ -423,57 +650,29 @@ impl FcApp {
         }
     }
 
-    fn log_drawer(&mut self, ui: &mut egui::Ui) {
-        let errors = self.state.error_count();
-        let warnings = self.state.log.len() - errors;
+    // ----- status bar -----
+
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let arrow = if self.log_open { "⏷" } else { "⏵" };
-            let mut title = RichText::new(format!("{arrow} Errors & skipped ({errors})"));
-            if self.state.unseen > 0 && !self.log_open {
-                title = title.color(WARN).strong();
+            ui.weak("Engine: Tokio async");
+            ui.weak("|");
+            let copy_rate = self.state.active.as_ref().and_then(|a| a.telemetry.as_ref()).map(|t| t.rate_bps).unwrap_or(0.0);
+            ui.label(format!("Copy {}", human_rate(copy_rate)));
+            ui.weak("|");
+            let remote_running = self.state.jobs.iter().filter(|r| r.state == JobState::Running && self.state.details.get(&r.id).is_some_and(|(_, t)| t.contains('/') && t.contains(':'))).count();
+            ui.label(format!("Remote transfers {remote_running}"));
+            if self.state.paused {
+                ui.colored_label(WARN, "queue paused");
             }
-            if ui.selectable_label(self.log_open, title).clicked() {
-                self.log_open = !self.log_open;
-            }
-            ui.weak(format!("{warnings} warning(s)"));
-            if self.log_open {
-                self.state.unseen = 0;
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Clear").clicked() {
-                        self.state.log.clear();
-                    }
-                });
-            }
-        });
-        if !self.log_open {
-            return;
-        }
-        ui.separator();
-        egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
-            for e in &self.state.log {
-                let (tag, color) = match e.kind {
-                    LogKind::Skipped => ("SKIPPED", WARN),
-                    LogKind::Failed => ("FAILED ", BAD),
-                    LogKind::JobFailed => ("JOB    ", BAD),
-                    LogKind::Warning => ("warning", ui.visuals().weak_text_color()),
-                };
-                ui.horizontal(|ui| {
-                    let ago = e.at.elapsed().map(|d| human_duration(d) + " ago").unwrap_or_default();
-                    ui.weak(format!("#{}", e.job)).on_hover_text(ago);
-                    ui.colored_label(color, RichText::new(tag).monospace());
-                    // Short form on the row; full path + message on hover.
-                    let name = e.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
-                    let short = match &name {
-                        Some(n) => format!("{n} — {}", e.message),
-                        None => e.message.clone(),
-                    };
-                    let full = match &e.path {
-                        Some(p) => format!("{}\n{}", p.display(), e.message),
-                        None => e.message.clone(),
-                    };
-                    ui.add(egui::Label::new(short).truncate()).on_hover_text(full);
-                });
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.selectable_label(self.view == View::Logs, "Ticker log").clicked() {
+                    self.view = View::Logs;
+                    self.state.unseen = 0;
+                }
+                if self.state.unseen > 0 {
+                    ui.colored_label(WARN, format!("{} new", self.state.unseen));
+                }
+            });
         });
     }
 
@@ -513,15 +712,47 @@ impl FcApp {
         }
     }
 
+    /// Files dropped on the window go into the Add task window.
     fn handle_drops(&mut self, ctx: &egui::Context) {
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
-        self.form.sources.extend(dropped);
+        if !dropped.is_empty() {
+            self.form.sources.extend(dropped);
+            self.show_add = true;
+        }
     }
 }
 
-fn stat(ui: &mut egui::Ui, name: &str, value: &str) {
-    ui.weak(name);
-    ui.label(RichText::new(value).strong().monospace());
+fn status_icon(state: &JobState, paused: bool) -> (&'static str, Color32) {
+    match state {
+        JobState::Pending => ("◌", DIM),
+        JobState::Running if paused => ("⏸", WARN),
+        JobState::Running => ("●", ACCENT),
+        JobState::Completed => ("✔", OK),
+        JobState::CompletedWithErrors => ("⚠", WARN),
+        JobState::Failed(_) => ("✖", BAD),
+        JobState::Cancelled => ("⊘", DIM),
+    }
+}
+
+fn status_text(state: &JobState, paused: bool) -> RichText {
+    let (text, color) = match state {
+        JobState::Pending => ("Queued".to_string(), DIM),
+        JobState::Running if paused => ("Paused".to_string(), WARN),
+        JobState::Running => ("Active".to_string(), ACCENT),
+        JobState::Completed => ("Complete".to_string(), OK),
+        JobState::CompletedWithErrors => ("Complete with errors".to_string(), WARN),
+        JobState::Failed(msg) => (format!("Failed: {msg}"), BAD),
+        JobState::Cancelled => ("Cancelled".to_string(), DIM),
+    };
+    RichText::new(text).color(color)
+}
+
+fn progress_color(state: &JobState) -> Color32 {
+    match state {
+        JobState::Completed => OK,
+        JobState::Failed(_) => BAD,
+        _ => ACCENT,
+    }
 }
 
 impl eframe::App for FcApp {
@@ -536,24 +767,32 @@ impl eframe::App for FcApp {
         }
 
         // Panel order matters in egui: edges first, central last.
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.add_space(4.0);
-            self.toolbar(ui);
+            self.tab_bar(ui);
+            ui.add_space(4.0);
+        });
+        egui::TopBottomPanel::top("actions").show(ctx, |ui| {
+            ui.add_space(2.0);
+            self.action_bar(ui);
+            ui.add_space(4.0);
+        });
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            ui.add_space(2.0);
+            self.status_bar(ui);
             ui.add_space(2.0);
         });
-        egui::TopBottomPanel::bottom("log")
-            .resizable(self.log_open)
-            .min_height(if self.log_open { 140.0 } else { 0.0 })
-            .show(ctx, |ui| self.log_drawer(ui));
-        egui::SidePanel::left("queue").resizable(true).default_width(240.0).show(ctx, |ui| self.queue_panel(ui));
-        egui::CentralPanel::default().show(ctx, |ui| {
-            self.dashboard(ui);
-            ui.add_space(12.0);
-            self.new_transfer(ui);
-            if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
-                ui.colored_label(OK, "Drop to add as sources");
-            }
+        egui::SidePanel::left("nav").resizable(false).exact_width(210.0).show(ctx, |ui| self.sidebar(ui));
+        egui::CentralPanel::default().show(ctx, |ui| match self.view {
+            View::Queue => self.queue_view(ui),
+            View::Peers => self.peers_view(ui),
+            View::Logs => self.logs_view(ui),
         });
+
+        let mut open = self.show_add;
+        egui::Window::new("Add task / files").open(&mut open).resizable(false).default_width(560.0).show(ctx, |ui| self.add_form(ui));
+        self.show_add = open;
+
         self.decision_modal(ctx);
 
         // Keep "Elapsed" ticking between telemetry events (e.g. at very low speed limits).
@@ -566,4 +805,13 @@ impl eframe::App for FcApp {
         // Cancel cleanly so no .fcpart files are left behind.
         self.queue.shutdown();
     }
+}
+
+/// Dark visuals with the orange accent on selections instead of the default blue.
+fn accent_visuals() -> egui::Visuals {
+    let mut v = egui::Visuals::dark();
+    v.selection.bg_fill = Color32::from_rgb(120, 48, 10);
+    v.selection.stroke = egui::Stroke::new(1.0_f32, ACCENT);
+    v.hyperlink_color = ACCENT;
+    v
 }
