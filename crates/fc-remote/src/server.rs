@@ -185,11 +185,11 @@ async fn handle_connection(state: Arc<State>, conn: quinn::Connection, ip: IpAdd
     let account = match tokio::time::timeout(HANDSHAKE_TIMEOUT, authenticate(&state, &conn, ip, &mut send, &mut recv)).await {
         Ok(Ok(a)) => a,
         Ok(Err(e)) => {
-            conn.close(1u32.into(), b"authentication failed");
+            close_after_flush(&mut send, &conn, b"authentication failed").await;
             return Err(e);
         }
         Err(_) => {
-            conn.close(1u32.into(), b"handshake timeout");
+            close_after_flush(&mut send, &conn, b"handshake timeout").await;
             return Err(ConnError::Timeout);
         }
     };
@@ -269,6 +269,17 @@ async fn handle_connection(state: Arc<State>, conn: quinn::Connection, ip: IpAdd
     state.sessions.lock().unwrap_or_else(|e| e.into_inner()).retain(|s| s.id != session_id);
     tracing::info!(peer = %conn.remote_address(), "session ended");
     result
+}
+
+/// Close the connection only after the queued reply (e.g. `AuthFailed`) has
+/// been acknowledged. Closing first discards unsent stream data, and the peer
+/// would then see only "connection closed" with no reason.
+async fn close_after_flush(send: &mut quinn::SendStream, conn: &quinn::Connection, reason: &'static [u8]) {
+    let _ = send.finish();
+    // `stopped` completes once the peer has read the stream to its end (or
+    // stopped it); the timeout keeps a silent peer from holding us open.
+    let _ = tokio::time::timeout(Duration::from_secs(1), send.stopped()).await;
+    conn.close(1u32.into(), reason);
 }
 
 fn update_session(state: &State, id: u64, f: impl FnOnce(&mut SessionInfo)) {
