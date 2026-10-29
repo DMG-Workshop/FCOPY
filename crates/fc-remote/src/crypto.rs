@@ -226,6 +226,9 @@ mod b64_32 {
 }
 
 #[cfg(test)]
+pub(crate) use tests::TEST_KDF;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -313,6 +316,3 @@ mod tests {
         assert_eq!(generate_access_key().len(), 32);
     }
 }
-
-#[cfg(test)]
-pub(crate) use tests::TEST_KDF;

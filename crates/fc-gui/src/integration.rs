@@ -33,6 +33,8 @@ pub fn uninstall() -> io::Result<Vec<PathBuf>> {
 
 /// Quote an argument for a `.desktop` `Exec=` line (freedesktop spec: reserved
 /// characters inside double quotes must be backslash-escaped).
+/// Pure, so it is tested on every OS; only the Linux adapter calls it.
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
 pub fn desktop_exec_quote(path: &Path) -> String {
     let s = path.to_string_lossy();
     let mut out = String::from("\"");

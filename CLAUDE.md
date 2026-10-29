@@ -27,7 +27,7 @@ depends upward; `fc-engine` must stay UI-free and sync.
 ## Commands
 
 ```sh
-cargo test --workspace              # 127 tests, all passing at handoff
+cargo test --workspace              # 127 on Linux, 117 on Windows; all passing
 cargo clippy --workspace --all-targets   # zero warnings expected
 cargo run -p fc-cli -- copy SRC... DEST [--verify readback] [--limit 10MB] [--on-error ask|auto|skip|cancel]
 cargo run -p fc-gui -- [--limit 20MB] [--verify] SRC... DEST
@@ -41,10 +41,13 @@ and take screenshots with `import -window root`.
 - MSRV 1.85, edition 2024. egui pinned to 0.32 (0.37 needs Rust 1.95).
 - Prefer complete-file edits; the owner reviews whole files.
 - Platform code: pure functions (tested everywhere) plus thin `#[cfg]` adapters.
-  **Windows/macOS branches have never been compiled** (no cross targets in the
-  original sandbox). First thing on a Windows/macOS machine: `cargo test --workspace`.
-  Affected: `fc-engine/src/platform/meta.rs`, `cache.rs`, `fc-gui/src/integration.rs`,
-  `fc-remote/src/config.rs` (dir helpers), `build.rs` resource embedding.
+  **Windows (MSVC, Win 11) builds and passes** `cargo test --workspace` + clippy
+  (117 tests; the rest are `cfg(unix)`). That first Windows run found read-back
+  verify breaking on the `FILE_FLAG_NO_BUFFERING` handle (unaligned tail read),
+  now fixed. **macOS branches have still never been compiled**: first thing on a
+  Mac, `cargo test --workspace`. Affected: `fc-engine/src/platform/meta.rs`,
+  `cache.rs`, `fc-gui/src/integration.rs`, `fc-remote/src/config.rs` (dir helpers).
+  On Windows the GUI's runtime behavior (context menu, `.rc` embedding) is built but not exercised.
 - Copies write `name.fcpart`, then fsync, then read-back verify (cache dropped),
   then metadata, then permissions **last** (Windows read-only cleanup), then an
   atomic rename.

@@ -293,6 +293,9 @@ impl Copier {
 mod tests {
     use super::*;
 
+    // The source tree needs names Windows itself cannot create (`a:b.txt`, `CON`,
+    // and two names differing only in case).
+    #[cfg(unix)]
     #[test]
     fn windows_safe_names_are_applied_and_reported() {
         let dir = tempfile::tempdir().unwrap();

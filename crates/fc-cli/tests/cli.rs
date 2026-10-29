@@ -56,6 +56,9 @@ fn single_file_to_new_name_with_speed_limit() {
     let src = dir.path().join("big.iso");
     fs::write(&src, data(3_000_000)).unwrap();
     let dst = dir.path().join("copy-of-big.iso");
+    // Warm-up launch: on Windows the first start of a freshly linked exe can
+    // stall for seconds while antivirus scans it, which is not copy time.
+    fcopy().arg("--version").output().unwrap();
     let t = Instant::now();
     let out = fcopy().args(["copy", "--limit", "10MB"]).arg(&src).arg(&dst).output().unwrap();
     let secs = t.elapsed().as_secs_f64();

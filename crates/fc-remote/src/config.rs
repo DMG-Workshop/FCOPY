@@ -184,7 +184,7 @@ impl AgentConfig {
     pub fn shares_for<'a>(&'a self, account: &'a Account) -> impl Iterator<Item = &'a Share> + 'a {
         self.shares
             .iter()
-            .filter(move |s| account.shares.as_ref().is_none_or(|allowed| allowed.iter().any(|n| *n == s.name)))
+            .filter(move |s| account.shares.as_ref().is_none_or(|allowed| allowed.contains(&s.name)))
     }
 
     /// Is this peer address allowed to connect at all?

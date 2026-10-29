@@ -380,7 +380,7 @@ impl Copier {
             cache::drop_cache(&dst_file);
             progress.set_phase(Phase::Verifying);
             let expected = source_digest.as_ref().expect("hasher present when verifying");
-            let actual = self.readback_digest(rec, &tmp, &mut lease.bufs[0], progress)?;
+            let actual = self.readback_digest(rec, &tmp, copied, &mut lease.bufs[0], progress)?;
             if &actual != expected {
                 return Err(AttemptError::Restart(
                     Operation::Verify,
@@ -562,28 +562,33 @@ impl Copier {
     }
 
     /// Hash the destination temp file by reading it back, bypassing the cache.
+    ///
+    /// `len` is the number of bytes written. Knowing it matters on Windows: the
+    /// handle is unbuffered, so every read must start at an aligned offset with
+    /// an aligned length. Reads always ask for whole aligned slices and the loop
+    /// stops at `len` instead of probing past a short tail read.
     fn readback_digest(
         &self,
         rec: &Recovery<'_>,
         path: &Path,
+        len: u64,
         buf: &mut AlignedBuf,
         progress: &Progress,
     ) -> Step<Digest> {
         let mut file = rec.run(path, Operation::Verify, None, |_| cache::open_uncached(path))?;
         let mut hasher = Hasher::new(self.options.algorithm);
         let mut offset = 0u64;
-        loop {
+        while offset < len {
             check(rec.control)?;
-            let n = fill_from(rec, &mut file, path, Operation::Verify, offset, buf)?;
+            let want = (len - offset).min(buf.len() as u64) as usize;
+            let n = fill_from(rec, &mut file, path, Operation::Verify, offset, buf, want)?;
             if n == 0 {
-                break;
+                break; // truncated: the digest comparison reports it
             }
+            let n = n.min(want);
             hasher.update(&buf[..n]);
             offset += n as u64;
             progress.add_verified(n as u64);
-            if n < buf.len() {
-                break;
-            }
         }
         Ok(hasher.finalize())
     }
@@ -593,8 +598,10 @@ impl Copier {
 // Chunk readers / writers with positional retry
 // ---------------------------------------------------------------------------
 
-/// Fill `buf` from `file` (until full or EOF) with recovery. A retry first
-/// seeks back to the exact byte that failed, so no data is skipped or repeated.
+/// Read from `file` into `buf` until at least `want` bytes are in or EOF, with
+/// recovery. Each read still offers the whole rest of `buf`, so the request
+/// stays aligned for unbuffered handles. A retry first seeks back to the exact
+/// byte that failed, so no data is skipped or repeated.
 fn fill_from<R: Read + Seek>(
     rec: &Recovery<'_>,
     file: &mut R,
@@ -602,13 +609,14 @@ fn fill_from<R: Read + Seek>(
     op: Operation,
     offset: u64,
     buf: &mut [u8],
+    want: usize,
 ) -> Step<usize> {
     let mut filled = 0usize;
     rec.run(path, op, Some(offset), |attempt| {
         if attempt > 0 {
             file.seek(SeekFrom::Start(offset + filled as u64))?;
         }
-        while filled < buf.len() {
+        while filled < want {
             match file.read(&mut buf[filled..]) {
                 Ok(0) => break,
                 Ok(n) => filled += n,
@@ -631,7 +639,8 @@ struct ChunkReader<'a, R> {
 impl<R: Read + Seek> ChunkReader<'_, R> {
     /// Returns bytes read; a result shorter than `buf.len()` means EOF.
     fn fill(&mut self, rec: &Recovery<'_>, buf: &mut [u8]) -> Step<usize> {
-        let n = fill_from(rec, self.file, self.path, Operation::Read, self.offset, buf)?;
+        let want = buf.len();
+        let n = fill_from(rec, self.file, self.path, Operation::Read, self.offset, buf, want)?;
         if let Some(h) = &mut self.hasher {
             h.update(&buf[..n]);
         }
@@ -1001,13 +1010,13 @@ mod tests {
         let progress = Progress::new();
         let mut buf = AlignedBuf::new(64 * 1024);
 
-        let good = c.readback_digest(&rec, &path, &mut buf, &progress).unwrap();
+        let good = c.readback_digest(&rec, &path, 300_000, &mut buf, &progress).unwrap();
         assert_eq!(good, expected);
         assert_eq!(progress.snapshot().bytes_verified, 300_000);
 
         bytes[123_456] ^= 0x01; // single flipped bit
         fs::write(&path, &bytes).unwrap();
-        let bad = c.readback_digest(&rec, &path, &mut buf, &progress).unwrap();
+        let bad = c.readback_digest(&rec, &path, 300_000, &mut buf, &progress).unwrap();
         assert_ne!(bad, expected);
     }
 }
