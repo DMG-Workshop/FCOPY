@@ -150,7 +150,7 @@ Done since the handoff, each with tests:
 - Desktop GUI: Copy to a PC on the network; redesigned window (tab bar, sidebar, queue table, status bar).
 
 Still open:
-- Windows service: verified on this PC (elevated): install, start, listening on UDP 47800, stop, uninstall. It writes no logs yet.
+- Windows service: verified on this PC (elevated): install, start, listening on UDP 47800, stop, uninstall. It writes no logs yet. End to end (packaging/windows/test-service.ps1): a file copied over QUIC into the running service matched byte for byte.
 - Pull (download) direction, not planned yet.
 - BitTorrent engine (web and desktop tabs are disabled and labelled).
 - Public certificate for the web console; the self-signed one needs trusting once.
