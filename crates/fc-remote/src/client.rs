@@ -16,6 +16,10 @@
 //!   FileOffer ─▶ FileAccept{resume_from} ─▶ hash local prefix
 //!   ├─ send: gate (cancel/skip/pause/limit) → DATA … → FileEnd{digest}
 //!   └─ recv: Ack … → FileDone{digest}        (run concurrently)
+//!
+//! Session::pull_file / list_dir
+//!   FileRequest ─▶ FileMeta{size, source_id} ─▶ resume from `name.fcpart` ─▶ PullStart
+//!   └─ recv: gate → DATA … → FileEnd{digest} ─▶ fsync, compare ─▶ rename ─▶ FileDone
 //! ```
 //!
 //! Errors say whether a retry can help: [`ClientError::is_retryable`] is true
@@ -23,7 +27,7 @@
 //! reconnecting (token first) and re-offering the file, which resumes.
 
 use std::fmt;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek};
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use sha2::{Digest as _, Sha256};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -39,7 +43,7 @@ use fc_engine::{Digest, Hasher, JobControl, LinkStats, RateLimiter};
 
 use crate::crypto::{auth_message, random, ClientKeys, EXPORTER_LABEL};
 use crate::protocol::*;
-use crate::server::to_engine;
+use crate::server::{open_temp, sidecar, to_engine, ID_SUFFIX, RESUME_ALIGN, TEMP_SUFFIX};
 use crate::tls::{client_config, PinnedVerifier};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -211,6 +215,8 @@ pub enum ClientError {
     Local { path: PathBuf, source: io::Error },
     #[error("checksum mismatch: sent {expected}, server stored {actual}")]
     Mismatch { expected: String, actual: String },
+    #[error("checksum mismatch: the server read {server} but {local} arrived")]
+    PullMismatch { server: String, local: String },
     #[error("cancelled")]
     Cancelled,
     #[error("skipped")]
@@ -637,12 +643,7 @@ impl Session {
                     let e = io::Error::new(io::ErrorKind::UnexpectedEof, "file shrank while it was being sent");
                     return Err(ClientError::local(local, e));
                 }
-                if let Some(limiter) = ctl.limiter {
-                    let wait = limiter.reserve(n as u64);
-                    if !wait.is_zero() {
-                        tokio::time::sleep(wait).await;
-                    }
-                }
+                self.throttle(ctl, n as u64).await?;
                 hasher.update(&chunk[..n]);
                 write_data(&mut send, offset, &chunk[..n]).await.map_err(|e| self.wire_error(e))?;
                 offset += n as u64;
@@ -702,6 +703,234 @@ impl Session {
         }
         observer.acked(size);
         Ok(PushOutcome { size, resumed_from: resume_from, digest })
+    }
+
+    /// List one remote directory. Entry names are single components, but they
+    /// come from the server: validate them before using them as local names.
+    pub async fn list_dir(&self, remote: &str) -> Result<Vec<DirEntry>, ClientError> {
+        /// A hostile server could stream pages forever.
+        const MAX_ENTRIES: usize = 1_000_000;
+        let (mut send, mut recv) = self.open_stream().await?;
+        write_msg(&mut send, &Message::ListDir { path: remote.to_string() }).await.map_err(|e| self.wire_error(e))?;
+        let _ = send.finish();
+        let mut buf = Vec::new();
+        let mut all = Vec::new();
+        loop {
+            match read_msg(&mut recv, &mut buf).await.map_err(|e| self.wire_error(e))? {
+                Message::DirListing { entries, more } => {
+                    all.extend(entries);
+                    if !more {
+                        return Ok(all);
+                    }
+                    if all.len() > MAX_ENTRIES {
+                        return Err(ClientError::Protocol("directory listing is unreasonably large".into()));
+                    }
+                }
+                Message::FileReject { reason, message } => return Err(ClientError::Rejected { reason, message }),
+                other => return Err(ClientError::Protocol(format!("expected DirListing, got {other:?}"))),
+            }
+        }
+    }
+
+    /// An empty path lists the authenticated account's shares.
+    pub async fn browse(&self, path: &str) -> Result<Vec<DirEntry>, ClientError> {
+        if path.is_empty() {
+            return Ok(self.shares().iter().map(|share| DirEntry {
+                name: share.name.clone(), kind: EntryKind::Dir, size: 0, mtime: (0, 0), mode: 0,
+            }).collect());
+        }
+        self.list_dir(path).await
+    }
+
+    /// Inspect a file without downloading it. Directories return IsDirectory.
+    pub async fn file_size(&self, remote: &str) -> Result<u64, ClientError> {
+        let (mut send, mut recv) = self.open_stream().await?;
+        write_msg(&mut send, &Message::FileRequest { path: remote.into(), algo: HashAlgo::Xxh3 })
+            .await.map_err(|e| self.wire_error(e))?;
+        let reply = read_msg(&mut recv, &mut Vec::new()).await.map_err(|e| self.wire_error(e))?;
+        let _ = send.reset(0u32.into());
+        let _ = recv.stop(0u32.into());
+        match reply {
+            Message::FileMeta { size, .. } => Ok(size),
+            Message::FileReject { reason, message } => Err(ClientError::Rejected { reason, message }),
+            other => Err(ClientError::Protocol(format!("expected FileMeta, got {other:?}"))),
+        }
+    }
+
+    /// Download one file to `req.local`, resuming a partial download of the
+    /// same version of the file. Written as `name.fcpart`, fsynced, compared
+    /// with the server's digest, and only then renamed into place.
+    pub async fn pull_file(
+        &self,
+        req: &PullRequest<'_>,
+        ctl: &PushControl<'_>,
+        observer: &dyn PullObserver,
+    ) -> Result<PullOutcome, ClientError> {
+        let dest = req.local;
+        let (mut send, mut recv) = self.open_stream().await?;
+        write_msg(&mut send, &Message::FileRequest { path: req.remote.to_string(), algo: req.algo })
+            .await
+            .map_err(|e| self.wire_error(e))?;
+        let mut buf = Vec::new();
+        let (size, mtime, mode, id) = match read_msg(&mut recv, &mut buf).await.map_err(|e| self.wire_error(e))? {
+            Message::FileMeta { size, mtime, mode, source_id } => (size, mtime, mode, source_id),
+            Message::FileReject { reason, message } => return Err(ClientError::Rejected { reason, message }),
+            other => return Err(ClientError::Protocol(format!("expected FileMeta, got {other:?}"))),
+        };
+        // After the server has answered: a folder target is discovered by its "is a
+        // directory" refusal, and then `dest` is legitimately a folder.
+        match std::fs::symlink_metadata(dest) {
+            Ok(m) if m.is_dir() => {
+                let _ = send.reset(0u32.into());
+                return Err(ClientError::local(dest, io::Error::new(io::ErrorKind::AlreadyExists, "a folder with that name exists")));
+            }
+            Ok(_) if !req.overwrite => {
+                let _ = send.reset(0u32.into());
+                return Err(ClientError::local(dest, io::Error::new(io::ErrorKind::AlreadyExists, "destination exists")));
+            }
+            _ => {}
+        }
+        observer.meta(size);
+
+        let tmp = sidecar(dest, TEMP_SUFFIX);
+        let id_path = sidecar(dest, ID_SUFFIX);
+        let (file, resume_from) = {
+            let (d, t, i) = (dest.to_path_buf(), tmp.clone(), id_path.clone());
+            tokio::task::spawn_blocking(move || prepare_download(&d, &t, &i, size, id))
+                .await
+                .map_err(|e| ClientError::local(dest, io::Error::other(e)))?
+                .map_err(|e| ClientError::local(dest, e))?
+        };
+        write_msg(&mut send, &Message::PullStart { resume_from }).await.map_err(|e| self.wire_error(e))?;
+        if resume_from > 0 {
+            observer.received(resume_from);
+        }
+
+        let hasher = {
+            let (t, algo) = (tmp.clone(), req.algo);
+            tokio::task::spawn_blocking(move || hash_prefix(&t, algo, resume_from))
+                .await
+                .map_err(|e| ClientError::local(&tmp, io::Error::other(e)))?
+                .map_err(|e| ClientError::local(&tmp, e))?
+        };
+
+        let mut file = tokio::fs::File::from_std(file);
+        let receiver = async {
+            let mut hasher = hasher;
+            let mut expected = resume_from;
+            let remote_digest = loop {
+                self.gate(ctl).await?;
+                match read_frame(&mut recv, &mut buf).await.map_err(|e| self.wire_error(e))? {
+                    Some(Frame::Data { offset, bytes }) => {
+                        if offset != expected || expected + bytes.len() as u64 > size {
+                            return Err(ClientError::Protocol(format!("data at {offset}, expected {expected}")));
+                        }
+                        hasher.update(bytes);
+                        file.write_all(bytes).await.map_err(|e| ClientError::local(&tmp, e))?;
+                        expected += bytes.len() as u64;
+                        observer.received(expected);
+                        self.throttle(ctl, bytes.len() as u64).await?;
+                    }
+                    Some(Frame::Msg(Message::FileEnd { size: end_size, digest })) => {
+                        if end_size != size || expected != size {
+                            return Err(ClientError::Protocol(format!("file ended at {expected} of {size} bytes")));
+                        }
+                        break digest;
+                    }
+                    Some(Frame::Msg(Message::FileDone { ok: false, message, .. })) => return Err(ClientError::Remote(message)),
+                    Some(Frame::Msg(other)) => return Err(ClientError::Protocol(format!("expected Data or FileEnd, got {other:?}"))),
+                    None => return Err(self.wire_error("stream ended before the file was complete")),
+                }
+            };
+            Ok((hasher, remote_digest))
+        };
+        // Cancel and skip must also work while the server is paused or silent,
+        // where the gate is never reached.
+        let abort = async {
+            loop {
+                tokio::time::sleep(ABORT_POLL).await;
+                if ctl.control.is_cancelled() {
+                    return ClientError::Cancelled;
+                }
+                if ctl.control.take_skip() {
+                    return ClientError::Skipped;
+                }
+            }
+        };
+        let result = tokio::select! {
+            r = receiver => r,
+            e = abort => Err(e),
+        };
+        let (hasher, remote_digest) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                // Keep the partial file: the same version resumes later.
+                let _ = file.flush().await;
+                let _ = send.reset(0u32.into());
+                let _ = recv.stop(0u32.into());
+                return Err(e);
+            }
+        };
+
+        let digest = hasher.finalize();
+        let synced = async {
+            file.flush().await?;
+            file.sync_all().await
+        }
+        .await;
+        if let Err(e) = synced {
+            // A failed sync cannot be repaired by syncing the same data again.
+            if let Err(cleanup) = std::fs::remove_file(&id_path) {
+                tracing::warn!(path = %id_path.display(), "cannot invalidate failed download: {cleanup}");
+            }
+            let _ = write_msg(&mut send, &Message::FileDone { ok: false, digest: vec![], message: "local write failed".into() }).await;
+            return Err(ClientError::local(&tmp, e));
+        }
+        let disk_digest = {
+            let (path, algo) = (tmp.clone(), req.algo);
+            tokio::task::spawn_blocking(move || hash_prefix(&path, algo, size).map(Hasher::finalize))
+                .await.map_err(|e| ClientError::local(&tmp, io::Error::other(e)))?
+                .map_err(|e| ClientError::local(&tmp, e))?
+        };
+        if remote_digest != digest.as_bytes() || disk_digest != digest {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::remove_file(&id_path);
+            let _ = write_msg(&mut send, &Message::FileDone { ok: false, digest: vec![], message: "checksum mismatch".into() }).await;
+            let _ = send.finish();
+            let server = Digest::new(digest.algorithm(), remote_digest).to_hex();
+            return Err(ClientError::PullMismatch { server, local: disk_digest.to_hex() });
+        }
+
+        let std_file = file.into_std().await;
+        let committed = {
+            let (t, d, i, preserve) = (tmp.clone(), dest.to_path_buf(), id_path.clone(), req.preserve);
+            tokio::task::spawn_blocking(move || commit_download(std_file, &t, &d, &i, preserve.then_some((mtime, mode))))
+                .await
+                .map_err(|e| ClientError::local(dest, io::Error::other(e)))?
+        };
+        let verdict = match &committed {
+            Ok(()) => Message::FileDone { ok: true, digest: vec![], message: String::new() },
+            Err(e) => Message::FileDone { ok: false, digest: vec![], message: format!("could not finish the file: {e}") },
+        };
+        let _ = write_msg(&mut send, &verdict).await;
+        let _ = send.finish();
+        committed.map_err(|e| ClientError::local(dest, e))?;
+        Ok(PullOutcome { size, resumed_from: resume_from, digest })
+    }
+
+    async fn throttle(&self, ctl: &PushControl<'_>, bytes: u64) -> Result<(), ClientError> {
+        let Some(limiter) = ctl.limiter else { return Ok(()) };
+        loop {
+            let rate = limiter.limit();
+            let deadline = tokio::time::Instant::now() + limiter.reserve(bytes);
+            while limiter.limit() == rate {
+                self.gate(ctl).await?;
+                let now = tokio::time::Instant::now();
+                if now >= deadline { return Ok(()); }
+                tokio::time::sleep((deadline - now).min(POLL)).await;
+            }
+        }
     }
 
     /// Before each chunk: cancel, skip, local or remote pause.
@@ -897,6 +1126,80 @@ pub trait PushObserver: Send + Sync {
 
 impl PushObserver for () {}
 
+/// One file to download.
+#[derive(Debug, Clone)]
+pub struct PullRequest<'a> {
+    /// `share/dir/name` on the server.
+    pub remote: &'a str,
+    /// Where the finished file goes; its folder is created if needed.
+    pub local: &'a Path,
+    pub algo: HashAlgo,
+    pub overwrite: bool,
+    /// Copy the server's modification time and (on Unix) permissions.
+    pub preserve: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PullOutcome {
+    pub size: u64,
+    /// Bytes already on disk from an earlier attempt.
+    pub resumed_from: u64,
+    pub digest: Digest,
+}
+
+/// Download progress with absolute file offsets (a resume restarts at `resume_from`).
+pub trait PullObserver: Send + Sync {
+    /// The file's size, once the server has answered.
+    fn meta(&self, _size: u64) {}
+    /// Bytes up to `offset` are on disk.
+    fn received(&self, _offset: u64) {}
+}
+
+impl PullObserver for () {}
+
+/// Open or reopen the partial file and decide where the download resumes.
+fn prepare_download(dest: &Path, tmp: &Path, id_path: &Path, size: u64, id: [u8; 16]) -> io::Result<(std::fs::File, u64)> {
+    let parent = dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let same_version = std::fs::read(id_path).is_ok_and(|v| v == id);
+    let existing = if same_version { std::fs::metadata(tmp).map(|m| m.len()).unwrap_or(0) } else { 0 };
+    // The tail of an interrupted write may be torn, so resume on an aligned boundary.
+    let resume_from = (existing.min(size) / RESUME_ALIGN) * RESUME_ALIGN;
+    let available = fs4::available_space(parent).unwrap_or(u64::MAX);
+    if available < size - resume_from {
+        return Err(io::Error::new(io::ErrorKind::StorageFull, format!("need {} bytes, {available} available", size - resume_from)));
+    }
+    let mut file = open_temp(tmp)?;
+    file.set_len(resume_from)?;
+    file.seek(io::SeekFrom::Start(resume_from))?;
+    std::fs::write(id_path, id)?;
+    Ok((file, resume_from))
+}
+
+/// Set times and permissions, then rename the finished partial into place.
+fn commit_download(file: std::fs::File, tmp: &Path, dest: &Path, id_path: &Path, meta: Option<((i64, u32), u32)>) -> io::Result<()> {
+    if let Some((mtime, mode)) = meta {
+        if mtime.0 >= 0 && mtime.1 < 1_000_000_000 {
+            if let Some(t) = UNIX_EPOCH.checked_add(Duration::new(mtime.0 as u64, mtime.1)) {
+                if let Err(e) = file.set_times(std::fs::FileTimes::new().set_modified(t)) {
+                    tracing::warn!(path = %dest.display(), "cannot preserve modification time: {e}");
+                }
+            }
+        }
+        #[cfg(unix)]
+        if mode != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(mode & 0o777));
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+    }
+    drop(file);
+    std::fs::rename(tmp, dest)?;
+    let _ = std::fs::remove_file(id_path);
+    Ok(())
+}
+
 /// Identifies one version of a source file: `sha256(path | size | mtime)[..16]`.
 pub fn source_id(path: &Path, size: u64, mtime: (i64, u32)) -> [u8; 16] {
     let mut h = Sha256::new();
@@ -950,7 +1253,7 @@ fn hash_prefix(path: &Path, algo: HashAlgo, len: u64) -> io::Result<Hasher> {
     Ok(hasher)
 }
 
-async fn read_full(file: &mut tokio::fs::File, buf: &mut [u8]) -> io::Result<usize> {
+pub(crate) async fn read_full(file: &mut tokio::fs::File, buf: &mut [u8]) -> io::Result<usize> {
     let mut filled = 0;
     while filled < buf.len() {
         match file.read(&mut buf[filled..]).await? {

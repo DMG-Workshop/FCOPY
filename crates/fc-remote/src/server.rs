@@ -35,9 +35,9 @@ use crate::tls::{server_config, Identity};
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 const ACK_EVERY: u64 = 4 * 1024 * 1024;
 /// Partial uploads resume from a multiple of this (the tail may be torn).
-const RESUME_ALIGN: u64 = 64 * 1024;
-const TEMP_SUFFIX: &str = ".fcpart";
-const ID_SUFFIX: &str = ".fcpart.id";
+pub(crate) const RESUME_ALIGN: u64 = 64 * 1024;
+pub(crate) const TEMP_SUFFIX: &str = ".fcpart";
+pub(crate) const ID_SUFFIX: &str = ".fcpart.id";
 
 /// A connected, authenticated client (for status displays).
 #[derive(Debug, Clone)]
@@ -56,6 +56,8 @@ pub struct SessionInfo {
 pub struct TestHooks {
     /// Abruptly close the connection once this many file bytes have arrived (once).
     pub drop_after_bytes: AtomicU64,
+    /// Same, for bytes sent to a downloading client.
+    pub drop_pull_after_bytes: AtomicU64,
 }
 
 struct State {
@@ -86,10 +88,11 @@ impl ServerHandle {
     /// Pause every incoming transfer. Clients are told, and the server also
     /// stops reading, so flow control holds senders that ignore the message.
     pub fn pause_all(&self) {
-        let _ = self.state.paused.send(true);
+        // `send_replace` stores the value even with no session connected yet.
+        self.state.paused.send_replace(true);
     }
     pub fn resume_all(&self) {
-        let _ = self.state.paused.send(false);
+        self.state.paused.send_replace(false);
     }
     pub fn sessions(&self) -> Vec<SessionInfo> {
         self.state.sessions.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -425,14 +428,14 @@ fn ensure_inside(share_root: &Path, dir: &Path) -> Result<(), Reject> {
     if real.starts_with(&root) { Ok(()) } else { Err((RejectReason::BadPath, "path escapes the share via a symlink".into())) }
 }
 
-fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut s = path.as_os_str().to_os_string();
     s.push(suffix);
     PathBuf::from(s)
 }
 
 /// Open (or reopen) the temp file without following symlinks.
-fn open_temp(tmp: &Path) -> io::Result<fs::File> {
+pub(crate) fn open_temp(tmp: &Path) -> io::Result<fs::File> {
     if fs::symlink_metadata(tmp).is_ok_and(|m| m.file_type().is_symlink()) {
         fs::remove_file(tmp)?;
     }
@@ -546,7 +549,9 @@ async fn handle_entry(
     let mut buf = Vec::with_capacity(MAX_FRAME);
     let (kind, path, size, mtime, mode, algo, source_id, overwrite) = match read_msg(&mut recv, &mut buf).await? {
         Message::FileOffer { kind, path, size, mtime, mode, algo, source_id, overwrite } => (kind, path, size, mtime, mode, algo, source_id, overwrite),
-        other => return Err(ProtoError::Unexpected { expected: "FileOffer", got: Box::new(other) }),
+        Message::FileRequest { path, algo } => return handle_pull(state, account, conn, send, recv, path, algo).await,
+        Message::ListDir { path } => return handle_list(state, account, send, path).await,
+        other => return Err(ProtoError::Unexpected { expected: "FileOffer, FileRequest or ListDir", got: Box::new(other) }),
     };
     let reject = |(reason, message): Reject| Message::FileReject { reason, message };
 
@@ -641,6 +646,223 @@ async fn handle_entry(
         }
     };
     write_msg(&mut send, &done).await?;
+    let _ = send.finish();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Download: read-only access to a share
+// ---------------------------------------------------------------------------
+
+/// Canonicalise `path` and make sure it is still inside the share, so a
+/// symlink can't lead a reader out of it. Returns the real path and its metadata.
+fn stat_inside(share: &Share, path: &Path) -> Result<(PathBuf, fs::Metadata), Reject> {
+    let io_err = |e: io::Error| (RejectReason::Io, e.to_string());
+    let real = fs::canonicalize(path).map_err(|e| match e.kind() {
+        io::ErrorKind::NotFound => (RejectReason::NotFound, "no such file or directory".to_string()),
+        _ => io_err(e),
+    })?;
+    let root = fs::canonicalize(&share.path).map_err(io_err)?;
+    if !real.starts_with(&root) {
+        return Err((RejectReason::BadPath, "path escapes the share via a symlink".into()));
+    }
+    let meta = fs::metadata(&real).map_err(io_err)?;
+    Ok((real, meta))
+}
+
+fn mtime_of(meta: &fs::Metadata) -> (i64, u32) {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| (d.as_secs() as i64, d.subsec_nanos()))
+        .unwrap_or((-1, 0))
+}
+
+fn mode_of(meta: &fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o7777
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        0
+    }
+}
+
+struct PullFile {
+    file: fs::File,
+    size: u64,
+    mtime: (i64, u32),
+    mode: u32,
+}
+
+fn open_for_read(share: &Share, path: &Path) -> Result<PullFile, Reject> {
+    let io_err = |e: io::Error| (RejectReason::Io, e.to_string());
+    let (real, meta) = stat_inside(share, path)?;
+    if meta.is_dir() {
+        return Err((RejectReason::IsDirectory, "that path is a directory".into()));
+    }
+    // Opening a FIFO or device would block or misbehave.
+    if !meta.is_file() {
+        return Err((RejectReason::BadPath, "not a regular file".into()));
+    }
+    let file = fs::File::open(&real).map_err(io_err)?;
+    let meta = file.metadata().map_err(io_err)?;
+    Ok(PullFile { file, size: meta.len(), mtime: mtime_of(&meta), mode: mode_of(&meta) })
+}
+
+fn list_dir(share: &Share, dir: &Path) -> Result<Vec<DirEntry>, Reject> {
+    let io_err = |e: io::Error| (RejectReason::Io, e.to_string());
+    let (real, meta) = stat_inside(share, dir)?;
+    if !meta.is_dir() {
+        return Err((RejectReason::NotDirectory, "that path is not a directory".into()));
+    }
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&real).map_err(io_err)? {
+        let Ok(entry) = entry else { continue };
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else { continue };
+        // Our own partial-upload files, and anything that isn't a plain name.
+        if name.ends_with(TEMP_SUFFIX) || name.ends_with(ID_SUFFIX) || name.contains(['/', '\\', '\0']) {
+            continue;
+        }
+        // Entries that resolve outside the share, or are neither file nor folder, are not listed.
+        let Ok((_, m)) = stat_inside(share, &entry.path()) else { continue };
+        let kind = if m.is_dir() {
+            EntryKind::Dir
+        } else if m.is_file() {
+            EntryKind::File
+        } else {
+            continue;
+        };
+        out.push(DirEntry { name, kind, size: if m.is_dir() { 0 } else { m.len() }, mtime: mtime_of(&m), mode: mode_of(&m) });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+async fn handle_list(state: &Arc<State>, account: &Account, mut send: quinn::SendStream, path: String) -> Result<(), ProtoError> {
+    let reject = |(reason, message): Reject| Message::FileReject { reason, message };
+    let listed = match resolve(&state.config, account, &path, false) {
+        Ok((share, dir)) => {
+            let share = share.clone();
+            tokio::task::spawn_blocking(move || list_dir(&share, &dir)).await.expect("list task")
+        }
+        Err(r) => Err(r),
+    };
+    match listed {
+        Err(r) => write_msg(&mut send, &reject(r)).await?,
+        Ok(entries) => {
+            let mut pages: Vec<&[DirEntry]> = entries.chunks(LISTING_PAGE).collect();
+            if pages.is_empty() {
+                pages.push(&[]);
+            }
+            let last = pages.len() - 1;
+            for (i, page) in pages.iter().enumerate() {
+                write_msg(&mut send, &Message::DirListing { entries: page.to_vec(), more: i < last }).await?;
+            }
+        }
+    }
+    let _ = send.finish();
+    Ok(())
+}
+
+async fn handle_pull(
+    state: &Arc<State>,
+    account: &Account,
+    conn: &quinn::Connection,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    path: String,
+    algo: HashAlgo,
+) -> Result<(), ProtoError> {
+    let reject = |(reason, message): Reject| Message::FileReject { reason, message };
+    let opened = match resolve(&state.config, account, &path, false) {
+        Ok((share, src)) => {
+            let share = share.clone();
+            tokio::task::spawn_blocking(move || open_for_read(&share, &src)).await.expect("open task")
+        }
+        Err(r) => Err(r),
+    };
+    let pf = match opened {
+        Ok(pf) => pf,
+        Err(r) => {
+            write_msg(&mut send, &reject(r)).await?;
+            let _ = send.finish();
+            return Ok(());
+        }
+    };
+    let (size, mtime) = (pf.size, pf.mtime);
+    let source_id = crate::client::source_id(Path::new(&path), size, mtime);
+    write_msg(&mut send, &Message::FileMeta { size, mtime, mode: pf.mode, source_id }).await?;
+
+    let mut buf = Vec::new();
+    let resume_from = match read_msg(&mut recv, &mut buf).await? {
+        Message::PullStart { resume_from } if resume_from <= size => resume_from,
+        Message::PullStart { resume_from } => {
+            return Err(ProtoError::Malformed(format!("resume point {resume_from} is past the end ({size})")));
+        }
+        other => return Err(ProtoError::Unexpected { expected: "PullStart", got: Box::new(other) }),
+    };
+
+    let mut file = tokio::fs::File::from_std(pf.file);
+    let mut hasher = Hasher::new(to_engine(algo));
+    let mut chunk = vec![0u8; CHUNK];
+    let mut offset = 0u64;
+    let failed = |message: &str| Message::FileDone { ok: false, digest: vec![], message: message.to_string() };
+
+    // The digest covers the whole file; the part the client already holds is only hashed.
+    while offset < resume_from {
+        let want = (resume_from - offset).min(CHUNK as u64) as usize;
+        let n = crate::client::read_full(&mut file, &mut chunk[..want]).await?;
+        if n < want {
+            write_msg(&mut send, &failed("file shrank while it was being read")).await?;
+            let _ = send.finish();
+            return Ok(());
+        }
+        hasher.update(&chunk[..n]);
+        offset += n as u64;
+    }
+
+    let mut paused = state.paused.subscribe();
+    while offset < size {
+        // Server-side pause: stop sending and let the client wait.
+        while *paused.borrow_and_update() {
+            if paused.changed().await.is_err() {
+                break;
+            }
+        }
+        let want = (size - offset).min(CHUNK as u64) as usize;
+        let n = crate::client::read_full(&mut file, &mut chunk[..want]).await?;
+        if n < want {
+            write_msg(&mut send, &failed("file shrank while it was being sent")).await?;
+            let _ = send.finish();
+            return Ok(());
+        }
+        hasher.update(&chunk[..n]);
+        write_data(&mut send, offset, &chunk[..n]).await?;
+        offset += n as u64;
+
+        let drop_at = state.hooks.drop_pull_after_bytes.load(Ordering::Relaxed);
+        if drop_at > 0 && offset >= drop_at {
+            state.hooks.drop_pull_after_bytes.store(0, Ordering::Relaxed);
+            conn.close(0u32.into(), b"test: simulated network drop");
+            return Ok(());
+        }
+    }
+
+    let after = file.metadata().await?;
+    if after.len() != size || mtime_of(&after) != mtime {
+        write_msg(&mut send, &failed("file changed while it was being sent")).await?;
+        let _ = send.finish();
+        return Ok(());
+    }
+    write_msg(&mut send, &Message::FileEnd { size, digest: hasher.finalize().as_bytes().to_vec() }).await?;
+    // The client's verdict arrives after it has written and compared the file.
+    if let Ok(Message::FileDone { ok: false, message, .. }) = read_msg(&mut recv, &mut buf).await {
+        tracing::warn!(%path, "client rejected the download: {message}");
+    }
     let _ = send.finish();
     Ok(())
 }

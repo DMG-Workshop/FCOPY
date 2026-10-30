@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use fc_engine::{ErrorPolicy, JobId, JobInfo, RetryPolicy, TransferRequest};
-use fc_remote::backend::RemoteBackend;
+use fc_remote::backend::{PullBackend, RemoteBackend};
 use fc_remote::client::{ClientError, Connector, RemoteSpec, Session};
 use fc_torrent::{TorrentEngine, TorrentError};
 
@@ -127,6 +127,16 @@ pub struct RemoteTarget {
     pub client_id: u64,
     /// Login for the PC. Used for this job only, never stored.
     pub password: String,
+    #[serde(default)]
+    pub direction: TransferDirection,
+}
+
+#[derive(Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferDirection {
+    #[default]
+    Upload,
+    Download,
 }
 
 /// The profile's address, with the path replaced by the job's folder. The
@@ -151,9 +161,15 @@ pub async fn create_transfer(
     if req.sources.is_empty() || req.sources.len() > MAX_SOURCES {
         return Err(ApiError::BadRequest(format!("give between 1 and {MAX_SOURCES} sources")));
     }
-    for src in &req.sources {
-        if !within_roots(&s.roots, src) || !src.exists() {
-            return Err(ApiError::BadRequest(format!("source not found inside a share: {}", src.display())));
+    let download = req.remote.as_ref().is_some_and(|r| r.direction == TransferDirection::Download);
+    if req.remote.is_some() {
+        require_admin(&p)?;
+    }
+    if !download {
+        for src in &req.sources {
+            if !within_roots(&s.roots, src) || !src.exists() {
+                return Err(ApiError::BadRequest(format!("source not found inside a share: {}", src.display())));
+            }
         }
     }
     let mut request = match req.remote {
@@ -169,11 +185,24 @@ pub async fn create_transfer(
                 return Err(ApiError::BadRequest("the PC's password or access key is required".into()));
             }
             let profile = s.clients.get(remote.client_id).ok_or(ApiError::NotFound)?;
-            let dest = req.dest.to_string_lossy().to_string();
-            let spec = remote_spec(&profile.target, &dest).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            let spec = if download {
+                if !within_roots(&s.roots, &req.dest) {
+                    return Err(ApiError::BadRequest("destination is outside every share".into()));
+                }
+                for src in &req.sources {
+                    remote_spec(&profile.target, &src.to_string_lossy()).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+                }
+                RemoteSpec::parse(&profile.target).map_err(|e| ApiError::BadRequest(e.to_string()))?
+            } else {
+                remote_spec(&profile.target, &req.dest.to_string_lossy()).map_err(|e| ApiError::BadRequest(e.to_string()))?
+            };
             let connector = Connector::new(spec).password(remote.password).pinned(Some(profile.fingerprint));
             let backend = RemoteBackend::new(connector).map_err(|e| ApiError::Remote(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            TransferRequest::to_backend(req.sources, Arc::new(backend))
+            if download {
+                TransferRequest::to_backend(req.sources, Arc::new(PullBackend::new(Arc::new(backend), req.dest)))
+            } else {
+                TransferRequest::to_backend(req.sources, Arc::new(backend))
+            }
         }
     };
     if let Some(label) = req.label.filter(|l| !l.trim().is_empty()) {
@@ -182,6 +211,42 @@ pub async fn create_transfer(
     let id = s.queue.add(request);
     s.owners.write().unwrap_or_else(|e| e.into_inner()).insert(id, p.name);
     Ok((StatusCode::ACCEPTED, Json(Created { id })))
+}
+
+#[derive(Deserialize)]
+pub struct BrowseRemote {
+    pub password: String,
+    /// Empty to list the authenticated account's shares.
+    #[serde(default)]
+    pub path: String,
+}
+
+pub async fn browse_client(
+    State(s): State<Arc<AppState>>,
+    p: Principal,
+    Path(id): Path<u64>,
+    Json(req): Json<BrowseRemote>,
+) -> Result<Response, ApiError> {
+    require_admin(&p)?;
+    let profile = s.clients.get(id).ok_or(ApiError::NotFound)?;
+    if req.password.is_empty() {
+        return Err(ApiError::BadRequest("the PC's password or access key is required".into()));
+    }
+    let path = if req.path.is_empty() {
+        String::new()
+    } else {
+        remote_spec(&profile.target, &req.path).map_err(|e| ApiError::BadRequest(e.to_string()))?.path
+    };
+    let spec = RemoteSpec::parse(&profile.target).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let connector = Connector::new(spec).password(req.password).pinned(Some(profile.fingerprint));
+    let entries = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let session = Session::open(&connector, None).await?;
+        let result = session.browse(&path).await;
+        session.close().await;
+        result
+    }).await.map_err(|_| ApiError::Remote(StatusCode::GATEWAY_TIMEOUT, "remote browsing timed out".into()))?
+        .map_err(|e| ApiError::Remote(StatusCode::BAD_GATEWAY, e.to_string()))?;
+    Ok(([(axum::http::header::CACHE_CONTROL, "no-store")], Json(json!({ "path": path, "entries": entries }))).into_response())
 }
 
 /// Look up a job the caller may act on. Other users' jobs look missing, so
@@ -389,6 +454,11 @@ fn current_settings(s: &AppState) -> Settings {
 pub async fn get_settings(State(s): State<Arc<AppState>>, p: Principal) -> Result<Json<Settings>, ApiError> {
     require_admin(&p)?;
     Ok(Json(current_settings(&s)))
+}
+
+pub async fn vpn_providers(p: Principal) -> Result<Json<&'static [fc_remote::vpn::Provider]>, ApiError> {
+    require_admin(&p)?;
+    Ok(Json(fc_remote::vpn::PROVIDERS))
 }
 
 pub async fn put_settings(State(s): State<Arc<AppState>>, p: Principal, Json(req): Json<Settings>) -> Result<Json<Settings>, ApiError> {

@@ -105,8 +105,15 @@ function fcopy() {
     modal: null,
     addForm: { sources: '', dest: '', label: '', mode: 'local', clientId: '', password: '' },
     addNotice: '',
+    remoteBrowser: { path: '', entries: [], busy: false, error: '' },
     settingsForm: { limitMiB: 0, policy: 'retry' },
     settingsNotice: '',
+    settingsTab: 'accounts',
+    vpnProviders: [],
+    vpnProvider: 'nordvpn',
+    vpnLoading: false,
+    vpnNotice: '',
+    vpnTarget: '',
     users: [],
     userForm: { name: '', password: '', role: 'user' },
     userNotice: '',
@@ -172,6 +179,7 @@ function fcopy() {
 
     async signOut() {
       await this.api('POST', '/api/auth/logout');
+      this.closeModal();
       this.disconnect();
       clearInterval(this.clientTimer);
       this.user = null;
@@ -180,6 +188,7 @@ function fcopy() {
       this.logs = [];
       this.selected = {};
       this.torrents = [];
+      this.vpnTarget = '';
     },
 
     // ---------- live queue ----------
@@ -404,7 +413,10 @@ function fcopy() {
 
     openModal(name) {
       this.modal = name;
-      if (name === 'settings') this.loadUsers();
+      if (name === 'settings') {
+        this.loadUsers();
+        this.loadVpnProviders();
+      }
       if (name === 'add') {
         this.addNotice = '';
         if (this.isAdmin()) this.loadClients();
@@ -418,6 +430,66 @@ function fcopy() {
 
     closeModal() {
       this.modal = null;
+      this.addForm.password = '';
+      this.pairForm.password = '';
+      this.pairForm.confirm = null;
+      this.resetRemoteBrowser();
+    },
+
+    resetRemoteBrowser() {
+      this.remoteBrowser = { path: '', entries: [], busy: false, error: '' };
+    },
+
+    changeTransferMode() {
+      this.addForm.sources = '';
+      this.addForm.dest = '';
+      this.resetRemoteBrowser();
+    },
+
+    changeRemoteClient() {
+      if (this.addForm.mode === 'download') this.addForm.sources = '';
+      this.addForm.password = '';
+      this.resetRemoteBrowser();
+    },
+
+    async browseRemote(path = '') {
+      if (this.remoteBrowser.busy) return;
+      const state = this.remoteBrowser;
+      state.error = '';
+      if (!this.addForm.clientId || !this.addForm.password) {
+        state.error = 'Choose a paired PC and enter its password or access key.';
+        return;
+      }
+      state.busy = true;
+      try {
+        const r = await this.api('POST', `/api/clients/${this.addForm.clientId}/browse`, {
+          password: this.addForm.password, path,
+        });
+        if (state !== this.remoteBrowser) return;
+        if (!r.ok) {
+          state.error = await errorText(r);
+          return;
+        }
+        const listing = await r.json();
+        if (state !== this.remoteBrowser) return;
+        state.path = listing.path;
+        state.entries = listing.entries;
+      } catch (e) {
+        if (state === this.remoteBrowser) state.error = `Cannot browse remote PC: ${e.message}`;
+      } finally {
+        state.busy = false;
+      }
+    },
+
+    remoteEntryPath(entry) {
+      return this.remoteBrowser.path ? `${this.remoteBrowser.path}/${entry.name}` : entry.name;
+    },
+
+    addRemoteSource(entry) {
+      const path = this.remoteEntryPath(entry);
+      const sources = this.addForm.sources.split('\n').filter(Boolean);
+      if (!sources.includes(path)) sources.push(path);
+      this.addForm.sources = sources.join('\n');
     },
 
     async setMode(m) {
@@ -434,16 +506,23 @@ function fcopy() {
       this.addNotice = '';
       const sources = this.addForm.sources.split('\n').map((s) => s.trim()).filter(Boolean);
       const body = { sources, dest: this.addForm.dest.trim(), label: this.addForm.label.trim() || null };
-      if (this.addForm.mode === 'remote') {
+      if (this.addForm.mode === 'remote' || this.addForm.mode === 'download') {
         if (!this.addForm.clientId) {
           this.addNotice = 'Choose a paired PC.';
           return;
         }
-        body.remote = { client_id: Number(this.addForm.clientId), password: this.addForm.password };
+        body.remote = { client_id: Number(this.addForm.clientId), password: this.addForm.password,
+          direction: this.addForm.mode === 'download' ? 'download' : 'upload' };
       }
-      const r = await this.api('POST', '/api/transfers', body);
-      // The password is cleared as soon as it has been sent, whatever the answer.
-      this.addForm.password = '';
+      let r;
+      try {
+        r = await this.api('POST', '/api/transfers', body);
+      } catch (e) {
+        this.addNotice = `Cannot queue transfer: ${e.message}`;
+        return;
+      } finally {
+        this.addForm.password = '';
+      }
       if (r.status === 202) {
         this.addForm = { sources: '', dest: this.addForm.dest, label: '', mode: this.addForm.mode, clientId: this.addForm.clientId, password: '' };
         this.closeModal();
@@ -453,6 +532,38 @@ function fcopy() {
     },
 
     // ---------- engine settings ----------
+
+    async loadVpnProviders() {
+      if (this.vpnLoading) return;
+      this.vpnLoading = true;
+      this.vpnNotice = '';
+      try {
+        const r = await this.api('GET', '/api/settings/vpn');
+        if (!r.ok) {
+          this.vpnNotice = await errorText(r);
+          return;
+        }
+        this.vpnProviders = await r.json();
+      } catch (e) {
+        this.vpnNotice = `Cannot load VPN services: ${e.message}`;
+      } finally {
+        this.vpnLoading = false;
+      }
+    },
+
+    vpnSelected() {
+      return this.vpnProviders.find((p) => p.id === this.vpnProvider);
+    },
+
+    pairOverVpn() {
+      const provider = this.vpnSelected();
+      if (!provider?.mesh || !this.vpnTarget.trim()) {
+        this.vpnNotice = 'Select Tailscale or ZeroTier and enter the remote VPN target.';
+        return;
+      }
+      this.pairForm = { name: `${provider.name} PC`, target: this.vpnTarget.trim(), password: '', confirm: null };
+      this.openModal('pair');
+    },
 
     limitLabel() {
       const m = this.settingsForm.limitMiB;

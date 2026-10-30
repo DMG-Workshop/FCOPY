@@ -139,8 +139,7 @@ per-file hooks, `Progress::count_file` (for concurrent small files),
    - Copy-to selector: Local path / Remote PC.
    - Dashboard link panel when `Snapshot.link` is present: RTT, acked vs sent, reconnects, "paused by remote".
 
-Not planned yet: pull (download) direction (add a `FileRequest` message mirroring
-`FileOffer`), single-instance IPC for the GUI, the Windows 11 modern context menu
+Not planned yet: single-instance IPC for the GUI, the Windows 11 modern context menu
 (IExplorerCommand + sparse MSIX).
 
 ## Status: remote agent work (updated)
@@ -151,11 +150,28 @@ Done since the handoff, each with tests:
 - LAN discovery (fc-remote/discovery.rs): advertise and browse `_fcopy._udp.local.`. The agent announces itself when `discovery = true`.
 - `fcopy copy SRC user@host:/share/dir` with password from file, env or prompt. `--accept-fingerprint`, trust saved after confirmation. `fcopy peers`.
 - Web console: Remote node mode in Add task; HTTPS only. Defaults to the agent's self-signed certificate; `https_server_config_from_pem` and the `serve` example's `--tls-cert`/`--tls-key` options support a supplied PEM chain and unencrypted private key. The example can bind to a LAN interface with `--bind`; plain HTTP is loopback-only.
+- Pull (download): `FileRequest`/`FileMeta`/`PullStart`/`ListDir`/`DirListing` messages (appended to
+  `Message`, protocol version still 1; an old agent refuses them), `Session::pull_file`/`list_dir`,
+  `RemoteBackend::pull` (folder walk, reconnect, resume from `name.fcpart` + `.fcpart.id`), and
+  `fcopy copy user@host:/share/path… DEST`. Read-only shares can be pulled from. Server serves only paths
+  that canonicalise inside the share; the client rejects any server-supplied name that is not one plain
+  component. Sequential (no parallel small files yet), no CLI `--manifest`.
+  Tests: fc-remote/tests/pull.rs, fc-cli/tests/remote.rs. Also fixed `pause_all` being ignored with no session connected.
+- Queued downloads: `PullBackend` overrides the synchronous `TransferBackend::plan` hook to
+  enumerate remote sources on the queue worker, then reports normal per-file results and progress.
+  Desktop Add task has a Download from PC mode with an off-thread share/directory browser.
+  Web Add task has Download from paired PC; POST `/api/clients/{id}/browse` is admin-only,
+  uses the pinned profile and per-operation credentials, and lists only the account's shares.
+  Web destinations remain confined to the console host's configured roots.
+  Pause/resume, skip, cancel, shared live rate limits, reconnect/resume, and read-back comparison are tested.
 - Desktop GUI: Copy to a PC on the network; redesigned window (tab bar, sidebar, queue table, status bar).
+- VPN settings: shared catalog of ten consumer VPNs plus Tailscale/ZeroTier. Desktop saves
+  app executable links and a VPN target in `vpn-links.toml`; web provides admin-only links
+  and hands VPN targets to normal pinned pairing. Tunnels, login, routing and kill switches
+  remain managed by the provider's app/OS, not FCOPY. See README for setup.
 
 Still open:
 - Windows service: install/start/copy/stop/uninstall previously passed on this PC. Timestamped diagnostics are now written to `service.log` in the agent state directory, with one 2 MiB rotated archive (`service.log.1`). The updated end-to-end script uses isolated temporary state and checks the startup record; this logging assertion still needs an elevated run.
-- Pull (download) direction, not planned yet.
 - BitTorrent (fc-torrent, librqbit 9): own lane, not the copy queue, since a torrent
   holds the one-job worker until its download finishes. Web console: admin-only tab
   with magnet and .torrent add (optional peer addresses), pause, resume, remove,

@@ -16,9 +16,17 @@
 //!
 //! Remote transfers always verify: the server re-reads the file and its digest
 //! must match. The copy engine's `verify` setting therefore doesn't apply here.
+//!
+//! # Downloads
+//!
+//! [`RemoteBackend::pull`] is the other direction, outside the transfer queue. It
+//! lists folders, then downloads their files one at a time into `name.fcpart`
+//! and renames each into place after the digest matches. It reconnects and
+//! resumes the same way, and never trusts a server-supplied name: anything that
+//! is not one plain component is reported as a failure instead of written.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,11 +36,14 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use fc_engine::{
     Algorithm, BackendContext, BatchReport, CopyError, CopyItem, CopyReport, FileEvent, JobControl, LinkStats,
-    Operation, Plan, Progress, TransferBackend,
+    Operation, Plan, PlanOptions, Progress, RateLimiter, TransferBackend,
 };
 
-use crate::client::{ClientError, Connector, PushControl, PushObserver, PushRequest, Session, fresh_source_id};
-use crate::protocol::HashAlgo;
+use crate::client::{
+    ClientError, Connector, PullObserver, PullOutcome, PullRequest, PushControl, PushObserver, PushRequest, Session,
+    fresh_source_id,
+};
+use crate::protocol::{DirEntry, EntryKind, HashAlgo, RejectReason};
 
 /// Files below this size go through the concurrent lane.
 pub const SMALL_FILE: u64 = 4 * 1024 * 1024;
@@ -64,6 +75,17 @@ pub struct RemoteBackend {
 }
 
 impl RemoteBackend {
+    /// Browse shares (empty path) or a directory without blocking a UI thread.
+    /// Call this synchronous adapter from a background worker.
+    pub fn browse(&self, path: &str) -> Result<Vec<DirEntry>, ClientError> {
+        self.runtime.as_ref().expect("runtime lives until drop").block_on(async {
+            tokio::time::timeout(Duration::from_secs(60), async {
+                let session = self.session(&JobControl::new()).await?;
+                session.browse(path).await
+            }).await.map_err(|_| ClientError::Connection("remote browsing timed out".into()))?
+        })
+    }
+
     /// The connector must carry the fingerprint the user confirmed at pairing. There is
     /// no trust-on-first-use here, so an unpaired destination can never receive a job.
     pub fn new(connector: Connector) -> std::io::Result<Self> {
@@ -140,7 +162,7 @@ impl RemoteBackend {
         }
     }
 
-    fn publish_link(&self, progress: &Progress) {
+    fn publish_link(&self, progress: &Progress, downloading: bool) {
         let mut link = match self.slot.try_lock() {
             Ok(slot) => slot.as_ref().map(|s| s.link_stats()),
             Err(_) => None,
@@ -148,6 +170,10 @@ impl RemoteBackend {
         .unwrap_or_else(|| LinkStats { peer: self.connector.spec().host_port(), ..LinkStats::default() });
         link.sent_bytes = self.sent.load(Ordering::Relaxed);
         link.acked_bytes = self.acked.load(Ordering::Relaxed);
+        if downloading {
+            link.received_bytes = Some(link.acked_bytes);
+            link.acked_bytes = 0;
+        }
         link.reconnects = self.reconnects();
         progress.set_link(link);
     }
@@ -250,7 +276,7 @@ impl RemoteBackend {
                 report.failed.push((item.clone(), e));
             }
         }
-        self.publish_link(ctx.progress);
+        self.publish_link(ctx.progress, false);
         true
     }
 
@@ -308,6 +334,450 @@ impl RemoteBackend {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Download (pull)
+// ---------------------------------------------------------------------------
+
+/// Deepest folder nesting a download follows. Symlinks inside a share can form
+/// loops, and the server is not trusted to be finite.
+const MAX_PULL_DEPTH: usize = 64;
+
+#[derive(Debug, Clone, Copy)]
+pub struct PullOptions {
+    pub algo: HashAlgo,
+    /// Replace files that already exist locally.
+    pub overwrite: bool,
+    /// Copy modification times and (on Unix) permissions from the server.
+    pub preserve: bool,
+}
+
+impl Default for PullOptions {
+    fn default() -> Self {
+        Self { algo: HashAlgo::Xxh3, overwrite: false, preserve: true }
+    }
+}
+
+/// What a download reports as it goes. Called from the transfer thread.
+pub trait PullProgress: Send + Sync {
+    /// A file is about to be received.
+    fn begin(&self, _remote: &str, _size: u64) {}
+    /// `bytes` more bytes of the current file are on disk.
+    fn advance(&self, _bytes: u64) {}
+    /// The file finished (`Ok(size)`) or failed.
+    fn finish(&self, _remote: &str, _result: Result<u64, &ClientError>) {}
+}
+
+impl PullProgress for () {}
+
+#[derive(Debug, Default)]
+pub struct PullReport {
+    pub files: u64,
+    pub dirs: u64,
+    pub bytes: u64,
+    /// Skipped by the user (remote path, reason).
+    pub skipped: Vec<String>,
+    /// `(remote path, reason)`.
+    pub failed: Vec<(String, String)>,
+    pub cancelled: bool,
+    pub elapsed: Duration,
+}
+
+struct PullCtx<'a> {
+    opts: &'a PullOptions,
+    control: &'a JobControl,
+    limiter: Option<&'a RateLimiter>,
+    progress: &'a dyn PullProgress,
+}
+
+/// A name from the server becomes a name on our disk, so it must be one
+/// ordinary component that this OS accepts as is.
+fn safe_local_name(name: &str) -> bool {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
+        return false;
+    }
+    if cfg!(windows) && (name.contains(':') || fc_engine::platform::names::sanitize_for_windows(name) != name) {
+        return false;
+    }
+    true
+}
+
+/// A remote source and a local destination, scheduled by the ordinary queue.
+pub struct PullBackend {
+    remote: Arc<RemoteBackend>,
+    destination: PathBuf,
+}
+
+impl PullBackend {
+    pub fn new(remote: Arc<RemoteBackend>, destination: PathBuf) -> Self {
+        Self { remote, destination }
+    }
+
+    async fn plan_remote(&self, sources: &[PathBuf], control: &JobControl) -> Result<Plan, ClientError> {
+        let invalid = |message: &str| ClientError::Protocol(message.into());
+        if sources.is_empty() || self.destination.as_os_str().is_empty() {
+            return Err(invalid("downloads need sources and a local destination folder"));
+        }
+        let mut plan = Plan { dest_root: self.destination.clone(), ..Default::default() };
+        let mut stack = Vec::new();
+        let mut targets = std::collections::HashSet::new();
+        for source in sources.iter().rev() {
+            let path = source.to_str().ok_or_else(|| invalid("remote paths must be UTF-8"))?;
+            let spec = crate::client::RemoteSpec::parse(&format!("host:/{path}"))
+                .map_err(|e| invalid(&e.to_string()))?;
+            let name = spec.path.rsplit('/').next().expect("nonempty path");
+            if !safe_local_name(name) {
+                return Err(invalid("unsafe remote source name"));
+            }
+            stack.push((spec.path.clone(), self.destination.join(name), 0));
+        }
+        while let Some((source, dest, depth)) = stack.pop() {
+            control.checkpoint().map_err(|_| ClientError::Cancelled)?;
+            // Reject ambiguous mappings rather than overwrite two remote entries
+            // with the same local filename on case-insensitive filesystems.
+            let key = dest.to_string_lossy().to_string();
+            let key = if cfg!(any(windows, target_os = "macos")) { key.to_lowercase() } else { key };
+            if !targets.insert(key) {
+                return Err(invalid("remote sources map to duplicate local paths"));
+            }
+            validate_download_path(&dest)?;
+            let session = self.remote.session(control).await?;
+            match session.file_size(&source).await {
+                Ok(size) => {
+                    plan.stats.files += 1;
+                    plan.stats.bytes = plan.stats.bytes.checked_add(size).ok_or_else(|| invalid("download is too large"))?;
+                    plan.items.push(CopyItem { src: source.into(), dst: dest, size });
+                }
+                Err(ClientError::Rejected { reason: RejectReason::IsDirectory, .. }) => {
+                    if depth >= MAX_PULL_DEPTH {
+                        return Err(invalid("remote folders nested too deeply"));
+                    }
+                    let entries = self.remote.list_retrying(control, &source).await?;
+                    plan.stats.dirs += 1;
+                    plan.dirs.push(dest.clone());
+                    for entry in entries.into_iter().rev() {
+                        if !safe_local_name(&entry.name) {
+                            return Err(invalid("unsafe filename sent by the server"));
+                        }
+                        stack.push((format!("{source}/{}", entry.name), dest.join(entry.name), depth + 1));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(plan)
+    }
+
+    async fn receive_plan(&self, plan: &Plan, ctx: &BackendContext<'_>, on_file: &mut dyn FnMut(FileEvent<'_>)) -> Result<BatchReport, CopyError> {
+        let started = Instant::now();
+        let mut report = BatchReport::default();
+        ctx.progress.set_job_totals(plan.stats.files, plan.stats.bytes, false);
+        for dir in &plan.dirs {
+            ctx.control.checkpoint().map_err(|_| CopyError::Cancelled)?;
+            validate_download_path(dir).map_err(|e| to_copy_error(e, dir))?;
+            tokio::fs::create_dir_all(dir).await
+                .map_err(|e| CopyError::Backend(format!("{}: {e}", dir.display())))?;
+        }
+        for item in &plan.items {
+            if ctx.control.is_cancelled() {
+                report.cancelled = true;
+                break;
+            }
+            ctx.progress.begin_file(&item.src, item.size, false);
+            ctx.progress.set_phase(fc_engine::Phase::Copying);
+            let progress = QueuedPullProgress { progress: ctx.progress, remote: &self.remote };
+            let opts = PullOptions {
+                algo: wire_algo(ctx.options.algorithm),
+                overwrite: ctx.options.overwrite,
+                preserve: ctx.options.preserve_mtime || ctx.options.preserve_permissions,
+            };
+            let pull_ctx = PullCtx { opts: &opts, control: ctx.control, limiter: ctx.options.rate_limit.as_deref(), progress: &progress };
+            let file_started = Instant::now();
+            let paths = [
+                item.dst.clone(),
+                crate::server::sidecar(&item.dst, crate::server::TEMP_SUFFIX),
+                crate::server::sidecar(&item.dst, crate::server::ID_SUFFIX),
+            ];
+            let result = match paths.iter().try_for_each(|path| validate_download_path(path)) {
+                Ok(()) => self.remote.pull_file_retrying(&pull_ctx, &item.src.to_string_lossy(), &item.dst).await,
+                Err(e) => Err(e),
+            };
+            match result {
+                Ok(out) => {
+                    let rep = CopyReport {
+                        src: item.src.clone(), dst: item.dst.clone(), bytes: out.size,
+                        source_digest: Some(out.digest), verified: true, retries: 0,
+                        elapsed: file_started.elapsed(), warnings: vec![],
+                    };
+                    ctx.progress.finish_file();
+                    report.bytes_copied += rep.bytes;
+                    on_file(FileEvent::Copied(&rep));
+                    report.copied.push(rep);
+                }
+                Err(ClientError::Cancelled) => { report.cancelled = true; break; }
+                Err(ClientError::Skipped) => {
+                    ctx.progress.skip_file(item.size);
+                    on_file(FileEvent::Skipped(item, &CopyError::SkippedByUser));
+                    report.skipped.push((item.clone(), CopyError::SkippedByUser));
+                }
+                Err(e) => {
+                    let e = to_copy_error(e, &item.dst);
+                    ctx.progress.skip_file(item.size);
+                    on_file(FileEvent::Failed(item, &e));
+                    report.failed.push((item.clone(), e));
+                }
+            }
+        }
+        report.elapsed = started.elapsed();
+        Ok(report)
+    }
+}
+
+// Do not descend through an existing link/junction in a download tree.
+fn validate_download_path(path: &Path) -> Result<(), ClientError> {
+    for ancestor in path.ancestors().filter(|p| !p.as_os_str().is_empty()) {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(meta) => {
+                #[cfg(windows)]
+                let link = {
+                    use std::os::windows::fs::MetadataExt;
+                    meta.file_attributes() & 0x400 != 0
+                };
+                #[cfg(not(windows))]
+                let link = meta.file_type().is_symlink();
+                if link {
+                    return Err(ClientError::Local { path: ancestor.into(), source: std::io::Error::other("download paths cannot traverse links or junctions") });
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(ClientError::Local { path: ancestor.into(), source }),
+        }
+    }
+    Ok(())
+}
+
+struct QueuedPullProgress<'a> {
+    progress: &'a Progress,
+    remote: &'a RemoteBackend,
+}
+
+impl PullProgress for QueuedPullProgress<'_> {
+    fn advance(&self, bytes: u64) {
+        self.progress.add_copied(bytes);
+        self.remote.acked.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+impl TransferBackend for PullBackend {
+    fn describe(&self) -> String {
+        format!("{} (from {})", self.destination.display(), self.remote.connector.spec().host_port())
+    }
+
+    fn plan(&self, sources: &[PathBuf], _options: &PlanOptions, control: &JobControl) -> Result<Plan, CopyError> {
+        self.remote.runtime.as_ref().expect("runtime lives until drop").block_on(async {
+            let cancel = async {
+                loop {
+                    if control.is_cancelled() { break; }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            };
+            tokio::select! {
+                result = self.plan_remote(sources, control) => result.map_err(|e| to_copy_error(e, &self.destination)),
+                () = cancel => Err(CopyError::Cancelled),
+            }
+        })
+    }
+
+    fn run(&self, plan: &Plan, ctx: &BackendContext<'_>, on_file: &mut dyn FnMut(FileEvent<'_>)) -> Result<BatchReport, CopyError> {
+        self.remote.sent.store(0, Ordering::Relaxed);
+        self.remote.acked.store(0, Ordering::Relaxed);
+        self.remote.runtime.as_ref().expect("runtime lives until drop").block_on(async {
+            let telemetry = async {
+                loop {
+                    self.remote.publish_link(ctx.progress, true);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            };
+            tokio::select! {
+                result = self.receive_plan(plan, ctx, on_file) => {
+                    self.remote.publish_link(ctx.progress, true);
+                    result
+                },
+                () = telemetry => unreachable!(),
+            }
+        })
+    }
+}
+
+impl RemoteBackend {
+    /// Download `remote` (`share/path`, a file or a folder) into `dest`.
+    ///
+    /// A file goes to `dest` itself, or into it when `dest` is an existing
+    /// folder or ends with a path separator. A folder is copied *into* `dest`
+    /// under its own name, like a local folder copy. Failures of single files are
+    /// collected in the report; only problems that stop everything (login,
+    /// an unreachable server, a bad top-level path) are returned as errors.
+    pub fn pull(
+        &self,
+        remote: &str,
+        dest: &Path,
+        opts: &PullOptions,
+        control: &JobControl,
+        limiter: Option<&RateLimiter>,
+        progress: &dyn PullProgress,
+    ) -> Result<PullReport, ClientError> {
+        let started = Instant::now();
+        let ctx = PullCtx { opts, control, limiter, progress };
+        let mut report = PullReport::default();
+        let runtime = self.runtime.as_ref().expect("runtime lives until drop");
+        match runtime.block_on(self.pull_tree(&ctx, remote.trim_matches('/'), dest, &mut report)) {
+            Ok(()) => {}
+            Err(ClientError::Cancelled) => report.cancelled = true,
+            Err(e) => return Err(e),
+        }
+        report.elapsed = started.elapsed();
+        Ok(report)
+    }
+
+    async fn pull_tree(&self, ctx: &PullCtx<'_>, remote: &str, dest: &Path, report: &mut PullReport) -> Result<(), ClientError> {
+        let name = remote.rsplit('/').next().unwrap_or(remote);
+        let into_dir = dest.is_dir() || dest.as_os_str().to_string_lossy().ends_with(['/', std::path::MAIN_SEPARATOR]);
+        let file_dest = if into_dir { dest.join(name) } else { dest.to_path_buf() };
+
+        // Most targets are files, and asking is how we learn it is a folder.
+        match self.pull_file_retrying(ctx, remote, &file_dest).await {
+            Ok(out) => {
+                report.files += 1;
+                report.bytes += out.size;
+                return Ok(());
+            }
+            Err(ClientError::Rejected { reason: RejectReason::IsDirectory, .. }) => {}
+            Err(e) => return Err(e),
+        }
+
+        let mut stack = vec![(remote.to_string(), dest.join(name), 0usize)];
+        let mut first = true;
+        while let Some((rdir, ldir, depth)) = stack.pop() {
+            if ctx.control.is_cancelled() {
+                report.cancelled = true;
+                return Ok(());
+            }
+            if let Err(e) = tokio::fs::create_dir_all(&ldir).await {
+                report.failed.push((rdir, format!("{}: {e}", ldir.display())));
+                continue;
+            }
+            report.dirs += 1;
+            let entries = match self.list_retrying(ctx.control, &rdir).await {
+                Ok(e) => e,
+                Err(e) if first => return Err(e),
+                Err(ClientError::Cancelled) => {
+                    report.cancelled = true;
+                    return Ok(());
+                }
+                Err(e) => {
+                    report.failed.push((rdir, e.to_string()));
+                    continue;
+                }
+            };
+            first = false;
+            for entry in entries {
+                let rpath = format!("{rdir}/{}", entry.name);
+                if !safe_local_name(&entry.name) {
+                    report.failed.push((rpath, "unsafe file name sent by the server".into()));
+                    continue;
+                }
+                match entry.kind {
+                    EntryKind::Dir if depth >= MAX_PULL_DEPTH => report.failed.push((rpath, "folders nested too deeply".into())),
+                    EntryKind::Dir => stack.push((rpath, ldir.join(&entry.name), depth + 1)),
+                    EntryKind::File => match self.pull_file_retrying(ctx, &rpath, &ldir.join(&entry.name)).await {
+                        Ok(out) => {
+                            report.files += 1;
+                            report.bytes += out.size;
+                        }
+                        Err(ClientError::Cancelled) => {
+                            report.cancelled = true;
+                            return Ok(());
+                        }
+                        Err(ClientError::Skipped) => report.skipped.push(rpath),
+                        Err(e) => report.failed.push((rpath, e.to_string())),
+                    },
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn list_retrying(&self, control: &JobControl, remote: &str) -> Result<Vec<DirEntry>, ClientError> {
+        let mut attempts = 0;
+        loop {
+            let s = self.session(control).await?;
+            match s.list_dir(remote).await {
+                Ok(v) => return Ok(v),
+                Err(e) if e.is_retryable() && attempts < MAX_FILE_ATTEMPTS => {
+                    attempts += 1;
+                    self.drop_session(&s).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Download one file. Retries after a dropped connection resume from the bytes on disk.
+    async fn pull_file_retrying(&self, ctx: &PullCtx<'_>, remote: &str, local: &Path) -> Result<PullOutcome, ClientError> {
+        let tally = PullTally { progress: ctx.progress, remote, started: AtomicBool::new(false), high_water: AtomicU64::new(0) };
+        let mut attempts = 0;
+        let mut mismatch_retried = false;
+        let result = loop {
+            let s = match self.session(ctx.control).await {
+                Ok(s) => s,
+                Err(e) => break Err(e),
+            };
+            let req = PullRequest { remote, local, algo: ctx.opts.algo, overwrite: ctx.opts.overwrite, preserve: ctx.opts.preserve };
+            let ctl = PushControl { control: ctx.control, limiter: ctx.limiter };
+            match s.pull_file(&req, &ctl, &tally).await {
+                Ok(out) => break Ok(out),
+                Err(e) if e.is_retryable() && attempts < MAX_FILE_ATTEMPTS => {
+                    attempts += 1;
+                    self.drop_session(&s).await;
+                }
+                // The partial file is deleted on a mismatch, so one more try starts clean.
+                Err(ClientError::PullMismatch { .. }) if !mismatch_retried => {
+                    mismatch_retried = true;
+                }
+                Err(e) => break Err(e),
+            }
+        };
+        // "Is a directory" is how a folder target is discovered, not a failure.
+        if !matches!(result, Err(ClientError::Rejected { reason: RejectReason::IsDirectory, .. })) {
+            ctx.progress.finish(remote, result.as_ref().map(|o| o.size));
+        }
+        result
+    }
+}
+
+/// Turns absolute offsets (which restart at the resume point after a
+/// reconnect) into byte deltas for [`PullProgress`].
+struct PullTally<'a> {
+    progress: &'a dyn PullProgress,
+    remote: &'a str,
+    started: AtomicBool,
+    high_water: AtomicU64,
+}
+
+impl PullObserver for PullTally<'_> {
+    fn meta(&self, size: u64) {
+        if !self.started.swap(true, Ordering::Relaxed) {
+            self.progress.begin(self.remote, size);
+        }
+    }
+
+    fn received(&self, offset: u64) {
+        let prev = self.high_water.fetch_max(offset, Ordering::Relaxed);
+        if offset > prev {
+            self.progress.advance(offset - prev);
+        }
+    }
+}
+
 impl TransferBackend for RemoteBackend {
     fn describe(&self) -> String {
         self.connector.spec().to_string()
@@ -317,7 +787,7 @@ impl TransferBackend for RemoteBackend {
         ctx.progress.set_job_totals(plan.stats.files, plan.stats.bytes, false);
         self.sent.store(0, Ordering::Relaxed);
         self.acked.store(0, Ordering::Relaxed);
-        self.publish_link(ctx.progress);
+        self.publish_link(ctx.progress, false);
         let started = Instant::now();
         let runtime = self.runtime.as_ref().expect("runtime lives until drop");
         let result = runtime.block_on(self.run_plan(plan, ctx, on_file));
@@ -399,6 +869,26 @@ impl Drop for RemoteBackend {
     fn drop(&mut self) {
         if let Some(rt) = self.runtime.take() {
             rt.shutdown_background();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_supplied_names_cannot_leave_the_download_folder() {
+        for evil in ["", ".", "..", "a/b", "../x", "a\\b", "x\0y", "/etc"] {
+            assert!(!safe_local_name(evil), "{evil:?}");
+        }
+        for fine in ["a.txt", "photo 1.jpg", "a..b", ".hidden", "ünïcode.txt"] {
+            assert!(safe_local_name(fine), "{fine:?}");
+        }
+        if cfg!(windows) {
+            for evil in ["C:", "a:b", "CON", "name."] {
+                assert!(!safe_local_name(evil), "{evil:?}");
+            }
         }
     }
 }

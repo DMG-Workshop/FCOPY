@@ -32,6 +32,7 @@ mod integration;
 mod remote;
 mod state;
 mod torrent;
+mod vpn;
 
 use fc_engine::units::parse_size;
 use std::path::PathBuf;

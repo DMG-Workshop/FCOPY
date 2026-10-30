@@ -60,16 +60,24 @@ pub struct BackendContext<'a> {
     pub options: &'a CopyOptions,
 }
 
-/// A destination other than the local filesystem (e.g. a remote agent).
+/// A transfer involving a backend (e.g. a remote agent in either direction).
 ///
-/// The queue plans the sources as usual, with destination paths *relative*
-/// (`photos/2026/a.jpg`), and hands the plan to the backend. The backend reports
+/// By default the queue plans local sources with destination paths *relative*
+/// (`photos/2026/a.jpg`). Download backends override `plan` to enumerate remote
+/// sources and choose local destinations. The backend reports
 /// per-file results through `on_file` and progress/link telemetry through
 /// `ctx.progress`, and must honour `ctx.control` (pause, cancel, skip), so remote
 /// jobs look exactly like local ones to every front end.
 pub trait TransferBackend: Send + Sync {
     /// Human-readable destination, e.g. `alice@nas:/backup/photos`.
     fn describe(&self) -> String;
+
+    /// Plan on the queue worker. Remote sources can override this without
+    /// introducing networking or an async runtime into the engine.
+    fn plan(&self, sources: &[PathBuf], options: &PlanOptions, _control: &JobControl) -> Result<Plan, CopyError> {
+        plan_copy_with(sources, std::path::Path::new(""), options)
+            .map_err(|e| CopyError::Backend(e.to_string()))
+    }
 
     fn run(&self, plan: &Plan, ctx: &BackendContext<'_>, on_file: &mut dyn FnMut(FileEvent<'_>)) -> Result<BatchReport, CopyError>;
 }
@@ -712,17 +720,15 @@ fn run_job(
     control: &JobControl,
 ) -> (JobState, JobSummary) {
     let plan = match &request.target {
-        Target::IntoDir(dir) => plan_copy_with(&request.sources, dir, plan_opts),
-        Target::FileTo(dst) if request.sources.len() == 1 => plan_file_to(&request.sources[0], dst),
-        Target::FileTo(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "a file target needs exactly one source; use a directory target",
-        )),
+        Target::IntoDir(dir) => plan_copy_with(&request.sources, dir, plan_opts).map_err(|e| CopyError::Backend(e.to_string())),
+        Target::FileTo(dst) if request.sources.len() == 1 => plan_file_to(&request.sources[0], dst).map_err(|e| CopyError::Backend(e.to_string())),
+        Target::FileTo(_) => Err(CopyError::Backend("a file target needs exactly one source; use a directory target".into())),
         // Relative destinations: the backend decides where they land.
-        Target::Backend(_) => plan_copy_with(&request.sources, std::path::Path::new(""), plan_opts),
+        Target::Backend(backend) => backend.plan(&request.sources, plan_opts, control),
     };
     let plan = match plan {
         Ok(p) => p,
+        Err(_) if control.is_cancelled() => return (JobState::Cancelled, JobSummary::default()),
         Err(e) => return (JobState::Failed(e.to_string()), JobSummary::default()),
     };
 
@@ -776,6 +782,7 @@ fn run_job(
     inner.update(id, |j| j.telemetry = Some(progress.snapshot()));
 
     match result {
+        Err(CopyError::Cancelled) => (JobState::Cancelled, JobSummary::default()),
         Err(e) => (JobState::Failed(e.to_string()), JobSummary::default()),
         Ok(r) => {
             let summary = JobSummary {

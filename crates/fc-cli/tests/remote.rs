@@ -110,3 +110,68 @@ fn copy_to_a_pc_trusts_it_once_and_refuses_a_wrong_fingerprint() {
     assert_eq!(std::fs::read(a.share.path().join("cli/note.txt")).unwrap(), b"second copy");
     a.handle.shutdown();
 }
+
+fn copy_from(agent: &Agent, config_dir: &std::path::Path, remote_path: &str, dest: &std::path::Path, extra: &[&str]) -> std::process::Output {
+    let source = format!("alice@127.0.0.1:{}:{remote_path}", agent.port);
+    let pw = config_dir.join("pw");
+    std::fs::write(&pw, "agent-pass-1\n").unwrap();
+    Command::new(BIN)
+        .arg("copy")
+        .arg(&source)
+        .arg(dest)
+        .arg("--password-file")
+        .arg(&pw)
+        .args(extra)
+        .env("FCOPY_CONFIG_DIR", config_dir)
+        .env_remove("FCOPY_PASSWORD")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn copy_from_a_pc_downloads_a_folder_and_a_file() {
+    let a = agent();
+    let config = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(a.share.path().join("photos/2026")).unwrap();
+    std::fs::write(a.share.path().join("photos/a.jpg"), b"jpeg-a").unwrap();
+    std::fs::write(a.share.path().join("photos/2026/b.jpg"), vec![7u8; 300_000]).unwrap();
+    std::fs::write(a.share.path().join("notes.txt"), b"notes").unwrap();
+    let fp = ["--accept-fingerprint", a.fingerprint.as_str()];
+
+    let out = tempfile::tempdir().unwrap();
+    let r = copy_from(&a, config.path(), "/backup/photos", out.path(), &fp);
+    assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+    assert_eq!(std::fs::read(out.path().join("photos/a.jpg")).unwrap(), b"jpeg-a");
+    assert_eq!(std::fs::read(out.path().join("photos/2026/b.jpg")).unwrap(), vec![7u8; 300_000]);
+    assert!(String::from_utf8_lossy(&r.stderr).contains("downloaded 2 file(s)"), "{}", String::from_utf8_lossy(&r.stderr));
+
+    // A single file to an exact new name; trust saved by the first run is reused.
+    let renamed = out.path().join("renamed.txt");
+    let r = copy_from(&a, config.path(), "/backup/notes.txt", &renamed, &[]);
+    assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+    assert_eq!(std::fs::read(&renamed).unwrap(), b"notes");
+
+    // Existing files are kept without --overwrite, and that is a failure exit.
+    let r = copy_from(&a, config.path(), "/backup/notes.txt", &renamed, &[]);
+    assert_eq!(r.status.code(), Some(1), "{}", String::from_utf8_lossy(&r.stderr));
+    assert!(String::from_utf8_lossy(&r.stderr).contains("destination exists"));
+    a.handle.shutdown();
+}
+
+#[test]
+fn mixed_and_remote_to_remote_copies_are_refused() {
+    let dst = tempfile::tempdir().unwrap();
+    let local = dst.path().join("x.txt");
+    std::fs::write(&local, b"x").unwrap();
+    let run = |args: &[&std::ffi::OsStr]| {
+        Command::new(BIN).arg("copy").args(args).env_remove("FCOPY_PASSWORD").stdin(Stdio::null()).output().unwrap()
+    };
+    let remote = std::ffi::OsStr::new("alice@127.0.0.1:47800:/backup/a");
+    let mixed = run(&[remote, local.as_os_str(), dst.path().as_os_str()]);
+    assert_eq!(mixed.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&mixed.stderr).contains("mix"));
+    let both = run(&[remote, std::ffi::OsStr::new("bob@127.0.0.1:47801:/backup/b")]);
+    assert_eq!(both.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&both.stderr).contains("not supported"));
+}

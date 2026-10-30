@@ -40,6 +40,8 @@ impl Phase {
 /// Network link telemetry, filled in by remote transfer backends.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LinkStats {
+    /// Download progress, including bytes resumed locally. None for uploads.
+    pub received_bytes: Option<u64>,
     /// `user@host:port` or similar.
     pub peer: String,
     pub connected: bool,

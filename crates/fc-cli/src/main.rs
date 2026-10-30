@@ -14,6 +14,8 @@
 //! fcopy copy big.iso /nas/iso/big-copy.iso --limit 20MB  # rename + 20 MB/s cap
 //! fcopy copy photos/ /mnt/nas --on-error skip --manifest photos.sha256 --algo sha256
 //! fcopy check photos.sha256 --algo sha256                # re-verify later
+//! fcopy copy photos/ alice@nas:/backup/photos            # upload to a PC running fcopy-agent
+//! fcopy copy alice@nas:/backup/photos ~/restore          # download (resumes after a dropout)
 //! ```
 //!
 //! Exit codes: 0 everything copied · 1 some files skipped/failed or mismatched ·
@@ -70,10 +72,12 @@ struct CopyArgs {
     /// Sources followed by the destination. With one source file and a
     /// destination that is not an existing folder, the file is copied *to*
     /// that path; otherwise everything is copied *into* the destination folder.
+    /// Either end may be a PC running fcopy-agent (`user@host:/share/path`): a
+    /// remote destination uploads, remote sources download into a local folder.
     #[arg(required = true, num_args = 2.., value_name = "PATH")]
     paths: Vec<PathBuf>,
 
-    /// Password for a remote destination. Visible in process listings: prefer FCOPY_PASSWORD or the prompt.
+    /// Password for a remote PC. Visible in process listings: prefer FCOPY_PASSWORD or the prompt.
     #[arg(long, value_name = "PASSWORD")]
     password: Option<String>,
 
@@ -206,6 +210,14 @@ fn build_request(paths: &[PathBuf]) -> TransferRequest {
 }
 
 fn copy(args: CopyArgs) -> ExitCode {
+    match remote_sources(&args) {
+        Ok(Some(specs)) => return pull(&args, specs),
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    }
     let interactive = io::stdin().is_terminal();
     let remote = match remote_destination(&args) {
         Ok(r) => r,
@@ -521,13 +533,20 @@ fn check(algo: Algorithm, manifest: &Path) -> ExitCode {
 /// The remote backend for `copy`, if the destination is `user@host:/share/dir`.
 /// Returns `Ok(None)` for a local copy.
 fn remote_destination(args: &CopyArgs) -> Result<Option<Arc<dyn TransferBackend>>, String> {
-    use fc_remote::backend::RemoteBackend;
-    use fc_remote::client::{Connector, RemoteSpec};
-    use fc_remote::config::{KnownHosts, default_client_dir};
+    use fc_remote::client::RemoteSpec;
 
     let dest = args.paths.last().expect("clap enforces >= 2 paths").to_string_lossy().to_string();
     // A local path is never a valid `host:/share` target, so a parse failure means local.
     let Ok(spec) = RemoteSpec::parse(&dest) else { return Ok(None) };
+    Ok(Some(Arc::new(connect_backend(args, spec)?)))
+}
+
+/// A connection to the agent named by `spec`: pinned from known_hosts, or
+/// trusted on first use after confirmation.
+fn connect_backend(args: &CopyArgs, spec: fc_remote::client::RemoteSpec) -> Result<fc_remote::backend::RemoteBackend, String> {
+    use fc_remote::backend::RemoteBackend;
+    use fc_remote::client::Connector;
+    use fc_remote::config::{KnownHosts, default_client_dir};
 
     let known_path = default_client_dir().join("known_hosts");
     let known = KnownHosts::load(&known_path);
@@ -564,7 +583,193 @@ fn remote_destination(args: &CopyArgs) -> Result<Option<Arc<dyn TransferBackend>
         }));
     }
     let backend = RemoteBackend::new(connector).map_err(|e| format!("cannot start the remote transfer engine: {e}"))?;
-    Ok(Some(Arc::new(backend)))
+    Ok(backend)
+}
+
+/// Remote sources (`user@host:/share/path`) mean a download. Returns `Ok(None)`
+/// when every source is local. A download needs a local destination and all
+/// sources on one PC and account.
+fn remote_sources(args: &CopyArgs) -> Result<Option<Vec<fc_remote::client::RemoteSpec>>, String> {
+    use fc_remote::client::RemoteSpec;
+
+    let (dest, sources) = args.paths.split_last().expect("clap enforces >= 2 paths");
+    let parsed: Vec<Option<RemoteSpec>> = sources.iter().map(|s| RemoteSpec::parse(&s.to_string_lossy()).ok()).collect();
+    if parsed.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    if RemoteSpec::parse(&dest.to_string_lossy()).is_ok() {
+        return Err("copying from one remote PC to another is not supported".into());
+    }
+    if parsed.iter().any(Option::is_none) {
+        return Err("cannot mix remote and local sources in one copy".into());
+    }
+    let specs: Vec<RemoteSpec> = parsed.into_iter().flatten().collect();
+    if specs.iter().any(|s| s.host_port() != specs[0].host_port() || s.user != specs[0].user) {
+        return Err("all remote sources must be on the same PC and account".into());
+    }
+    Ok(Some(specs))
+}
+
+/// `fcopy copy user@host:/share/path… DEST`: download into a local folder.
+fn pull(args: &CopyArgs, specs: Vec<fc_remote::client::RemoteSpec>) -> ExitCode {
+    use fc_remote::backend::PullOptions;
+    use fc_remote::protocol::HashAlgo;
+
+    if args.manifest.is_some() {
+        eprintln!("error: --manifest is not supported for downloads yet");
+        return ExitCode::from(2);
+    }
+    let dest = args.paths.last().expect("clap enforces >= 2 paths").clone();
+    if specs.len() > 1 {
+        if let Err(e) = std::fs::create_dir_all(&dest) {
+            eprintln!("error: cannot create {}: {e}", dest.display());
+            return ExitCode::from(2);
+        }
+    }
+    let backend = match connect_backend(args, specs[0].clone()) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let control = Arc::new(JobControl::new());
+    let presses = Arc::new(AtomicUsize::new(0));
+    {
+        let (control, presses) = (control.clone(), presses.clone());
+        let _ = ctrlc::set_handler(move || {
+            if presses.fetch_add(1, Ordering::SeqCst) == 0 {
+                eprintln!("\n^C cancelling; partial files are kept for resume (press again to quit immediately)…");
+                control.cancel();
+            } else {
+                std::process::exit(130);
+            }
+        });
+    }
+
+    let limiter = args.limit.map(|l| RateLimiter::new(Some(l)));
+    let opts = PullOptions {
+        algo: match args.algo {
+            Algo::Sha256 => HashAlgo::Sha256,
+            _ => HashAlgo::Xxh3, // MD5 isn't offered remotely
+        },
+        overwrite: args.overwrite,
+        preserve: !args.no_preserve,
+    };
+    let line = PullLine::new(!args.quiet && io::stderr().is_terminal());
+
+    let (mut files, mut bytes, mut skipped, mut failed) = (0u64, 0u64, 0usize, 0usize);
+    let mut cancelled = false;
+    let started = std::time::Instant::now();
+    for spec in &specs {
+        match backend.pull(&spec.path, &dest, &opts, &control, limiter.as_ref(), &line) {
+            Ok(r) => {
+                files += r.files;
+                bytes += r.bytes;
+                skipped += r.skipped.len();
+                failed += r.failed.len();
+                line.clear();
+                for p in &r.skipped {
+                    eprintln!("SKIPPED {p}");
+                }
+                for (p, why) in &r.failed {
+                    eprintln!("FAILED  {p}: {why}");
+                }
+                cancelled |= r.cancelled;
+            }
+            Err(e) => {
+                line.clear();
+                eprintln!("error: {spec}: {e}");
+                failed += 1;
+            }
+        }
+        if cancelled {
+            break;
+        }
+    }
+    line.clear();
+    let elapsed = started.elapsed();
+    eprintln!(
+        "downloaded {files} file(s), {} in {} ({})",
+        human_bytes(bytes),
+        human_duration(elapsed),
+        human_rate(bytes as f64 / elapsed.as_secs_f64().max(0.001))
+    );
+    if skipped + failed > 0 {
+        eprintln!("{skipped} skipped, {failed} failed");
+    }
+    if cancelled {
+        eprintln!("cancelled");
+        return ExitCode::from(130);
+    }
+    if skipped + failed > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+}
+
+/// One rewritable status line for a download.
+struct PullLine {
+    show: bool,
+    state: std::sync::Mutex<PullLineState>,
+}
+
+struct PullLineState {
+    started: std::time::Instant,
+    last_draw: std::time::Instant,
+    total: u64,
+    file_bytes: u64,
+    file_size: u64,
+    name: String,
+    drawn: bool,
+}
+
+impl PullLine {
+    fn new(show: bool) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            show,
+            state: std::sync::Mutex::new(PullLineState { started: now, last_draw: now, total: 0, file_bytes: 0, file_size: 0, name: String::new(), drawn: false }),
+        }
+    }
+
+    fn clear(&self) {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if s.drawn {
+            eprint!("\r\x1b[2K");
+            s.drawn = false;
+        }
+    }
+
+    fn draw(&self, s: &mut PullLineState) {
+        if !self.show {
+            return;
+        }
+        let pct = if s.file_size == 0 { 100.0 } else { s.file_bytes as f64 * 100.0 / s.file_size as f64 };
+        let rate = s.total as f64 / s.started.elapsed().as_secs_f64().max(0.001);
+        let name: String = s.name.chars().rev().take(48).collect::<Vec<_>>().into_iter().rev().collect();
+        eprint!("\r\x1b[2K{pct:>5.1}%  {:>11}  {} total  {name}", human_rate(rate), human_bytes(s.total));
+        let _ = io::stderr().flush();
+        s.drawn = true;
+        s.last_draw = std::time::Instant::now();
+    }
+}
+
+impl fc_remote::backend::PullProgress for PullLine {
+    fn begin(&self, remote: &str, size: u64) {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.name = remote.rsplit('/').next().unwrap_or(remote).to_string();
+        s.file_size = size;
+        s.file_bytes = 0;
+        self.draw(&mut s);
+    }
+
+    fn advance(&self, bytes: u64) {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.total += bytes;
+        s.file_bytes += bytes;
+        if s.last_draw.elapsed() >= Duration::from_millis(100) {
+            self.draw(&mut s);
+        }
+    }
 }
 
 /// The password, from --password, --password-file, FCOPY_PASSWORD, or a prompt.

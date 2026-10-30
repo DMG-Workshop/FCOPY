@@ -310,47 +310,108 @@
   </footer>
 
   <!-- ============ Modals ============ -->
-  <div x-show="modal" x-cloak class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/70 p-4 md:items-center" @keydown.escape.window="closeModal()">
+  <div x-show="modal" x-cloak class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/70 p-4" :class="modal !== 'settings' && 'md:items-center'" @keydown.escape.window="closeModal()">
 
     <!-- Add task -->
     <form x-show="modal === 'add'" class="modal" @submit.prevent="create()" role="dialog" aria-modal="true" aria-label="Add transfer task">
       <header class="modal-head"><h3>Add transfer task</h3><button type="button" class="btn-mini" @click="closeModal()">Close</button></header>
       <div class="grid gap-3 p-4">
-        <label class="grid gap-1"><span class="text-[11px] text-dim">Sources, one absolute path per line</span>
+        <label class="grid gap-1"><span class="text-[11px] text-dim" x-text="addForm.mode === 'download' ? 'Remote sources, one share/path per line (or browse below)' : 'Sources, one absolute path per line'"></span>
           <textarea rows="3" x-model="addForm.sources" required spellcheck="false" class="field font-mono"></textarea></label>
         <label class="grid gap-1"><span class="text-[11px] text-dim" x-text="addForm.mode === 'remote' ? 'Folder on the PC, below its share' : 'Destination folder'"></span>
           <input x-model="addForm.dest" required spellcheck="false" class="field font-mono"
                  :placeholder="addForm.mode === 'remote' ? 'backup/photos' : '/mnt/storage/downloads'"></label>
         <div class="grid grid-cols-2 gap-2">
           <label class="grid gap-1"><span class="text-[11px] text-dim">Mode</span>
-            <select x-model="addForm.mode" class="field font-mono">
+            <select x-model="addForm.mode" @change="changeTransferMode()" class="field font-mono">
               <option value="local">Local filesystem copy</option>
               <option value="remote" x-show="isAdmin()">Remote node (paired PC)</option>
+              <option value="download" x-show="isAdmin()">Download from paired PC</option>
             </select></label>
           <label class="grid gap-1"><span class="text-[11px] text-dim">Label</span>
             <input x-model="addForm.label" class="field"></label>
         </div>
-        <div x-show="addForm.mode === 'remote'" x-cloak class="grid gap-2 border border-line p-3">
+        <div x-show="addForm.mode === 'remote' || addForm.mode === 'download'" x-cloak class="grid gap-2 border border-line p-3">
           <label class="grid gap-1"><span class="text-[11px] text-dim">Paired PC</span>
-            <select x-model="addForm.clientId" class="field font-mono">
+            <select x-model="addForm.clientId" @change="changeRemoteClient()" class="field font-mono">
               <option value="">Choose a PC</option>
               <template x-for="c in clients" :key="c.id">
                 <option :value="c.id" x-text="`${c.name} — ${c.target}`"></option>
               </template>
             </select></label>
           <p x-show="clients.length === 0" class="text-[11px] text-warn">No PCs paired yet. Pair one from the Remote node tab first.</p>
-          <label class="grid gap-1"><span class="text-[11px] text-dim">That PC's password or access key, sent with this job only</span>
+          <label class="grid gap-1"><span class="text-[11px] text-dim">That PC's password or access key (browse and job only; not saved)</span>
             <input type="password" x-model="addForm.password" autocomplete="off" class="field font-mono"></label>
+          <div x-show="addForm.mode === 'download'" class="grid gap-2">
+            <p class="text-[11px] text-dim">Downloads go to this console's machine, not your browser's Downloads folder.</p>
+            <div class="flex flex-wrap items-center gap-2">
+              <button type="button" class="btn-mini" :disabled="remoteBrowser.busy" @click="browseRemote('')">Browse shares</button>
+              <button type="button" class="btn-mini" x-show="remoteBrowser.path" :disabled="remoteBrowser.busy"
+                      @click="browseRemote(remoteBrowser.path.split('/').slice(0, -1).join('/'))">Up</button>
+              <span class="font-mono text-[11px]" x-text="remoteBrowser.busy ? 'Loading...' : (remoteBrowser.path || 'Shares')"></span>
+            </div>
+            <div class="max-h-44 overflow-y-auto">
+              <template x-for="entry in remoteBrowser.entries" :key="entry.name">
+                <div class="flex items-center gap-2 py-1">
+                  <button type="button" class="btn-mini" :disabled="remoteBrowser.busy" @click="addRemoteSource(entry)">Add</button>
+                  <button type="button" class="text-brand font-mono" x-show="entry.kind === 'Dir'" :disabled="remoteBrowser.busy"
+                          @click="browseRemote(remoteEntryPath(entry))" x-text="entry.name + '/'"></button>
+                  <span x-show="entry.kind !== 'Dir'" class="font-mono" x-text="entry.name"></span>
+                </div>
+              </template>
+            </div>
+            <p x-show="remoteBrowser.error" x-text="remoteBrowser.error" role="status" class="text-warn text-[11px]"></p>
+          </div>
         </div>
         <p x-show="addNotice" x-text="addNotice" role="status" class="font-mono text-[11px] text-dim"></p>
       </div>
       <footer class="modal-foot"><button type="button" class="btn-ghost h-8 px-3" @click="closeModal()">Cancel</button><button class="btn-primary h-8 px-4">Queue transfer</button></footer>
     </form>
 
-    <!-- Settings: accounts -->
-    <div x-show="modal === 'settings'" class="modal" role="dialog" aria-modal="true" aria-label="Accounts">
-      <header class="modal-head"><h3>Accounts</h3><button class="btn-mini" @click="closeModal()">Close</button></header>
-      <div class="grid gap-3 p-4">
+    <!-- Settings: accounts and VPN links -->
+    <div x-show="modal === 'settings'" class="modal" role="dialog" aria-modal="true" aria-label="Settings">
+      <header class="modal-head"><h3>Settings</h3><button class="btn-mini" @click="closeModal()">Close</button></header>
+      <div class="flex gap-2 px-4 py-2" role="group" aria-label="Settings sections">
+        <button class="seg" :class="settingsTab === 'accounts' && 'seg-on'" :aria-pressed="settingsTab === 'accounts'" @click="settingsTab = 'accounts'">Accounts</button>
+        <button class="seg" :class="settingsTab === 'vpn' && 'seg-on'" :aria-pressed="settingsTab === 'vpn'" @click="settingsTab = 'vpn'">VPN</button>
+      </div>
+      <div x-show="settingsTab === 'vpn'" class="grid gap-3 p-4">
+        <p class="text-dim">Ten popular VPN services, plus two private networks. Not a ranking or endorsement.</p>
+        <p class="text-[11px] text-dim">Sign in and connect using the provider's app. FCOPY does not store VPN credentials, manage tunnels, or provide a kill switch.</p>
+        <p class="text-[11px] text-warn">Links open on your browser's device. Connect the console host and remote PC to the VPN, not just the browser's machine. This console cannot launch their apps.</p>
+        <p x-show="vpnLoading" role="status">Loading VPN services...</p>
+        <label class="grid gap-1"><span class="text-[11px] text-dim">VPN service</span>
+          <select x-model="vpnProvider" class="field" :disabled="vpnLoading">
+            <template x-for="p in vpnProviders" :key="p.id"><option :value="p.id" x-text="p.name"></option></template>
+          </select>
+        </label>
+        <template x-if="vpnSelected()">
+          <div class="grid gap-3">
+            <div class="flex gap-3">
+              <a class="btn-ghost px-2 py-2" :href="vpnSelected().download" target="_blank" rel="noopener noreferrer">Download / install</a>
+              <a class="btn-ghost px-2 py-2" :href="vpnSelected().guide" target="_blank" rel="noopener noreferrer">Setup / help</a>
+            </div>
+            <template x-if="vpnSelected().mesh">
+              <div class="grid gap-3">
+                <h4>Connect two PCs privately</h4>
+                <p class="text-dim" x-text="vpnSelected().mesh.instructions"></p>
+                <a class="btn-ghost px-2 py-2" :href="vpnSelected().mesh.dashboard" target="_blank" rel="noopener noreferrer">Open network dashboard</a>
+                <p class="text-[11px] text-dim">Run fcopy-agent on the remote PC. Permit UDP 47800 (or your chosen port) in its firewall and the VPN's access rules. Check the agent's allowlist; do not make it public. LAN discovery may not cross the VPN.</p>
+                <label class="grid gap-1"><span class="text-[11px] text-dim">Remote VPN target, user@VPN-host:port:/share</span>
+                  <input x-model="vpnTarget" :placeholder="vpnSelected().mesh.example" class="field font-mono" spellcheck="false">
+                </label>
+                <button class="btn-primary h-8 px-4" @click="pairOverVpn()">Pair PC over VPN</button>
+                <p class="text-[11px] text-dim">Pairing checks the agent fingerprint and login, then saves the PC without its password. Use Add task to upload or download.</p>
+              </div>
+            </template>
+            <p x-show="!vpnSelected().mesh" class="text-[11px] text-dim">A commercial VPN connection alone does not connect your PCs. Select Tailscale or ZeroTier for private PC-to-PC setup.</p>
+          </div>
+        </template>
+        <p class="text-[11px] text-dim">Transfers use the console host's OS routing. A second VPN, split tunneling, or a provider kill switch can block the private network; check both apps' settings.</p>
+        <p x-show="vpnNotice" x-text="vpnNotice" role="status" class="text-warn"></p>
+        <button x-show="vpnNotice" class="btn-ghost h-8 px-3" :disabled="vpnLoading" @click="loadVpnProviders()">Reload VPN services</button>
+      </div>
+      <div x-show="settingsTab === 'accounts'" class="grid gap-3 p-4">
         <div class="border border-line">
           <template x-for="u in users" :key="u.name">
             <div class="flex items-center justify-between border-b border-line/60 px-3 py-2 last:border-b-0">

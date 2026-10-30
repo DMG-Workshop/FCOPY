@@ -51,6 +51,27 @@
 //!   │◀──────────── FileDone{ok, digest, msg} ──│   server re-read the file from disk
 //! ```
 //!
+//! # Download (pull)
+//!
+//! Also one stream per request. The server reads the file and never writes
+//! anything; read-only shares can be pulled from.
+//!
+//! ```text
+//!   │── FileRequest{path, algo} ─────────────▶│
+//!   │◀───────── FileMeta{size, mtime, source_id}│   or FileReject{NotFound | IsDirectory | …}
+//!   │── PullStart{resume_from} ──────────────▶│   from a partial of the same source_id
+//!   │◀─────────────────── DATA(offset, bytes) …│   starts at resume_from
+//!   │◀────────────────── FileEnd{size, digest} ─│   digest of the whole file
+//!   │── FileDone{ok, …} ─────────────────────▶│   after the client fsynced and compared
+//!
+//!   │── ListDir{path} ───────────────────────▶│
+//!   │◀──────── DirListing{entries, more} … ────│   pages of LISTING_PAGE entries
+//! ```
+//!
+//! Entry names in a listing are single path components. The client must still
+//! validate them before touching its disk, because the server is not trusted
+//! to be well-behaved.
+//!
 //! On reconnect the client sends `AuthResume{token}` instead of the SCRAM
 //! exchange and re-offers the interrupted file; the server answers with the
 //! offset it already holds.
@@ -118,7 +139,27 @@ pub enum RejectReason {
     NoSpace,
     /// Server-side I/O error.
     Io,
+    /// Nothing exists at that path (pull and listing only).
+    NotFound,
+    /// The path is a directory but a file was requested (pull only).
+    IsDirectory,
+    /// The path is a file but a directory was requested (listing only).
+    NotDirectory,
 }
+
+/// One entry of a remote directory listing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirEntry {
+    /// A single path component, never a path.
+    pub name: String,
+    pub kind: EntryKind,
+    pub size: u64,
+    pub mtime: (i64, u32),
+    pub mode: u32,
+}
+
+/// Most entries in one `DirListing` frame, which keeps it under [`MAX_FRAME`].
+pub const LISTING_PAGE: usize = 1000;
 
 /// Control and per-file messages (`kind 0x01` frames).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +203,23 @@ pub enum Message {
     Ack { offset: u64 },
     FileEnd { size: u64, digest: Vec<u8> },
     FileDone { ok: bool, digest: Vec<u8>, message: String },
+
+    // ----- download (client → server request on its own stream) -----
+    //
+    // Variants are only ever appended: postcard numbers them by position.
+    /// Ask for a file. Answered by `FileMeta` or `FileReject`.
+    FileRequest { path: String, algo: HashAlgo },
+    /// The file as it is now. `source_id` names this version so the client can
+    /// resume a partial download of it.
+    FileMeta { size: u64, mtime: (i64, u32), mode: u32, source_id: [u8; 16] },
+    /// Begin streaming at `resume_from` (a multiple of 64 KiB, at most `size`).
+    /// The server then sends `Data` from there and `FileEnd` with the digest of
+    /// the *whole* file; the client answers `FileDone`.
+    PullStart { resume_from: u64 },
+    /// List a directory. Answered by one or more `DirListing` or a `FileReject`.
+    ListDir { path: String },
+    /// A page of entries; `more` is false on the last page.
+    DirListing { entries: Vec<DirEntry>, more: bool },
 }
 
 /// One decoded frame. `Data` borrows from the caller's buffer.

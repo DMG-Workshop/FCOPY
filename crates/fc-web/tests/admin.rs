@@ -126,6 +126,28 @@ fn pair_body(e: &Env, expected: Option<&str>, password: &str) -> Value {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn vpn_catalog_is_admin_only_and_has_ten_services_plus_two_private_networks() {
+    let e = env().await;
+    assert_eq!(send(&e, "GET", "/api/settings/vpn", None, None).await.status, StatusCode::UNAUTHORIZED);
+    let bob = login(&e, "bob", "bobs-password").await;
+    assert_eq!(send(&e, "GET", "/api/settings/vpn", Some(&bob), None).await.status, StatusCode::FORBIDDEN);
+    let admin = login(&e, "admin", "admin-password").await;
+    let reply = send(&e, "GET", "/api/settings/vpn", Some(&admin), None).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let providers = reply.json.as_array().unwrap();
+    assert_eq!(providers.iter().filter(|p| p["mesh"].is_null()).count(), 10);
+    assert_eq!(providers.iter().filter(|p| !p["mesh"].is_null()).count(), 2);
+    for p in providers {
+        assert!(p["download"].as_str().unwrap().starts_with("https://"));
+        assert!(p["guide"].as_str().unwrap().starts_with("https://"));
+        assert!(p.get("apps").is_none(), "local executable paths must not be exposed");
+        if !p["mesh"].is_null() {
+            fc_remote::client::RemoteSpec::parse(p["mesh"]["example"].as_str().unwrap()).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn pairing_is_admin_only() {
     let e = env().await;
     let bob = login(&e, "bob", "bobs-password").await;
@@ -328,6 +350,54 @@ async fn paired_client(e: &Env, admin: &str) -> u64 {
     let r = send(e, "POST", "/api/clients", Some(admin), Some(pair_body(e, Some(&e.agent_fp), "agent-pass-1"))).await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.json);
     send(e, "GET", "/api/clients", Some(admin), None).await.json[0]["id"].as_u64().unwrap()
+}
+
+#[tokio::test]
+async fn remote_browser_and_download_use_pairing_permissions_and_local_roots() {
+    let e = env().await;
+    let admin = login(&e, "admin", "admin-password").await;
+    let bob = login(&e, "bob", "bobs-password").await;
+    let id = paired_client(&e, &admin).await;
+    std::fs::create_dir_all(e._share.path().join("tree/empty")).unwrap();
+    std::fs::write(e._share.path().join("tree/file"), b"downloaded").unwrap();
+    let uri = format!("/api/clients/{id}/browse");
+    let browse = json!({ "password": "agent-pass-1", "path": "" });
+    assert_eq!(send(&e, "POST", &uri, Some(&bob), Some(browse.clone())).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(send(&e, "POST", &uri, None, Some(browse.clone())).await.status, StatusCode::UNAUTHORIZED);
+    let shares = send(&e, "POST", &uri, Some(&admin), Some(browse)).await;
+    assert_eq!(shares.status, StatusCode::OK, "{}", shares.json);
+    assert_eq!(shares.json["entries"][0]["name"], "backup");
+    let listing = send(&e, "POST", &uri, Some(&admin), Some(json!({ "password": "agent-pass-1", "path": "backup/tree" }))).await;
+    assert_eq!(listing.status, StatusCode::OK);
+    assert_eq!(listing.json["entries"][0]["kind"], "Dir");
+    assert_eq!(listing.json["entries"][1]["name"], "file");
+    let invalid = send(&e, "POST", &uri, Some(&admin), Some(json!({ "password": "agent-pass-1", "path": "backup/../secret" }))).await;
+    assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+    let wrong = send(&e, "POST", &uri, Some(&admin), Some(json!({ "password": "wrong", "path": "" }))).await;
+    assert_eq!(wrong.status, StatusCode::BAD_GATEWAY);
+
+    let destination = e.root.path().join("restore");
+    let mut body = json!({
+        "sources": ["backup/tree"], "dest": destination,
+        "remote": { "client_id": id, "password": "agent-pass-1", "direction": "download" }
+    });
+    assert_eq!(send(&e, "POST", "/api/transfers", Some(&bob), Some(body.clone())).await.status, StatusCode::FORBIDDEN);
+    let outside = tempfile::tempdir().unwrap();
+    body["dest"] = json!(outside.path());
+    assert_eq!(send(&e, "POST", "/api/transfers", Some(&admin), Some(body.clone())).await.status, StatusCode::BAD_REQUEST);
+    body["dest"] = json!(destination);
+    e.state.queue.pause();
+    let created = send(&e, "POST", "/api/transfers", Some(&admin), Some(body)).await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{}", created.json);
+    assert!(!destination.exists(), "submission must not touch the destination");
+    e.state.queue.resume();
+    let job = wait_for_state(&e, &admin, "completed").await;
+    assert!(job["destination"].as_str().unwrap().contains("restore"));
+    assert_eq!(std::fs::read(destination.join("tree/file")).unwrap(), b"downloaded");
+    assert!(destination.join("tree/empty").is_dir());
+    let visible = send(&e, "GET", "/api/transfers", Some(&bob), None).await;
+    assert_eq!(visible.json, json!([]));
+    e.agent.shutdown();
 }
 
 fn remote_job(e: &Env, client_id: u64, dest: &str, password: &str) -> Value {

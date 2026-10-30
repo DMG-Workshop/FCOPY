@@ -19,7 +19,7 @@ use fc_engine::{
 };
 
 use crate::Startup;
-use crate::remote::{self, PeerSearch, RemoteForm};
+use crate::remote::{self, PeerSearch, RemoteBrowser, RemoteForm};
 use crate::state::{AppState, JobRow, LogKind};
 use crate::torrent::{self, Torrents};
 
@@ -47,6 +47,7 @@ enum View {
     Peers,
     Torrents,
     Logs,
+    Settings,
 }
 
 /// Which jobs the queue table lists.
@@ -115,8 +116,10 @@ pub struct FcApp {
     remember_choice: bool,
     peers: PeerSearch,
     peer_list: Vec<fc_remote::discovery::Peer>,
+    browser: RemoteBrowser,
     torrents: Torrents,
     notice: Option<String>,
+    vpn: crate::vpn::VpnSettings,
 }
 
 impl FcApp {
@@ -165,8 +168,10 @@ impl FcApp {
             remember_choice: false,
             peers: PeerSearch::default(),
             peer_list: Vec::new(),
+            browser: RemoteBrowser::default(),
             torrents: Torrents::start(startup.torrent_dht, startup.torrent_trackers),
             notice: None,
+            vpn: crate::vpn::VpnSettings::default(),
         };
         app.state.speed_limit = startup.limit;
         if !app.form.sources.is_empty() && !app.form.dest.is_empty() {
@@ -207,10 +212,14 @@ impl FcApp {
                 self.form.remote.folder.trim().trim_matches('/')
             );
             self.form.remote.password.clear();
-            (
-                TransferRequest::to_backend(sources.clone(), backend),
-                target,
-            )
+            if self.form.remote.download {
+                let dest = PathBuf::from(self.form.dest.trim());
+                let target = format!("{} (from {})", dest.display(), self.form.remote.address);
+                let backend = Arc::new(fc_remote::backend::PullBackend::new(backend, dest));
+                (TransferRequest::to_backend(sources.clone(), backend), target)
+            } else {
+                (TransferRequest::to_backend(sources.clone(), backend), target)
+            }
         } else {
             let dest = PathBuf::from(self.form.dest.trim());
             let request = if sources.len() == 1 && sources[0].is_file() && !dest.is_dir() {
@@ -269,7 +278,9 @@ impl FcApp {
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.weak("Tokio async engine");
+                if ui.selectable_label(self.view == View::Settings, "Settings").clicked() {
+                    self.view = View::Settings;
+                }
             });
         });
     }
@@ -493,12 +504,15 @@ impl FcApp {
                 ));
             });
             if let Some(link) = &t.link {
+                let bytes = match link.received_bytes {
+                    Some(n) => format!("received {}", human_bytes(n)),
+                    None => format!("sent {} · acknowledged {}", human_bytes(link.sent_bytes), human_bytes(link.acked_bytes)),
+                };
                 ui.weak(format!(
-                    "Link to {}: round trip {} ms · sent {} · acknowledged {} · {} reconnects{}",
+                    "Link to {}: round trip {} ms · {} · {} reconnects{}",
                     link.peer,
                     link.rtt.as_millis(),
-                    human_bytes(link.sent_bytes),
-                    human_bytes(link.acked_bytes),
+                    bytes,
                     link.reconnects,
                     if link.remote_paused {
                         " · PC paused"
@@ -713,6 +727,9 @@ impl FcApp {
                         });
                         ui.weak(format!("fingerprint {}", peer.fingerprint));
                         if ui.button("Copy to this PC").clicked() {
+                            if self.form.remote.download { self.form.sources.clear(); }
+                            self.form.remote.download = false;
+                            self.browser = RemoteBrowser::default();
                             self.form.remote.enabled = true;
                             self.form.remote.address =
                                 remote::address_for(&self.form.remote.address, &peer);
@@ -781,11 +798,31 @@ impl FcApp {
 
     /// The new-transfer form, shown in the "Add task" window.
     fn add_form(&mut self, ui: &mut egui::Ui) {
+        let old_mode = (self.form.remote.enabled, self.form.remote.download);
+        ui.horizontal(|ui| {
+            if ui.selectable_label(!self.form.remote.enabled, "Local copy").clicked() {
+                self.form.remote.enabled = false;
+                self.form.remote.download = false;
+            }
+            if ui.selectable_label(self.form.remote.enabled && !self.form.remote.download, "Upload to PC").clicked() {
+                self.form.remote.enabled = true;
+                self.form.remote.download = false;
+            }
+            if ui.selectable_label(self.form.remote.enabled && self.form.remote.download, "Download from PC").clicked() {
+                self.form.remote.enabled = true;
+                self.form.remote.download = true;
+            }
+        });
+        if old_mode != (self.form.remote.enabled, self.form.remote.download) {
+            self.form.sources.clear();
+            self.form.add_path.clear();
+            self.browser = RemoteBrowser::default();
+        }
         ui.horizontal(|ui| {
             ui.label("Source");
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.form.add_path)
-                    .hint_text("path, or drop files onto the window")
+                    .hint_text(if self.form.remote.download { "share/path, or select below" } else { "path, or drop files onto the window" })
                     .desired_width(ui.available_width() - 60.0),
             );
             let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -809,15 +846,23 @@ impl FcApp {
             self.form.sources.remove(i);
         }
         ui.add_space(4.0);
-        ui.checkbox(&mut self.form.remote.enabled, "Copy to a PC on the network");
         if self.form.remote.enabled {
+            let address = self.form.remote.address.clone();
             self.remote_fields(ui);
-        } else {
+            if self.form.remote.address != address {
+                self.browser = RemoteBrowser::default();
+                if self.form.remote.download { self.form.sources.clear(); }
+            }
+            if self.form.remote.download {
+                self.remote_browser(ui);
+            }
+        }
+        if !self.form.remote.enabled || self.form.remote.download {
             ui.horizontal(|ui| {
                 ui.label("Destination");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.form.dest)
-                        .hint_text("folder (or new file name for a single file)")
+                        .hint_text(if self.form.remote.download { "local destination folder" } else { "folder (or new file name for a single file)" })
                         .desired_width(f32::INFINITY),
                 );
             });
@@ -850,7 +895,7 @@ impl FcApp {
         }
         ui.add_space(4.0);
         let ready = !self.form.sources.is_empty()
-            && (self.form.remote.enabled || !self.form.dest.trim().is_empty());
+            && ((self.form.remote.enabled && !self.form.remote.download) || !self.form.dest.trim().is_empty());
         if ui
             .add_enabled(
                 ready,
@@ -859,6 +904,47 @@ impl FcApp {
             .clicked()
         {
             self.start_transfer();
+        }
+    }
+
+    fn remote_browser(&mut self, ui: &mut egui::Ui) {
+        self.browser.poll();
+        let mut navigate = None;
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!self.browser.busy(), egui::Button::new("Browse shares")).clicked() {
+                navigate = Some(String::new());
+            }
+            if !self.browser.path.is_empty() && ui.add_enabled(!self.browser.busy(), egui::Button::new("Up")).clicked() {
+                navigate = Some(self.browser.path.rsplit_once('/').map(|(p, _)| p).unwrap_or("").into());
+            }
+            ui.monospace(if self.browser.path.is_empty() { "Shares" } else { &self.browser.path });
+            if self.browser.busy() { ui.spinner(); }
+        });
+        if let Some(error) = &self.browser.error { ui.colored_label(WARN, error); }
+        let mut selected = None;
+        egui::ScrollArea::vertical().id_salt("remote-browser").max_height(160.0).show(ui, |ui| {
+            for entry in &self.browser.entries {
+                let path = if self.browser.path.is_empty() { entry.name.clone() } else { format!("{}/{}", self.browser.path, entry.name) };
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!self.browser.busy(), egui::Button::new("Add")).clicked() {
+                        selected = Some(PathBuf::from(&path));
+                    }
+                    if entry.kind == fc_remote::protocol::EntryKind::Dir {
+                        if ui.add_enabled(!self.browser.busy(), egui::Button::new(format!("{}/", entry.name))).clicked() {
+                            navigate = Some(path);
+                        }
+                    } else {
+                        ui.label(&entry.name);
+                        ui.weak(human_bytes(entry.size));
+                    }
+                });
+            }
+        });
+        if let Some(path) = selected {
+            if !self.form.sources.contains(&path) { self.form.sources.push(path); }
+        }
+        if let Some(path) = navigate {
+            self.browser.start(&self.form.remote, path, ui.ctx());
         }
     }
 
@@ -903,19 +989,21 @@ impl FcApp {
                     .hint_text("user@host:port")
                     .desired_width(220.0),
             );
-            ui.label("Folder");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.form.remote.folder)
-                    .hint_text("backup/photos")
-                    .desired_width(f32::INFINITY),
-            );
+            if !self.form.remote.download {
+                ui.label("Folder");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.form.remote.folder)
+                        .hint_text("backup/photos")
+                        .desired_width(f32::INFINITY),
+                );
+            }
         });
         ui.horizontal(|ui| {
             ui.label("Password");
             ui.add(
                 egui::TextEdit::singleline(&mut self.form.remote.password)
                     .password(true)
-                    .hint_text("used for this job only")
+                    .hint_text("browse and job only; not saved")
                     .desired_width(220.0),
             );
         });
@@ -1033,6 +1121,10 @@ impl FcApp {
                 .collect()
         });
         if !dropped.is_empty() {
+            if self.form.remote.download {
+                self.notice = Some("Select remote sources in the browser; dropped files are local.".into());
+                return;
+            }
             self.form.sources.extend(dropped);
             self.show_add = true;
         }
@@ -1109,6 +1201,19 @@ impl eframe::App for FcApp {
             View::Peers => self.peers_view(ui),
             View::Torrents => torrent::show(ui, &mut self.torrents),
             View::Logs => self.logs_view(ui),
+            View::Settings => {
+                if let Some(remote) = self.vpn.show(ui) {
+                    self.form.sources = if remote.download {
+                        vec![PathBuf::from(&remote.folder)]
+                    } else {
+                        Vec::new()
+                    };
+                    self.form.remote = remote;
+                    self.browser = RemoteBrowser::default();
+                    self.notice = None;
+                    self.show_add = true;
+                }
+            }
         });
 
         let mut open = self.show_add;
@@ -1117,7 +1222,11 @@ impl eframe::App for FcApp {
             .resizable(false)
             .default_width(560.0)
             .show(ctx, |ui| self.add_form(ui));
-        self.show_add = open;
+        if self.show_add && !open {
+            self.form.remote.password.clear();
+            self.browser = RemoteBrowser::default();
+        }
+        self.show_add &= open;
 
         self.decision_modal(ctx);
 
