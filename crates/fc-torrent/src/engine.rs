@@ -138,12 +138,24 @@ impl TorrentStatus {
     }
 }
 
+/// Per-transfer choices for an add.
+#[derive(Debug, Clone, Default)]
+pub struct AddOptions {
+    /// Start paused.
+    pub paused: bool,
+    /// Contacted directly, for the file list or the data.
+    pub peers: Vec<SocketAddr>,
+    /// Where this transfer's data goes. `None` uses the engine's output folder.
+    pub output: Option<PathBuf>,
+}
+
 /// A magnet link still waiting for its file list.
 struct Pending {
     id: usize,
     magnet: String,
     paused: bool,
     peers: Vec<SocketAddr>,
+    output: Option<PathBuf>,
     /// The task that waits for metadata. `None` once it has finished.
     task: Option<tokio::task::JoinHandle<()>>,
     error: Option<String>,
@@ -158,6 +170,9 @@ struct SavedMagnet {
     magnet: String,
     paused: bool,
     peers: Vec<SocketAddr>,
+    /// Missing in files saved before folders were chosen per transfer.
+    #[serde(default)]
+    output: Option<PathBuf>,
 }
 
 type PendingList = Arc<Mutex<Vec<Pending>>>;
@@ -194,8 +209,8 @@ impl TorrentEngine {
             pending_file: config.state_dir.map(|d| d.join(PENDING_FILE)),
         };
         for saved in load_saved(engine.pending_file.as_deref())? {
-            let peers = saved.peers.clone();
-            engine.spawn_magnet(&saved.magnet, saved.paused, peers)?;
+            let opts = AddOptions { paused: saved.paused, peers: saved.peers, output: saved.output };
+            engine.spawn_magnet(&saved.magnet, opts)?;
         }
         Ok(engine)
     }
@@ -210,11 +225,16 @@ impl TorrentEngine {
     /// are contacted for that list. Waiting magnets are saved with the state
     /// directory, so they are still waiting after a restart.
     pub async fn add_magnet(&self, magnet: &str, paused: bool, peers: Vec<SocketAddr>) -> Result<usize, TorrentError> {
-        self.spawn_magnet(magnet, paused, peers)
+        self.add_magnet_with(magnet, AddOptions { paused, peers, output: None }).await
+    }
+
+    /// [`add_magnet`](Self::add_magnet) with the output folder chosen too.
+    pub async fn add_magnet_with(&self, magnet: &str, opts: AddOptions) -> Result<usize, TorrentError> {
+        self.spawn_magnet(magnet, opts)
     }
 
     /// Start waiting for one magnet's metadata in the background, and list it.
-    fn spawn_magnet(&self, magnet: &str, paused: bool, peers: Vec<SocketAddr>) -> Result<usize, TorrentError> {
+    fn spawn_magnet(&self, magnet: &str, opts: AddOptions) -> Result<usize, TorrentError> {
         if !magnet.starts_with("magnet:?") || magnet_param(magnet, "xt").and_then(|x| x.strip_prefix("urn:btih:").map(str::to_string)).is_none() {
             return Err(TorrentError::Engine("not a magnet link with an info hash".into()));
         }
@@ -224,7 +244,12 @@ impl TorrentEngine {
         let shared = self.pending.clone();
         let file = self.pending_file.clone();
         let url = magnet.to_string();
-        let options = AddTorrentOptions { paused, initial_peers: (!peers.is_empty()).then(|| peers.clone()), ..Default::default() };
+        let options = AddTorrentOptions {
+            paused: opts.paused,
+            initial_peers: (!opts.peers.is_empty()).then(|| opts.peers.clone()),
+            output_folder: folder_string(opts.output.as_deref()),
+            ..Default::default()
+        };
         // The task locks the list before it reports anything, so the entry below is
         // always in place by the time it does.
         let task = tokio::spawn(async move {
@@ -243,7 +268,16 @@ impl TorrentEngine {
             // Every change rewrites the whole file. A failed write is retried by the next change.
             let _ = save_pending(file.as_deref(), &list);
         });
-        list.push(Pending { id, magnet: magnet.to_string(), paused, peers, task: Some(task), error: None, resolved: None });
+        list.push(Pending {
+            id,
+            magnet: magnet.to_string(),
+            paused: opts.paused,
+            peers: opts.peers,
+            output: opts.output,
+            task: Some(task),
+            error: None,
+            resolved: None,
+        });
         save_pending(self.pending_file.as_deref(), &list)?;
         Ok(id)
     }
@@ -272,10 +306,16 @@ impl TorrentEngine {
     /// Add a `.torrent` file's bytes. `peers` are contacted directly, which is
     /// how transfers run on a LAN without trackers.
     pub async fn add_torrent_bytes(&self, bytes: Vec<u8>, paused: bool, peers: Vec<SocketAddr>) -> Result<usize, TorrentError> {
+        self.add_torrent_bytes_with(bytes, AddOptions { paused, peers, output: None }).await
+    }
+
+    /// [`add_torrent_bytes`](Self::add_torrent_bytes) with the output folder chosen too.
+    pub async fn add_torrent_bytes_with(&self, bytes: Vec<u8>, opts: AddOptions) -> Result<usize, TorrentError> {
         let options = AddTorrentOptions {
-            paused,
+            paused: opts.paused,
             overwrite: true,
-            initial_peers: (!peers.is_empty()).then_some(peers),
+            initial_peers: (!opts.peers.is_empty()).then_some(opts.peers),
+            output_folder: folder_string(opts.output.as_deref()),
             ..Default::default()
         };
         let response = self.session.add_torrent(AddTorrent::from_bytes(bytes), Some(options)).await?;
@@ -377,13 +417,18 @@ fn save_pending(path: Option<&Path>, list: &[Pending]) -> Result<(), TorrentErro
     let saved: Vec<SavedMagnet> = list
         .iter()
         .filter(|p| p.error.is_none() && p.resolved.is_none())
-        .map(|p| SavedMagnet { magnet: p.magnet.clone(), paused: p.paused, peers: p.peers.clone() })
+        .map(|p| SavedMagnet { magnet: p.magnet.clone(), paused: p.paused, peers: p.peers.clone(), output: p.output.clone() })
         .collect();
     let tmp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(&saved).map_err(|e| TorrentError::Engine(e.to_string()))?;
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// The output folder as librqbit takes it.
+fn folder_string(path: Option<&Path>) -> Option<String> {
+    path.map(|p| p.to_string_lossy().into_owned())
 }
 
 /// One query parameter of a magnet link, as written (not decoded).

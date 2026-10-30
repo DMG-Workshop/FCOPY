@@ -20,13 +20,14 @@ use fc_engine::{
 
 use crate::remote::{self, PeerSearch, RemoteForm};
 use crate::state::{AppState, JobRow, LogKind};
+use crate::torrent::{self, Torrents};
 use crate::Startup;
 
-const OK: Color32 = Color32::from_rgb(110, 200, 120);
-const WARN: Color32 = Color32::from_rgb(230, 180, 80);
-const BAD: Color32 = Color32::from_rgb(235, 100, 90);
-const ACCENT: Color32 = Color32::from_rgb(234, 88, 12);
-const DIM: Color32 = Color32::from_rgb(120, 124, 134);
+pub(crate) const OK: Color32 = Color32::from_rgb(110, 200, 120);
+pub(crate) const WARN: Color32 = Color32::from_rgb(230, 180, 80);
+pub(crate) const BAD: Color32 = Color32::from_rgb(235, 100, 90);
+pub(crate) const ACCENT: Color32 = Color32::from_rgb(234, 88, 12);
+pub(crate) const DIM: Color32 = Color32::from_rgb(120, 124, 134);
 
 /// Speed presets for the throttle menu. `None` is unlimited.
 const THROTTLE: [(&str, Option<u64>); 7] = [
@@ -44,6 +45,7 @@ const THROTTLE: [(&str, Option<u64>); 7] = [
 enum View {
     Queue,
     Peers,
+    Torrents,
     Logs,
 }
 
@@ -107,6 +109,7 @@ pub struct FcApp {
     remember_choice: bool,
     peers: PeerSearch,
     peer_list: Vec<fc_remote::discovery::Peer>,
+    torrents: Torrents,
     notice: Option<String>,
 }
 
@@ -146,6 +149,7 @@ impl FcApp {
             remember_choice: false,
             peers: PeerSearch::default(),
             peer_list: Vec::new(),
+            torrents: Torrents::start(),
             notice: None,
         };
         app.state.speed_limit = startup.limit;
@@ -219,7 +223,15 @@ impl FcApp {
             if ui.selectable_label(self.view == View::Peers, "Remote PCs").clicked() {
                 self.view = View::Peers;
             }
-            ui.add_enabled(false, egui::Label::new("BitTorrent")).on_disabled_hover_text("Not built yet");
+            let running = self.torrents.is_running();
+            let tab = ui.add_enabled(running, egui::Button::new("BitTorrent").selected(self.view == View::Torrents).frame(false));
+            if running {
+                if tab.clicked() {
+                    self.view = View::Torrents;
+                }
+            } else {
+                tab.on_disabled_hover_text("The BitTorrent engine could not start. See the BitTorrent tab.");
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.weak("Tokio async engine");
             });
@@ -783,9 +795,11 @@ impl eframe::App for FcApp {
             ui.add_space(2.0);
         });
         egui::SidePanel::left("nav").resizable(false).exact_width(210.0).show(ctx, |ui| self.sidebar(ui));
+        self.torrents.refresh();
         egui::CentralPanel::default().show(ctx, |ui| match self.view {
             View::Queue => self.queue_view(ui),
             View::Peers => self.peers_view(ui),
+            View::Torrents => torrent::show(ui, &mut self.torrents),
             View::Logs => self.logs_view(ui),
         });
 
@@ -799,11 +813,16 @@ impl eframe::App for FcApp {
         if self.state.active.is_some() && !self.state.paused {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
+        // Torrent rates and progress change without events, so the tab repaints on a timer.
+        if self.torrents.is_busy() {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Cancel cleanly so no .fcpart files are left behind.
         self.queue.shutdown();
+        self.torrents.shutdown();
     }
 }
 

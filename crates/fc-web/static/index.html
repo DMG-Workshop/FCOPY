@@ -209,10 +209,10 @@
                 <td class="hidden p-2 text-right tabular-nums text-dim lg:table-cell" x-text="t.live_peers"></td>
                 <td class="block p-0 md:table-cell md:p-2">
                   <div class="flex justify-end gap-1">
-                    <button x-show="t.phase !== 'paused' && t.phase !== 'failed'" class="btn-mini" @click="torrentAct(t, 'pause')">Pause</button>
+                    <button x-show="['checking', 'downloading', 'seeding'].includes(t.phase)" class="btn-mini" @click="torrentAct(t, 'pause')">Pause</button>
                     <button x-show="t.phase === 'paused'" class="btn-mini" @click="torrentAct(t, 'resume')">Resume</button>
                     <button class="btn-mini hover:text-bad" @click="removeTorrent(t, false)">Remove</button>
-                    <button class="btn-mini hover:text-bad" title="Remove and delete the downloaded files" @click="removeTorrent(t, true)">Delete data</button>
+                    <button x-show="t.phase !== 'waiting'" class="btn-mini hover:text-bad" title="Remove and delete the downloaded files" @click="removeTorrent(t, true)">Delete data</button>
                   </div>
                 </td>
               </tr>

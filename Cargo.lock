@@ -1507,7 +1507,9 @@ dependencies = [
  "embed-resource",
  "fc-engine",
  "fc-remote",
+ "fc-torrent",
  "tempfile",
+ "tokio",
  "winreg",
 ]
 

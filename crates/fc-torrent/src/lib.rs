@@ -1,2 +1,2 @@
 pub mod engine;
-pub use engine::{EngineConfig, TorrentEngine, TorrentError, TorrentPhase, TorrentState, TorrentStatus};
+pub use engine::{AddOptions, EngineConfig, TorrentEngine, TorrentError, TorrentPhase, TorrentState, TorrentStatus};

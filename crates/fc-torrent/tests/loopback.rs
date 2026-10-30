@@ -210,6 +210,24 @@ async fn a_download_and_its_paused_state_survive_a_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_download_goes_to_the_folder_chosen_for_it() {
+    let seed_dir = tempfile::tempdir().unwrap();
+    let engine_dir = tempfile::tempdir().unwrap();
+    let chosen = tempfile::tempdir().unwrap();
+    let (seed, _seed_id, torrent, peer) = seed_one_file(seed_dir.path(), "chosen.bin", 64 * 1024).await;
+
+    let leech = TorrentEngine::start(EngineConfig::new(engine_dir.path())).await.unwrap();
+    let opts = fc_torrent::AddOptions { peers: vec![peer], output: Some(chosen.path().to_path_buf()), ..Default::default() };
+    let id = leech.add_torrent_bytes_with(torrent, opts).await.unwrap();
+    wait_for(&leech, id, 90, |s| s.finished).await;
+
+    assert!(chosen.path().join("chosen.bin").exists(), "the file is in the chosen folder");
+    assert!(!engine_dir.path().join("chosen.bin").exists(), "and not in the engine's default folder");
+    leech.shutdown().await;
+    seed.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_magnet_link_without_an_info_hash_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let engine = TorrentEngine::start(EngineConfig::new(dir.path())).await.unwrap();

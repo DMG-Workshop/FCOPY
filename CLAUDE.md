@@ -156,7 +156,9 @@ Still open:
 - BitTorrent (fc-torrent, librqbit 9): own lane, not the copy queue, since a torrent
   holds the one-job worker until its download finishes. Web console: admin-only tab
   with magnet and .torrent add (optional peer addresses), pause, resume, remove,
-  delete data; rows arrive in telemetry frames. Desktop tab still disabled.
+  delete data; rows arrive in telemetry frames. Desktop: BitTorrent tab in
+  fc-gui/src/torrent.rs, on its own runtime, with a save-folder field per transfer
+  (the tab is disabled only if the engine fails to start).
   A magnet is listed at once as "waiting for peers", keeps its id when its file
   list arrives, and both transfers and waiting magnets survive a restart when a
   state directory is given (librqbit persistence plus pending-magnets.json).
