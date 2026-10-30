@@ -130,7 +130,9 @@ mod imp {
             written.push(path);
         }
         // Refresh the MIME/desktop cache if the tool exists; harmless if not.
-        let _ = std::process::Command::new("update-desktop-database").arg(base.join("applications")).status();
+        let _ = std::process::Command::new("update-desktop-database")
+            .arg(base.join("applications"))
+            .status();
         Ok(written)
     }
 
@@ -154,11 +156,14 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use super::*;
-    use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
 
     /// Verb locations: any file, folders, and the folder background (paste-into).
-    const ROOTS: [&str; 2] = [r"Software\Classes\*\shell\fcopy", r"Software\Classes\Directory\shell\fcopy"];
+    const ROOTS: [&str; 2] = [
+        r"Software\Classes\*\shell\fcopy",
+        r"Software\Classes\Directory\shell\fcopy",
+    ];
 
     pub fn install(exe: &Path) -> io::Result<Vec<PathBuf>> {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
@@ -207,7 +212,9 @@ mod imp {
     /// ship a pre-built `Copy with fcopy.workflow` inside the .app's Resources
     /// (see packaging/macos/README) and copy it into ~/Library/Services here.
     pub fn install(exe: &Path) -> io::Result<Vec<PathBuf>> {
-        let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| io::Error::other("HOME not set"))?;
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| io::Error::other("HOME not set"))?;
         // exe = fcopy.app/Contents/MacOS/fcopy-gui → Resources is ../Resources
         let bundled = exe
             .parent()
@@ -221,7 +228,9 @@ mod imp {
     }
 
     pub fn uninstall() -> io::Result<Vec<PathBuf>> {
-        let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| io::Error::other("HOME not set"))?;
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| io::Error::other("HOME not set"))?;
         let dest = home.join("Library/Services/Copy with fcopy.workflow");
         std::fs::remove_dir_all(&dest)?;
         Ok(vec![dest])
@@ -232,7 +241,11 @@ mod imp {
         for e in std::fs::read_dir(from)? {
             let e = e?;
             let target = to.join(e.file_name());
-            if e.file_type()?.is_dir() { copy_dir(&e.path(), &target)? } else { std::fs::copy(e.path(), target).map(|_| ())? }
+            if e.file_type()?.is_dir() {
+                copy_dir(&e.path(), &target)?
+            } else {
+                std::fs::copy(e.path(), target).map(|_| ())?
+            }
         }
         Ok(())
     }
@@ -242,7 +255,10 @@ mod imp {
 mod imp {
     use super::*;
     pub fn install(_: &Path) -> io::Result<Vec<PathBuf>> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "no desktop integration on this platform"))
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no desktop integration on this platform",
+        ))
     }
     pub fn uninstall() -> io::Result<Vec<PathBuf>> {
         Ok(vec![])
@@ -255,8 +271,14 @@ mod tests {
 
     #[test]
     fn exec_quoting_follows_the_desktop_spec() {
-        assert_eq!(desktop_exec_quote(Path::new("/opt/fcopy/fcopy-gui")), "\"/opt/fcopy/fcopy-gui\"");
-        assert_eq!(desktop_exec_quote(Path::new("/home/a b/$x\"y")), "\"/home/a b/\\$x\\\"y\"");
+        assert_eq!(
+            desktop_exec_quote(Path::new("/opt/fcopy/fcopy-gui")),
+            "\"/opt/fcopy/fcopy-gui\""
+        );
+        assert_eq!(
+            desktop_exec_quote(Path::new("/home/a b/$x\"y")),
+            "\"/home/a b/\\$x\\\"y\""
+        );
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -267,12 +289,25 @@ mod tests {
         unsafe { std::env::set_var("XDG_DATA_HOME", dir.path()) };
         let written = imp::install(Path::new("/opt/fcopy/fcopy-gui")).unwrap();
         assert_eq!(written.len(), 4);
-        let desktop = std::fs::read_to_string(dir.path().join("applications/io.github.fcopy.desktop")).unwrap();
+        let desktop =
+            std::fs::read_to_string(dir.path().join("applications/io.github.fcopy.desktop"))
+                .unwrap();
         assert!(desktop.contains("Exec=\"/opt/fcopy/fcopy-gui\" --sources %F"));
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(dir.path().join("kio/servicemenus/fcopy.desktop")).unwrap().permissions().mode();
-        assert_eq!(mode & 0o111, 0o111, "Dolphin service menus must be executable");
+        let mode = std::fs::metadata(dir.path().join("kio/servicemenus/fcopy.desktop"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o111,
+            0o111,
+            "Dolphin service menus must be executable"
+        );
         assert_eq!(imp::uninstall().unwrap().len(), 4);
-        assert!(!dir.path().join("applications/io.github.fcopy.desktop").exists());
+        assert!(
+            !dir.path()
+                .join("applications/io.github.fcopy.desktop")
+                .exists()
+        );
     }
 }

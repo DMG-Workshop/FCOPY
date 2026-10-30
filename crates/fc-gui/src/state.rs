@@ -74,7 +74,13 @@ impl AppState {
     }
 
     fn push_log(&mut self, job: JobId, kind: LogKind, path: Option<PathBuf>, message: String) {
-        self.log.push(LogEntry { at: SystemTime::now(), job, kind, path, message });
+        self.log.push(LogEntry {
+            at: SystemTime::now(),
+            job,
+            kind,
+            path,
+            message,
+        });
         self.unseen += 1;
         // Bound memory on huge jobs with many failures.
         if self.log.len() > 10_000 {
@@ -84,7 +90,14 @@ impl AppState {
 
     fn active_mut(&mut self, job: JobId) -> &mut ActiveView {
         if self.active.as_ref().map(|a| a.job) != Some(job) {
-            self.active = Some(ActiveView { job, telemetry: None, received: Instant::now(), files_copied: 0, files_skipped: 0, files_failed: 0 });
+            self.active = Some(ActiveView {
+                job,
+                telemetry: None,
+                received: Instant::now(),
+                files_copied: 0,
+                files_skipped: 0,
+                files_failed: 0,
+            });
         }
         self.active.as_mut().unwrap()
     }
@@ -102,7 +115,12 @@ impl AppState {
                 bytes_total: 0,
                 summary: None,
             }),
-            Event::Started { job, files, bytes, warnings } => {
+            Event::Started {
+                job,
+                files,
+                bytes,
+                warnings,
+            } => {
                 if let Some(r) = self.row_mut(job) {
                     r.state = JobState::Running;
                     r.files_total = files;
@@ -121,7 +139,9 @@ impl AppState {
                 a.telemetry = Some(telemetry);
                 a.received = Instant::now();
             }
-            Event::FileCopied { job, dst, warnings, .. } => {
+            Event::FileCopied {
+                job, dst, warnings, ..
+            } => {
                 self.active_mut(job).files_copied += 1;
                 for w in warnings {
                     self.push_log(job, LogKind::Warning, Some(dst.clone()), w);
@@ -149,7 +169,11 @@ impl AppState {
                 }
             }
             Event::SpeedLimit(l) => self.speed_limit = l,
-            Event::Finished { job, state, summary } => {
+            Event::Finished {
+                job,
+                state,
+                summary,
+            } => {
                 if let JobState::Failed(msg) = &state {
                     self.push_log(job, LogKind::JobFailed, None, msg.clone());
                 }
@@ -177,7 +201,10 @@ impl AppState {
     /// Log entries that are errors rather than warnings.
     #[cfg(test)]
     pub fn error_count(&self) -> usize {
-        self.log.iter().filter(|l| l.kind != LogKind::Warning).count()
+        self.log
+            .iter()
+            .filter(|l| l.kind != LogKind::Warning)
+            .count()
     }
 }
 
@@ -210,15 +237,34 @@ mod tests {
     #[test]
     fn lifecycle_drives_rows_active_view_and_log() {
         let mut s = AppState::default();
-        s.apply(Event::Queued { job: 1, label: "photos".into() });
+        s.apply(Event::Queued {
+            job: 1,
+            label: "photos".into(),
+        });
         assert_eq!(s.jobs[0].state, JobState::Pending);
-        s.apply(Event::Started { job: 1, files: 2, bytes: 100, warnings: vec!["skipped symlink".into()] });
+        s.apply(Event::Started {
+            job: 1,
+            files: 2,
+            bytes: 100,
+            warnings: vec!["skipped symlink".into()],
+        });
         assert!(s.active.is_some());
-        s.apply(Event::Progress { job: 1, telemetry: snap(0.4) });
+        s.apply(Event::Progress {
+            job: 1,
+            telemetry: snap(0.4),
+        });
         assert_eq!(s.jobs[0].fraction, 0.4);
-        s.apply(Event::FileSkipped { job: 1, src: "/x".into(), reason: "skipped by user".into() });
+        s.apply(Event::FileSkipped {
+            job: 1,
+            src: "/x".into(),
+            reason: "skipped by user".into(),
+        });
         assert_eq!((s.log.len(), s.error_count(), s.unseen), (2, 1, 2));
-        s.apply(Event::Finished { job: 1, state: JobState::CompletedWithErrors, summary: JobSummary::default() });
+        s.apply(Event::Finished {
+            job: 1,
+            state: JobState::CompletedWithErrors,
+            summary: JobSummary::default(),
+        });
         assert!(s.active.is_none());
         assert_eq!(s.jobs[0].state, JobState::CompletedWithErrors);
     }
@@ -232,7 +278,10 @@ mod tests {
         assert_eq!(s.speed_limit, Some(10_000_000));
         s.apply(Event::Resumed);
         assert!(!s.paused);
-        s.apply(Event::Queued { job: 7, label: "x".into() });
+        s.apply(Event::Queued {
+            job: 7,
+            label: "x".into(),
+        });
         s.apply(Event::Removed { job: 7 });
         assert!(s.jobs.is_empty());
     }
@@ -240,8 +289,15 @@ mod tests {
     #[test]
     fn failed_job_is_logged() {
         let mut s = AppState::default();
-        s.apply(Event::Queued { job: 1, label: "x".into() });
-        s.apply(Event::Finished { job: 1, state: JobState::Failed("no space".into()), summary: JobSummary::default() });
+        s.apply(Event::Queued {
+            job: 1,
+            label: "x".into(),
+        });
+        s.apply(Event::Finished {
+            job: 1,
+            state: JobState::Failed("no space".into()),
+            summary: JobSummary::default(),
+        });
         assert_eq!(s.log[0].kind, LogKind::JobFailed);
     }
 }

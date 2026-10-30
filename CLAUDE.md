@@ -69,9 +69,12 @@ and take screenshots with `import -window root`.
 | 20k small files | 1.27 s | 1.76 s (**slower**: per-file thread hand-off + metadata) |
 | 20k small files + readback | n/a | 7.1 s (**fsync per file dominates**) |
 
-Known performance to-dos: a small-file fast path (batch, no per-file fsync for
-readback, use `syncfs`/batched fsync), parallel small files, kernel fast paths
-(reflink/`copy_file_range`/`CopyFileExW`/`clonefile`).
+Known performance to-dos: batch read-back durability work (`syncfs`/batched
+fsync), parallel small files, kernel fast paths
+(reflink/`copy_file_range`/`CopyFileExW`/`clonefile`). A Windows 20k × 128 B
+before/after experiment of reducing the buffer-pool lease for inline copies was
+noisy and showed no improvement (median 29.9 s baseline vs 31.2 s modified); that
+change was dropped. Avoid retaining the optimization without a reproducible win.
 
 ## fc-remote status
 
@@ -147,11 +150,11 @@ Done since the handoff, each with tests:
 - `fcopy-agent` (fc-agent): init, serve, fingerprint, share, user, unattended, allow, service install/uninstall/run (Windows service verified on this PC). systemd and launchd files in packaging/.
 - LAN discovery (fc-remote/discovery.rs): advertise and browse `_fcopy._udp.local.`. The agent announces itself when `discovery = true`.
 - `fcopy copy SRC user@host:/share/dir` with password from file, env or prompt. `--accept-fingerprint`, trust saved after confirmation. `fcopy peers`.
-- Web console: Remote node mode in Add task; HTTPS only, with the agent's certificate.
+- Web console: Remote node mode in Add task; HTTPS only. Defaults to the agent's self-signed certificate; `https_server_config_from_pem` and the `serve` example's `--tls-cert`/`--tls-key` options support a supplied PEM chain and unencrypted private key. The example can bind to a LAN interface with `--bind`; plain HTTP is loopback-only.
 - Desktop GUI: Copy to a PC on the network; redesigned window (tab bar, sidebar, queue table, status bar).
 
 Still open:
-- Windows service: verified on this PC (elevated): install, start, listening on UDP 47800, stop, uninstall. It writes no logs yet. End to end (packaging/windows/test-service.ps1): a file copied over QUIC into the running service matched byte for byte.
+- Windows service: install/start/copy/stop/uninstall previously passed on this PC. Timestamped diagnostics are now written to `service.log` in the agent state directory, with one 2 MiB rotated archive (`service.log.1`). The updated end-to-end script uses isolated temporary state and checks the startup record; this logging assertion still needs an elevated run.
 - Pull (download) direction, not planned yet.
 - BitTorrent (fc-torrent, librqbit 9): own lane, not the copy queue, since a torrent
   holds the one-job worker until its download finishes. Web console: admin-only tab
@@ -162,5 +165,9 @@ Still open:
   A magnet is listed at once as "waiting for peers", keeps its id when its file
   list arrives, and both transfers and waiting magnets survive a restart when a
   state directory is given (librqbit persistence plus pending-magnets.json).
-  Gaps: trackers and DHT off by default; magnets cannot be paused while waiting.
-- Public certificate for the web console; the self-signed one needs trusting once.
+  DHT and tracker announces remain off by default for privacy; the desktop app
+  and web serve example expose explicit `--torrent-dht` and
+  `--torrent-trackers` startup opt-ins. Waiting magnets can be paused; this
+  cancels metadata discovery while preserving the row and id, and resume
+  restarts discovery. Loopback coverage verifies this behavior.
+- The web console accepts a supplied PEM certificate chain and private key via `https_server_config_from_pem`; the serve example accepts `--tls-cert` and `--tls-key`. A real trusted certificate and DNS name still need to be provisioned by whoever deploys the console.

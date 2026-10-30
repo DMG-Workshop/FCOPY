@@ -2,15 +2,15 @@
 //! and discovery runs off the UI thread so the window never waits on it.
 
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use fc_engine::TransferBackend;
 use fc_remote::backend::RemoteBackend;
 use fc_remote::client::{Connector, RemoteSpec};
-use fc_remote::config::{default_client_dir, KnownHosts};
-use fc_remote::discovery::{browse, Peer};
+use fc_remote::config::{KnownHosts, default_client_dir};
+use fc_remote::discovery::{Peer, browse};
 
 /// The remote part of the new-transfer form.
 #[derive(Default, Clone)]
@@ -35,14 +35,17 @@ pub fn known_hosts_path() -> PathBuf {
 /// The fingerprint already trusted for this address, if any.
 pub fn trusted_fingerprint(address: &str) -> Option<String> {
     let spec = RemoteSpec::parse(&format!("{}:/x", address.trim())).ok()?;
-    KnownHosts::load(&known_hosts_path()).get(&spec.host_port()).map(str::to_string)
+    KnownHosts::load(&known_hosts_path())
+        .get(&spec.host_port())
+        .map(str::to_string)
 }
 
 /// Build the backend a job will use. The error says what is missing, and is
 /// shown in the form.
 pub fn backend_for(form: &RemoteForm) -> Result<Arc<dyn TransferBackend>, String> {
     let folder = form.folder.trim().trim_matches('/');
-    let spec = RemoteSpec::parse(&format!("{}:/{}", form.address.trim(), folder)).map_err(|e| e.to_string())?;
+    let spec = RemoteSpec::parse(&format!("{}:/{}", form.address.trim(), folder))
+        .map_err(|e| e.to_string())?;
     if form.password.is_empty() {
         return Err("enter the PC's password or access key".into());
     }
@@ -57,9 +60,15 @@ pub fn backend_for(form: &RemoteForm) -> Result<Arc<dyn TransferBackend>, String
             let _ = known.save(&known_hosts_path());
             form.fingerprint.clone()
         }
-        None => return Err("compare the PC's fingerprint with the one it shows, then tick the box".into()),
+        None => {
+            return Err(
+                "compare the PC's fingerprint with the one it shows, then tick the box".into(),
+            );
+        }
     };
-    let connector = Connector::new(spec).password(form.password.clone()).pinned(Some(pinned));
+    let connector = Connector::new(spec)
+        .password(form.password.clone())
+        .pinned(Some(pinned));
     let backend = RemoteBackend::new(connector).map_err(|e| e.to_string())?;
     Ok(Arc::new(backend))
 }
@@ -93,8 +102,15 @@ impl PeerSearch {
 
 /// `user@host:port` for a discovered peer, keeping any user already typed.
 pub fn address_for(current: &str, peer: &Peer) -> String {
-    let user = current.split_once('@').map(|(u, _)| format!("{u}@")).unwrap_or_default();
-    let host = peer.addresses.first().map(ToString::to_string).unwrap_or_else(|| peer.host.clone());
+    let user = current
+        .split_once('@')
+        .map(|(u, _)| format!("{u}@"))
+        .unwrap_or_default();
+    let host = peer
+        .addresses
+        .first()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| peer.host.clone());
     format!("{user}{host}:{}", peer.port)
 }
 

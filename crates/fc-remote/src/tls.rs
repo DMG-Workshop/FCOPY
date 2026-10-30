@@ -23,7 +23,9 @@ use std::time::Duration;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::pki_types::{
+    CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime, pem::PemObject,
+};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 
 use crate::crypto::fingerprint;
@@ -43,8 +45,9 @@ impl std::fmt::Debug for Identity {
 
 impl Identity {
     pub fn generate(hostname: &str) -> io::Result<Self> {
-        let ck = rcgen::generate_simple_self_signed(vec![hostname.to_string(), "fcopy-agent".into()])
-            .map_err(io::Error::other)?;
+        let ck =
+            rcgen::generate_simple_self_signed(vec![hostname.to_string(), "fcopy-agent".into()])
+                .map_err(io::Error::other)?;
         Ok(Self {
             cert: ck.cert.der().clone(),
             key: PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()),
@@ -80,7 +83,11 @@ fn transport() -> quinn::TransportConfig {
     let mut t = quinn::TransportConfig::default();
     // Keep NAT bindings alive and notice dead peers quickly.
     t.keep_alive_interval(Some(Duration::from_secs(4)));
-    t.max_idle_timeout(Some(Duration::from_secs(20).try_into().expect("valid idle timeout")));
+    t.max_idle_timeout(Some(
+        Duration::from_secs(20)
+            .try_into()
+            .expect("valid idle timeout"),
+    ));
     // One stream per file: allow plenty in flight for small-file batches.
     t.max_concurrent_bidi_streams(64u32.into());
     t.max_concurrent_uni_streams(0u32.into());
@@ -97,10 +104,14 @@ pub fn server_config(id: &Identity) -> io::Result<quinn::ServerConfig> {
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(io::Error::other)?
         .with_no_client_auth()
-        .with_single_cert(vec![id.cert.clone()], PrivateKeyDer::Pkcs8(id.key.clone_key()))
+        .with_single_cert(
+            vec![id.cert.clone()],
+            PrivateKeyDer::Pkcs8(id.key.clone_key()),
+        )
         .map_err(io::Error::other)?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
-    let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(io::Error::other)?;
+    let crypto =
+        quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(io::Error::other)?;
     let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     cfg.transport_config(Arc::new(transport()));
     // A client whose Wi-Fi → Ethernet switch changes its address keeps its session.
@@ -119,7 +130,11 @@ pub struct PinnedVerifier {
 
 impl PinnedVerifier {
     pub fn new(pinned: Option<String>) -> Arc<Self> {
-        Arc::new(Self { pinned, seen: Mutex::new(None), provider: provider() })
+        Arc::new(Self {
+            pinned,
+            seen: Mutex::new(None),
+            provider: provider(),
+        })
     }
 
     /// Fingerprint presented in the last handshake.
@@ -157,7 +172,12 @@ impl ServerCertVerifier for PinnedVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -168,11 +188,18 @@ impl ServerCertVerifier for PinnedVerifier {
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
         // The handshake signature must still be valid for the presented key:
         // pinning replaces the CA chain, not the proof of key possession.
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.provider.signature_verification_algorithms.supported_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -185,7 +212,8 @@ pub fn client_config(verifier: Arc<PinnedVerifier>) -> io::Result<quinn::ClientC
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
     tls.alpn_protocols = vec![ALPN.to_vec()];
-    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(io::Error::other)?;
+    let crypto =
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(io::Error::other)?;
     let mut cfg = quinn::ClientConfig::new(Arc::new(crypto));
     cfg.transport_config(Arc::new(transport()));
     Ok(cfg)
@@ -194,12 +222,76 @@ pub fn client_config(verifier: Arc<PinnedVerifier>) -> io::Result<quinn::ClientC
 /// TLS 1.3 for the web console, using this agent's identity. The ALPN is
 /// HTTP/1.1, which is what the console speaks. QUIC uses [`server_config`].
 pub fn https_server_config(id: &Identity) -> io::Result<rustls::ServerConfig> {
+    https_server_config_for(
+        vec![id.cert.clone()],
+        PrivateKeyDer::Pkcs8(id.key.clone_key()),
+    )
+}
+
+/// Load a browser-trusted certificate chain and unencrypted private key from
+/// PEM files for the web console. Returns the TLS config and the leaf SHA-256
+/// fingerprint used by the sign-in page. The private key file should be
+/// readable only by the account running the web server.
+pub fn https_server_config_from_pem(
+    certificate_chain: &Path,
+    private_key: &Path,
+) -> io::Result<(rustls::ServerConfig, String)> {
+    let certs = CertificateDer::pem_file_iter(certificate_chain)
+        .map_err(|e| io::Error::other(format!("reading {}: {e}", certificate_chain.display())))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| io::Error::other(format!("parsing {}: {e}", certificate_chain.display())))?;
+    let leaf = certs.first().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "certificate chain contains no certificates",
+        )
+    })?;
+    let fingerprint = fingerprint(leaf);
+    let key = PrivateKeyDer::from_pem_file(private_key)
+        .map_err(|e| io::Error::other(format!("reading {}: {e}", private_key.display())))?;
+    let config = https_server_config_for(certs, key)?;
+    Ok((config, fingerprint))
+}
+
+fn https_server_config_for(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> io::Result<rustls::ServerConfig> {
     let mut tls = rustls::ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(io::Error::other)?
         .with_no_client_auth()
-        .with_single_cert(vec![id.cert.clone()], PrivateKeyDer::Pkcs8(id.key.clone_key()))
+        .with_single_cert(certs, key)
         .map_err(io::Error::other)?;
     tls.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(tls)
+}
+
+#[cfg(test)]
+mod https_pem_tests {
+    use super::*;
+
+    #[test]
+    fn loads_certificate_chain_and_key_from_pem() {
+        let dir = tempfile::tempdir().unwrap();
+        let pair = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_path = dir.path().join("fullchain.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, pair.cert.pem()).unwrap();
+        std::fs::write(&key_path, pair.signing_key.serialize_pem()).unwrap();
+
+        let (config, fp) = https_server_config_from_pem(&cert_path, &key_path).unwrap();
+        assert_eq!(fp, fingerprint(pair.cert.der()));
+        assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+    }
+
+    #[test]
+    fn rejects_pem_without_a_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("empty.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, "not a certificate").unwrap();
+        std::fs::write(&key_path, "not a key").unwrap();
+        assert!(https_server_config_from_pem(&cert_path, &key_path).is_err());
+    }
 }

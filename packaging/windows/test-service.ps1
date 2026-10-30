@@ -8,11 +8,13 @@ if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw 'Not elevated. Open PowerShell with "Run as administrator" and run this again.'
 }
 
-$dir   = 'C:\ProgramData\fcopy-agent'
+$tag   = [guid]::NewGuid().ToString('N')
+$dir   = Join-Path $env:ProgramData "fcopy-agent-test-$tag"
 $agent = '.\target\debug\fcopy-agent.exe'
 $cli   = '.\target\debug\fcopy.exe'
 $pass  = 'service-pass-1'
-$work  = Join-Path $env:TEMP 'fcopy-service-test'
+$work  = Join-Path $env:TEMP "fcopy-service-test-$tag"
+$installed = $false
 
 # Native programs don't stop the script on error, so check the exit code.
 function Invoke-Native {
@@ -27,12 +29,14 @@ $src = Join-Path $work 'svc-test.txt'
 Set-Content -Path $src -Value 'hello from the service test' -NoNewline
 
 try {
-    # Config is read when the service starts, so set it up before starting.
+    # Use a fresh isolated agent config so the test cannot modify the installed agent's state.
+    Invoke-Native $agent @('--dir', $dir, 'init', '--name', 'service-test', '--port', '47800')
     $env:FCOPY_PASSWORD = $pass
     Invoke-Native $agent @('--dir', $dir, 'share', 'add', 'backup', "$dir\share")
     Invoke-Native $agent @('--dir', $dir, 'user', 'add', 'alice', '--shares', 'backup')
     Remove-Item Env:FCOPY_PASSWORD
     Invoke-Native $agent @('--dir', $dir, 'service', 'install')
+    $installed = $true
     Start-Service fcopy-agent
 
     $fp = (& $agent --dir $dir fingerprint).Trim()
@@ -47,13 +51,32 @@ try {
     $landed = Join-Path $dir 'share\svc\svc-test.txt'
     $got = Get-Content -Raw $landed
     if ($got -ne 'hello from the service test') { throw "contents differ: '$got'" }
+    $log = Join-Path $dir 'service.log'
+    if (-not (Test-Path $log)) { throw "service log was not created at $log" }
+    $logText = Get-Content -Raw $log
+    if (-not $logText.Contains('QUIC server listening')) { throw 'service log does not contain the server startup record' }
     Write-Host 'PASS: file copied to the Windows service and verified'
+    Write-Host "PASS: service diagnostics recorded in $log"
 }
 finally {
     # Clean up whatever was done, ignoring steps that never ran.
-    Stop-Service fcopy-agent -ErrorAction SilentlyContinue
-    & $agent --dir $dir service uninstall 2>$null
-    & $agent --dir $dir user del alice 2>$null
+    $serviceRemoved = -not $installed
+    if ($installed) {
+        Stop-Service fcopy-agent -ErrorAction SilentlyContinue
+        $oldErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        & $agent --dir $dir service uninstall 2>$null
+        $serviceRemoved = $LASTEXITCODE -eq 0
+        $ErrorActionPreference = $oldErrorActionPreference
+    }
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+    $statePrefix = [IO.Path]::GetFullPath((Join-Path $env:ProgramData 'fcopy-agent-test-'))
+    $statePath = [IO.Path]::GetFullPath($dir)
+    if ($serviceRemoved -and $statePath.StartsWith($statePrefix, [StringComparison]::OrdinalIgnoreCase) -and (Split-Path -Leaf $statePath) -eq "fcopy-agent-test-$tag") {
+        Remove-Item -LiteralPath $statePath -Recurse -Force -ErrorAction SilentlyContinue
+    } elseif (-not $serviceRemoved) {
+        Write-Warning "Could not confirm service removal; keeping its state directory at $statePath"
+    }
+    Remove-Item Env:FCOPY_PASSWORD -ErrorAction SilentlyContinue
     Remove-Item Env:FCOPY_CONFIG_DIR -ErrorAction SilentlyContinue
 }

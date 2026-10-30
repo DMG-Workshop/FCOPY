@@ -42,10 +42,19 @@ pub struct Startup {
     pub dest: Option<PathBuf>,
     pub limit: Option<u64>,
     pub verify: bool,
+    pub torrent_dht: bool,
+    pub torrent_trackers: bool,
 }
 
 fn parse_startup() -> Result<Startup, String> {
-    let mut s = Startup { sources: vec![], dest: None, limit: None, verify: false };
+    let mut s = Startup {
+        sources: vec![],
+        dest: None,
+        limit: None,
+        verify: false,
+        torrent_dht: false,
+        torrent_trackers: false,
+    };
     let mut paths = vec![];
     let mut all_sources = false;
     let mut it = std::env::args().skip(1);
@@ -53,6 +62,8 @@ fn parse_startup() -> Result<Startup, String> {
         match a.as_str() {
             "--limit" => s.limit = Some(parse_size(&it.next().ok_or("--limit needs a value")?)?),
             "--verify" => s.verify = true,
+            "--torrent-dht" => s.torrent_dht = true,
+            "--torrent-trackers" => s.torrent_trackers = true,
             // File-manager launches: every path is a source; the user picks the destination.
             "--sources" => all_sources = true,
             "--install-integration" | "--uninstall-integration" => {
@@ -70,7 +81,7 @@ fn parse_startup() -> Result<Startup, String> {
                     }
                 }
             }
-            "-h" | "--help" => return Err("usage: fcopy-gui [--limit RATE] [--verify] [SOURCE... DEST]\n       fcopy-gui --sources PATH...      (pre-fill sources only)\n       fcopy-gui --install-integration | --uninstall-integration".into()),
+            "-h" | "--help" => return Err("usage: fcopy-gui [--limit RATE] [--verify] [--torrent-dht] [--torrent-trackers] [SOURCE... DEST]\n       fcopy-gui --sources PATH...      (pre-fill sources only)\n       fcopy-gui --install-integration | --uninstall-integration".into()),
             _ => paths.push(PathBuf::from(a)),
         }
     }
@@ -100,5 +111,9 @@ fn main() -> eframe::Result<()> {
             .with_drag_and_drop(true),
         ..Default::default()
     };
-    eframe::run_native("fcopy", options, Box::new(move |cc| Ok(Box::new(app::FcApp::new(cc, startup)))))
+    eframe::run_native(
+        "fcopy",
+        options,
+        Box::new(move |cc| Ok(Box::new(app::FcApp::new(cc, startup)))),
+    )
 }
