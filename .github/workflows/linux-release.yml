@@ -162,10 +162,12 @@ jobs:
           git clone --bare . /tmp/fcopy-source.git
           git --git-dir=/tmp/fcopy-source.git tag --force "v$version" "$GITHUB_SHA"
           chown -R builder /tmp/fcopy-source.git "$GITHUB_WORKSPACE"
-          runuser -u builder -- git config --global \
+          # makepkg deliberately ignores global Git configuration.
+          git config --file /tmp/fcopy-makepkg.gitconfig \
             url.file:///tmp/fcopy-source.git.insteadOf https://github.com/DMG-Workshop/FCOPY.git
-          runuser -u builder -- git config --global protocol.file.allow always
-          runuser -u builder -- bash -c 'cd packaging/arch && makepkg --cleanbuild --force --noconfirm'
+          git config --file /tmp/fcopy-makepkg.gitconfig protocol.file.allow always
+          runuser -u builder -- env MAKEPKG_GIT_CONFIG=/tmp/fcopy-makepkg.gitconfig \
+            bash -c 'cd packaging/arch && makepkg --cleanbuild --force --noconfirm'
           mkdir -p dist
           cp packaging/arch/fcopy-*.pkg.tar.zst dist/
       - name: Install and smoke-test Arch package
