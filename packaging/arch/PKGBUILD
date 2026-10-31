@@ -13,6 +13,8 @@ depends=('gcc-libs' 'glibc' 'openssl' 'ca-certificates' 'libxkbcommon'
          'libxrandr' 'wayland' 'hicolor-icon-theme')
 optdepends=('mesa: Mesa graphics drivers')
 makedepends=('cargo' 'git' 'cmake' 'pkgconf')
+# Cargo enables Rust thin LTO; makepkg's GCC LTO breaks ring/aws-lc native archives.
+options=('!lto')
 source=("fcopy::git+$url.git#tag=v$pkgver")
 sha256sums=('SKIP')
 

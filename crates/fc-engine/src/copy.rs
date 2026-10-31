@@ -265,6 +265,13 @@ impl Copier {
         *size_out = size;
         progress.set_file_size(size);
 
+        // Repair or skip blocked parents before the conflict probe can fail with ENOTDIR.
+        if opts.create_parent_dirs {
+            if let Some(parent) = dst.parent().filter(|p| !p.as_os_str().is_empty()) {
+                rec.run(parent, Operation::CreateDir, None, |_| fs::create_dir_all(parent))?;
+            }
+        }
+
         let (destination, overwrite) = crate::conflict::local_destination(
             src, dst, opts.overwrite, opts.conflicts.as_deref(), rec.control,
         ).map_err(|e| match e {
@@ -273,12 +280,6 @@ impl Copier {
             _ => Abort::Fatal(e),
         })?;
         let dst = destination.as_path();
-
-        if opts.create_parent_dirs {
-            if let Some(parent) = dst.parent().filter(|p| !p.as_os_str().is_empty()) {
-                rec.run(parent, Operation::CreateDir, None, |_| fs::create_dir_all(parent))?;
-            }
-        }
 
         // Disk-full is the classic "free some space, then Retry" case, so a
         // failed pre-check goes to the handler rather than aborting outright.
