@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/fc-engine", "crates/fc-cli", "crates/fc-gui", "crates/fc-remote", "crates/fc-web", "crates/fc-agent", "crates/fc-torrent"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"

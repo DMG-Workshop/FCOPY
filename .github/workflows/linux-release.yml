@@ -254,7 +254,7 @@ jobs:
         run: cargo test --locked --workspace
       - name: Lint workspace
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - name: Build unsigned desktop and CLI
+      - name: Build self-contained unsigned desktop and CLI
         run: cargo build --locked --release -p fc-cli -p fc-gui
       - name: Locate installer compiler
         run: |

@@ -128,6 +128,10 @@ try {
         throw 'Installer is not unsigned as labeled'
     }
     Expand-Archive -LiteralPath $archive -DestinationPath $portable
+    & (Join-Path $PSScriptRoot 'test-runtime.ps1') -Binary @(
+        (Join-Path $portable 'fcopy.exe'),
+        (Join-Path $portable 'fcopy-gui.exe')
+    )
     $payload = @(Get-ChildItem -LiteralPath $portable -Recurse -File)
     if ($payload.Count -ne 4) { throw 'Portable payload must have only CLI, GUI, README and unsigned notice' }
     foreach ($name in @('fcopy.exe', 'fcopy-gui.exe')) {

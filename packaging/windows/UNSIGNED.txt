@@ -10,5 +10,6 @@ if you trust its source. Do not disable SmartScreen or antivirus globally.
 
 The installer is per-user and does not request administrator access.
 Explorer integration is optional. No agent or web service is installed.
+The Visual C++ runtime is linked statically; no separate runtime install is needed.
 Uninstall removes program files and owned integration, not copied data,
 saved profiles, settings, history or recovery state.

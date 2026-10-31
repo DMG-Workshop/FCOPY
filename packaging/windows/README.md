@@ -12,6 +12,10 @@ Windows 10 (1809+) / Windows 11 x64 are the intended desktop platforms.
 CI uses Windows Server 2022; interactive desktop behavior also has a separate
 local Windows regression script.
 
+Starting with v0.1.2, both executables statically link the Visual C++ runtime:
+no separate Visual C++ Redistributable installation is needed. v0.1.1 instead
+requires the Microsoft Visual C++ x64 runtime to already be installed.
+
 ## Unsigned builds
 
 **The installer and executables are not Authenticode signed.** Expect Windows
@@ -91,6 +95,12 @@ cargo build --locked --release -p fc-cli -p fc-gui
 .\packaging\windows\build.ps1
 .\packaging\windows\test-packages.ps1
 ```
+
+The repository's `.cargo/config.toml` enables static runtime linking on MSVC
+targets only. Do not override it with dynamic-CRT `RUSTFLAGS`. Both the package
+builder and smoke test inspect DLL imports with MSVC `dumpbin.exe` and reject
+executables that require redistributable Visual C++ runtime DLLs, even when
+those DLLs happen to be installed on the build/test machine.
 
 Pass `-Compiler C:\Path\ISCC.exe` if the compiler is not in its standard location.
 Packages go to `dist`. The package smoke test uses isolated paths, checks

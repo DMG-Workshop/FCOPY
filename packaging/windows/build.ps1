@@ -33,6 +33,10 @@ try {
     if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
         throw "Tag $env:GITHUB_REF_NAME does not match v$version"
     }
+    & (Join-Path $PSScriptRoot 'test-runtime.ps1') -Binary @(
+        (Join-Path $root 'target\release\fcopy.exe'),
+        (Join-Path $root 'target\release\fcopy-gui.exe')
+    )
     New-Item -ItemType Directory -Path $stage, $OutputDirectory -Force | Out-Null
     foreach ($name in @('fcopy.exe', 'fcopy-gui.exe')) {
         $binary = Join-Path $root "target\release\$name"
