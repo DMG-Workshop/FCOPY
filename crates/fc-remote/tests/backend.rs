@@ -164,6 +164,61 @@ fn a_dropped_connection_mid_file_reconnects_and_resumes() {
 }
 
 #[test]
+fn recovered_upload_resumes_but_retry_starts_at_zero_with_a_new_backend() {
+    use fc_remote::client::{PushControl, PushRequest, Session};
+    use fc_remote::protocol::HashAlgo;
+    use fc_remote::recovery::{Action, Job, RecoveryStore};
+
+    let a = agent();
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("recover.bin");
+    let bytes = data(6 * 1024 * 1024, 17);
+    std::fs::write(&source, &bytes).unwrap();
+    for action in [Action::Resume, Action::Retry] {
+        let remote = backend(&a, &a.fingerprint);
+        let descriptor = remote.recovery_destination(None).unwrap();
+        let request = TransferRequest::to_backend(vec![source.clone()], remote);
+        let job = Job::new(&request, descriptor, None, &CopyOptions::default()).unwrap();
+        let path = root.path().join("recovery.toml");
+        let mut store = RecoveryStore::open(Some(path.clone())).unwrap();
+        let saved_id = store.add(job).unwrap();
+        drop(request);
+        drop(store);
+
+        // A previous process left a compatible, fsynced partial upload.
+        a._rt.block_on(async {
+            let spec = RemoteSpec::parse(&format!("alice@127.0.0.1:{}:/backup/dest", a.port)).unwrap();
+            let connector = Connector::new(spec).password("agent-pass-1").pinned(Some(a.fingerprint.clone()));
+            let session = Session::open(&connector, None).await.unwrap();
+            session.make_dir("backup/dest").await.unwrap();
+            a.handle.hooks().drop_after_bytes.store(2 * 1024 * 1024, std::sync::atomic::Ordering::SeqCst);
+            let control = fc_engine::JobControl::new();
+            let req = PushRequest { local: &source, remote: "backup/dest/recover.bin", algo: HashAlgo::Xxh3, overwrite: true, source_id: None };
+            assert!(session.push_file(&req, &PushControl { control: &control, limiter: None }, &()).await.unwrap_err().is_retryable());
+        });
+        assert!(a.share.path().join("dest/recover.bin.fcpart").exists());
+        let prior_sessions: std::collections::HashSet<_> = a.handle.sessions().iter().map(|session| session.id).collect();
+        let store = RecoveryStore::open(Some(path)).unwrap();
+        let request = store.get(saved_id).unwrap().request(action, "agent-pass-1".into()).unwrap();
+        let (queue, events) = queue();
+        let id = queue.add(request);
+        assert_eq!(finished(&events, id), JobState::Completed);
+        let active = a.handle.sessions();
+        let received: u64 = active.iter().filter(|s| !prior_sessions.contains(&s.id) && s.files_completed > 0).map(|s| s.bytes_received).sum();
+        if action == Action::Resume {
+            assert!(received > 0 && received < bytes.len() as u64, "resume must transmit only the remaining bytes, received {received}");
+        } else {
+            assert_eq!(received, bytes.len() as u64, "Retry must transmit from offset zero");
+        }
+        assert_eq!(std::fs::read(a.share.path().join("dest/recover.bin")).unwrap(), bytes);
+        queue.shutdown();
+        drop(queue);
+        std::fs::remove_file(a.share.path().join("dest/recover.bin")).unwrap();
+    }
+    a.handle.shutdown();
+}
+
+#[test]
 fn an_identity_change_fails_the_job_without_retrying_forever() {
     let a = agent();
     let src_root = tempfile::tempdir().unwrap();

@@ -1502,14 +1502,20 @@ dependencies = [
 name = "fc-gui"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "eframe",
  "egui",
  "embed-resource",
  "fc-engine",
  "fc-remote",
  "fc-torrent",
+ "fs4",
+ "raw-window-handle",
+ "serde",
  "tempfile",
  "tokio",
+ "toml",
+ "windows-sys 0.61.2",
  "winreg",
 ]
 

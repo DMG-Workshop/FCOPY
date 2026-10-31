@@ -255,6 +255,8 @@ async fn dashboard_assets_are_served_with_a_strict_policy() {
         ("/", "text/html"),
         ("/static/app.js", "text/javascript"),
         ("/static/app.css", "text/css"),
+        ("/static/console.css", "text/css"),
+        ("/static/appearance.js", "text/javascript"),
         ("/static/alpine.min.js", "text/javascript"),
     ] {
         let mut req = Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap();

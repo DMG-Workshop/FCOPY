@@ -134,6 +134,210 @@ async fn history_job(e: &Env, cookie: &str, name: &str) -> u64 {
     response.json["id"].as_u64().unwrap()
 }
 
+async fn restart_recovery(e: &mut Env) {
+    e.state.queue.shutdown();
+    let (queue, events) = Queue::start(QueueConfig::default());
+    let state = build(queue, events, Config {
+        roots: vec![e.root.path().into()], cookie_secure: false,
+        hash_cost: HashCost { m_kib: 256, t: 1, p: 1 },
+        state_dir: Some(e.state_dir.path().into()), ..Default::default()
+    }).unwrap();
+    state.users.add("admin", "admin-password", Role::Admin).unwrap();
+    state.users.add("bob", "bobs-password", Role::User).unwrap();
+    e.router = router(state.clone());
+    e.state = state;
+    // Let any old event-reader references finish and release advisory claims.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+}
+
+#[tokio::test]
+async fn recovery_restarts_paused_and_resumes_with_content_comparison() {
+    let mut e = env().await;
+    let bob = login(&e, "bob", "bobs-password").await;
+    e.state.queue.pause();
+    history_job(&e, &bob, "recover-local").await;
+    assert!(send(&e, "GET", "/api/recovery", Some(&bob), None).await.json["jobs"].as_array().unwrap().is_empty(), "active records are not recoverable twice");
+    restart_recovery(&mut e).await;
+    let bob = login(&e, "bob", "bobs-password").await;
+    let rows = send(&e, "GET", "/api/recovery", Some(&bob), None).await;
+    assert_eq!(rows.status, StatusCode::OK);
+    assert_eq!(rows.json["jobs"][0]["state"], "paused");
+    assert_eq!(rows.json["persistent"], true);
+    assert!(e.state.queue.jobs().is_empty());
+    assert!(!e.root.path().join("history-out").exists());
+    let id = rows.json["jobs"][0]["id"].as_u64().unwrap();
+    let out = e.root.path().join("history-out");
+    std::fs::create_dir(&out).unwrap();
+    std::fs::write(out.join("recover-local"), b"history bytes").unwrap();
+    let response = send(&e, "POST", &format!("/api/recovery/{id}"), Some(&bob), Some(json!({"action":"resume"}))).await;
+    assert_eq!(response.status, StatusCode::ACCEPTED, "{:?}", response.json);
+    let history = history_entries(&e, &bob, 1).await;
+    assert_eq!(history["entries"][0]["files_copied"], 0);
+    assert_eq!(history["entries"][0]["files_skipped"], 1);
+    assert_eq!(std::fs::read(out.join("recover-local")).unwrap(), b"history bytes");
+    assert!(send(&e, "GET", "/api/recovery", Some(&bob), None).await.json["jobs"].as_array().unwrap().is_empty());
+    assert_eq!(send(&e, "POST", &format!("/api/recovery/{id}"), Some(&bob), Some(json!({"action":"resume"}))).await.status, StatusCode::NOT_FOUND);
+    e.state.queue.shutdown();
+    e.agent.shutdown();
+}
+
+#[tokio::test]
+async fn recovery_is_owner_scoped_csrf_protected_and_discard_keeps_partial_data() {
+    let mut e = env().await;
+    let bob = login(&e, "bob", "bobs-password").await;
+    let admin = login(&e, "admin", "admin-password").await;
+    e.state.queue.pause();
+    history_job(&e, &bob, "bob-recovery").await;
+    history_job(&e, &admin, "admin-recovery").await;
+    restart_recovery(&mut e).await;
+    let bob = login(&e, "bob", "bobs-password").await;
+    let admin = login(&e, "admin", "admin-password").await;
+    assert_eq!(send(&e, "GET", "/api/recovery", None, None).await.status, StatusCode::UNAUTHORIZED);
+    let own = send(&e, "GET", "/api/recovery", Some(&bob), None).await.json;
+    let all = send(&e, "GET", "/api/recovery", Some(&admin), None).await.json;
+    assert_eq!(own["jobs"].as_array().unwrap().len(), 1);
+    assert_eq!(all["jobs"].as_array().unwrap().len(), 2);
+    let other = all["jobs"].as_array().unwrap().iter().find(|j| j["owner"] == "admin").unwrap()["id"].as_u64().unwrap();
+    assert_eq!(send(&e, "POST", &format!("/api/recovery/{other}"), Some(&bob), Some(json!({"action":"discard"}))).await.status, StatusCode::NOT_FOUND);
+    let id = own["jobs"][0]["id"].as_u64().unwrap();
+    let uri = format!("/api/recovery/{id}");
+    let mut request = Request::builder().method("POST").uri(&uri).header(COOKIE, &bob).header(CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"action":"discard"}"#)).unwrap();
+    request.extensions_mut().insert(ConnectInfo(fc_web::https::PeerAddr(SocketAddr::from(([127, 0, 0, 1], 40_000)))));
+    assert_eq!(e.router.clone().oneshot(request).await.unwrap().status(), StatusCode::FORBIDDEN);
+    let partial = e.root.path().join("history-out/bob-recovery.fcpart");
+    std::fs::create_dir(partial.parent().unwrap()).unwrap();
+    std::fs::write(&partial, b"preserve partial").unwrap();
+    assert_eq!(send(&e, "POST", &uri, Some(&bob), Some(json!({"action":"discard"}))).await.status, StatusCode::NO_CONTENT);
+    assert_eq!(std::fs::read(partial).unwrap(), b"preserve partial");
+    assert!(e.state.queue.jobs().is_empty());
+    // Admin resuming Bob's jobs must keep Bob as the owner (covered below by a new record).
+    e.state.queue.pause();
+    history_job(&e, &bob, "admin-resumes-bob").await;
+    restart_recovery(&mut e).await;
+    let admin = login(&e, "admin", "admin-password").await;
+    let rows = send(&e, "GET", "/api/recovery", Some(&admin), None).await.json;
+    let id = rows["jobs"].as_array().unwrap().iter().find(|j| j["label"] == "admin-resumes-bob").unwrap()["id"].as_u64().unwrap();
+    assert_eq!(send(&e, "POST", &format!("/api/recovery/{id}"), Some(&admin), Some(json!({"action":"retry"}))).await.status, StatusCode::ACCEPTED);
+    let bob = login(&e, "bob", "bobs-password").await;
+    assert_eq!(history_entries(&e, &bob, 1).await["entries"][0]["owner"], "bob");
+    e.state.queue.shutdown();
+    e.agent.shutdown();
+}
+
+#[tokio::test]
+async fn recovery_save_failure_prevents_execution_and_changed_roots_are_rechecked() {
+    let mut e = env().await;
+    let bob = login(&e, "bob", "bobs-password").await;
+    let src = e.root.path().join("not-started");
+    std::fs::write(&src, b"safe").unwrap();
+    let blocker = e.state_dir.path().join("unfinished-jobs.tmp");
+    std::fs::create_dir(&blocker).unwrap();
+    let r = send(&e, "POST", "/api/transfers", Some(&bob), Some(json!({"sources":[src],"dest":e.root.path().join("out")}))).await;
+    assert_eq!(r.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(r.json["error"].as_str().unwrap().contains("not started"));
+    assert!(e.state.queue.jobs().is_empty());
+    assert!(!e.root.path().join("out").exists());
+    std::fs::remove_dir(blocker).unwrap();
+    e.state.queue.pause();
+    history_job(&e, &bob, "root-changes").await;
+    restart_recovery(&mut e).await;
+    let bob = login(&e, "bob", "bobs-password").await;
+    let id = send(&e, "GET", "/api/recovery", Some(&bob), None).await.json["jobs"][0]["id"].as_u64().unwrap();
+    // A once-valid source has disappeared. Recovery must not blindly enqueue it.
+    std::fs::remove_file(e.root.path().join("root-changes")).unwrap();
+    assert_eq!(send(&e, "POST", &format!("/api/recovery/{id}"), Some(&bob), Some(json!({"action":"resume"}))).await.status, StatusCode::BAD_REQUEST);
+    assert!(e.state.queue.jobs().is_empty());
+    assert_eq!(send(&e, "GET", "/api/recovery", Some(&bob), None).await.json["jobs"].as_array().unwrap().len(), 1);
+    // A formerly allowed root is not necessarily shared by the current config.
+    let former_root = tempfile::tempdir().unwrap();
+    let source = former_root.path().join("outside-current-shares");
+    std::fs::write(&source, b"former share").unwrap();
+    let request = fc_engine::TransferRequest::into_dir(vec![source], e.root.path().join("out"));
+    let job = fc_remote::recovery::Job::new(&request, fc_remote::recovery::Destination::Directory { path: e.root.path().join("out") }, Some("bob".into()), &CopyOptions::default()).unwrap();
+    let mut store = fc_remote::recovery::RecoveryStore::open(Some(e.state_dir.path().join("unfinished-jobs.toml"))).unwrap();
+    let outside = store.add(job).unwrap();
+    assert_eq!(send(&e, "POST", &format!("/api/recovery/{outside}"), Some(&bob), Some(json!({"action":"resume"}))).await.status, StatusCode::BAD_REQUEST);
+    assert!(e.state.queue.jobs().is_empty());
+    e.state.queue.shutdown();
+    e.agent.shutdown();
+}
+
+#[tokio::test]
+async fn recovery_keeps_active_jobs_on_shutdown_but_not_explicit_cancel() {
+    let mut e = env().await;
+    let bob = login(&e, "bob", "bobs-password").await;
+    std::fs::create_dir(e.root.path().join("history-out")).unwrap();
+    std::fs::write(e.root.path().join("history-out/active-shutdown"), b"different").unwrap();
+    history_job(&e, &bob, "active-shutdown").await;
+    wait_for_conflict(&e, &bob, None).await;
+    e.state.queue.shutdown();
+    history_entries(&e, &bob, 1).await;
+    restart_recovery(&mut e).await;
+    let bob = login(&e, "bob", "bobs-password").await;
+    let rows = send(&e, "GET", "/api/recovery", Some(&bob), None).await.json;
+    assert_eq!(rows["jobs"].as_array().unwrap().len(), 1);
+    let id = rows["jobs"][0]["id"].as_u64().unwrap();
+    let resumed = send(&e, "POST", &format!("/api/recovery/{id}"), Some(&bob), Some(json!({"action":"resume"}))).await;
+    assert_eq!(resumed.status, StatusCode::ACCEPTED);
+    let conflict = wait_for_conflict(&e, &bob, None).await;
+    assert_eq!(conflict["different"], true, "Resume must ask again for different content");
+    let live_id = resumed.json["id"].as_u64().unwrap();
+    assert_eq!(send(&e, "POST", &format!("/api/recovery/{id}"), Some(&bob), Some(json!({"action":"retry"}))).await.status, StatusCode::CONFLICT);
+    assert_eq!(send(&e, "DELETE", &format!("/api/transfers/{live_id}"), Some(&bob), None).await.status, StatusCode::NO_CONTENT);
+    history_entries(&e, &bob, 2).await;
+    assert!(send(&e, "GET", "/api/recovery", Some(&bob), None).await.json["jobs"].as_array().unwrap().is_empty());
+    assert_eq!(std::fs::read(e.root.path().join("history-out/active-shutdown")).unwrap(), b"different");
+    e.state.queue.shutdown();
+    e.agent.shutdown();
+}
+
+#[tokio::test]
+async fn recovery_remote_jobs_prompt_again_and_bad_credentials_preserve_recovery() {
+    let mut e = env().await;
+    let admin = login(&e, "admin", "admin-password").await;
+    let client = paired_client(&e, &admin).await;
+    std::fs::write(e._share.path().join("remote-source"), b"download me").unwrap();
+    e.state.queue.pause();
+    for (direction, sources, dest) in [
+        ("upload", vec![e.root.path().join("upload-source")], std::path::PathBuf::from("backup/recovered")),
+        ("download", vec![std::path::PathBuf::from("backup/remote-source")], e.root.path().join("downloaded")),
+    ] {
+        if direction == "upload" { std::fs::write(&sources[0], b"upload me").unwrap(); }
+        let r = send(&e, "POST", "/api/transfers", Some(&admin), Some(json!({
+            "sources": sources, "dest":dest, "remote":{"client_id":client,"password":"agent-pass-1","direction":direction}
+        }))).await;
+        assert_eq!(r.status, StatusCode::ACCEPTED, "{:?}", r.json);
+    }
+    let saved = std::fs::read_to_string(e.state_dir.path().join("unfinished-jobs.toml")).unwrap();
+    assert!(!saved.contains("agent-pass-1") && !saved.contains("password") && !saved.contains("token"));
+    restart_recovery(&mut e).await;
+    let admin = login(&e, "admin", "admin-password").await;
+    let rows = send(&e, "GET", "/api/recovery", Some(&admin), None).await.json;
+    assert_eq!(rows["jobs"].as_array().unwrap().len(), 2);
+    assert!(!rows.to_string().contains("agent-pass-1"));
+    assert!(e.state.queue.jobs().is_empty());
+    assert!(!e.root.path().join("downloaded").exists());
+    let upload = rows["jobs"].as_array().unwrap().iter().find(|j| j["destination"]["kind"] == "upload").unwrap()["id"].as_u64().unwrap();
+    let uri = format!("/api/recovery/{upload}");
+    assert_eq!(send(&e, "POST", &uri, Some(&admin), Some(json!({"action":"resume"}))).await.status, StatusCode::BAD_REQUEST);
+    assert!(e.state.queue.jobs().is_empty());
+    assert_eq!(send(&e, "POST", &uri, Some(&admin), Some(json!({"action":"resume","password":"wrong-password"}))).await.status, StatusCode::ACCEPTED);
+    history_entries(&e, &admin, 1).await;
+    let rows = send(&e, "GET", "/api/recovery", Some(&admin), None).await.json;
+    assert_eq!(rows["jobs"].as_array().unwrap().len(), 2, "failed authentication must not lose the saved job");
+    assert_eq!(send(&e, "POST", &uri, Some(&admin), Some(json!({"action":"resume","password":"agent-pass-1"}))).await.status, StatusCode::ACCEPTED);
+    history_entries(&e, &admin, 2).await;
+    let download = rows["jobs"].as_array().unwrap().iter().find(|j| j["destination"]["kind"] == "download").unwrap()["id"].as_u64().unwrap();
+    assert_eq!(send(&e, "POST", &format!("/api/recovery/{download}"), Some(&admin), Some(json!({"action":"resume","password":"agent-pass-1"}))).await.status, StatusCode::ACCEPTED);
+    history_entries(&e, &admin, 3).await;
+    assert_eq!(std::fs::read(e._share.path().join("recovered/upload-source")).unwrap(), b"upload me");
+    assert_eq!(std::fs::read(e.root.path().join("downloaded/remote-source")).unwrap(), b"download me");
+    assert!(send(&e, "GET", "/api/recovery", Some(&admin), None).await.json["jobs"].as_array().unwrap().is_empty());
+    e.state.queue.shutdown();
+    e.agent.shutdown();
+}
+
 #[tokio::test]
 async fn history_survives_restart_filters_owners_and_clears_without_touching_files() {
     let mut e = env().await;

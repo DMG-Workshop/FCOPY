@@ -105,7 +105,7 @@ impl History {
     pub fn show(&mut self, ui: &mut egui::Ui) {
         ui.heading("Transfer history");
         ui.label("Latest 1,000 finished jobs on this PC. History does not restart transfers.");
-        if let Some(error) = &self.error { ui.colored_label(crate::app::BAD, error); }
+        if let Some(error) = &self.error { ui.colored_label(crate::app::bad(ui), error); }
         ui.horizontal_wrapped(|ui| {
             ui.label("Search");
             ui.text_edit_singleline(&mut self.search);

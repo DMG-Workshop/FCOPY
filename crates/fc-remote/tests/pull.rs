@@ -344,6 +344,41 @@ fn a_changed_remote_file_is_not_resumed_from_a_stale_partial() {
 }
 
 #[test]
+fn retry_discards_compatible_partial_but_keeps_real_identity_for_reconnect() {
+    let a = agent();
+    let bytes = data(6 * MIB, 7);
+    fs::write(a.share.path().join("retry.bin"), &bytes).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let local = out.path().join("retry.bin");
+    let control = JobControl::new();
+    let ctl = PushControl { control: &control, limiter: None };
+    let req = request("backup/retry.bin", &local, false);
+    for resume in [true, false] {
+        a.handle.hooks().drop_pull_after_bytes.store((2 * MIB) as u64, Ordering::SeqCst);
+        let s = a.login(None);
+        assert!(a.rt.block_on(s.pull_file_with_resume(&req, &ctl, &(), resume)).unwrap_err().is_retryable());
+        assert!(fs::metadata(out.path().join("retry.bin.fcpart")).unwrap().len() > 0);
+    }
+    let s = a.login(None);
+    let done = a.rt.block_on(s.pull_file(&req, &ctl, &())).unwrap();
+    assert!(done.resumed_from > 0, "a reconnect after a fresh retry can resume");
+    assert_eq!(fs::read(local).unwrap(), bytes);
+    no_leftovers(out.path());
+
+    // A compatible partial must be ignored when Retry is explicitly chosen.
+    let local = out.path().join("retry-again.bin");
+    let req = request("backup/retry.bin", &local, false);
+    a.handle.hooks().drop_pull_after_bytes.store((2 * MIB) as u64, Ordering::SeqCst);
+    let s = a.login(None);
+    assert!(a.rt.block_on(s.pull_file(&req, &ctl, &())).is_err());
+    let s = a.login(None);
+    let done = a.rt.block_on(s.pull_file_with_resume(&req, &ctl, &(), false)).unwrap();
+    assert_eq!(done.resumed_from, 0);
+    assert_eq!(fs::read(local).unwrap(), bytes);
+    a.handle.shutdown();
+}
+
+#[test]
 fn pausing_the_agent_stalls_a_download_until_it_resumes() {
     let a = agent();
     let bytes = data(3 * MIB, 4);

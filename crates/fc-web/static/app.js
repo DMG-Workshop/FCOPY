@@ -87,6 +87,10 @@ function fcopy() {
     socket: null,
     retry: 1000,
     live: false,
+    appearance: { ...FCOPYAppearance.initial.preferences },
+    appearanceNotice: FCOPYAppearance.initial.error,
+    appearanceTheme: '',
+    monitorOpen: false,
 
     // mode, queue
     mode: 'local',
@@ -102,6 +106,13 @@ function fcopy() {
     historyBusy: false,
     historyPersistent: true,
     historyRequest: 0,
+    recovered: [],
+    recoveryPersistent: true,
+    recoveryNotice: '',
+    recoveryBusy: false,
+    recoveryRequest: 0,
+    recoverySelected: null,
+    recoveryPassword: '',
     logs: [],
     logOpen: false,
     graphHistory: [],
@@ -119,7 +130,7 @@ function fcopy() {
     remoteBrowser: { path: '', entries: [], busy: false, error: '' },
     settingsForm: { limitMiB: 0, policy: 'retry' },
     settingsNotice: '',
-    settingsTab: 'accounts',
+    settingsTab: 'appearance',
     vpnProviders: [],
     vpnProvider: 'nordvpn',
     vpnLoading: false,
@@ -140,6 +151,12 @@ function fcopy() {
     torrentNotice: '',
 
     async start() {
+      this.previewAppearance();
+      FCOPYAppearance.media.addEventListener('change', () => this.previewAppearance());
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) this.previewAppearance();
+      });
+      setInterval(() => this.previewAppearance(), 30_000);
       const info = await fetch("/api/info", { credentials: "same-origin" });
       if (info.ok) {
         const body = await info.json();
@@ -153,8 +170,37 @@ function fcopy() {
         this.connect();
         if (this.isAdmin()) this.loadSettings();
         this.loadQueueState();
+        this.loadRecovery();
       }
       this.paint(0);
+    },
+
+    previewAppearance() {
+      try {
+        this.appearanceTheme = FCOPYAppearance.apply(this.appearance);
+      } catch (e) {
+        this.appearanceNotice = `Appearance was not applied: ${e.message}`;
+      }
+    },
+
+    saveAppearance() {
+      try {
+        FCOPYAppearance.save(this.appearance);
+        this.previewAppearance();
+        this.appearanceNotice = 'Appearance saved in this browser on this device.';
+      } catch (e) {
+        this.appearanceNotice = `Appearance was not saved: ${e.message}`;
+      }
+    },
+
+    queueOverview() {
+      const jobs = Object.values(this.jobs);
+      const total = jobs.reduce((n, j) => n + (j.bytes_total || 0), 0);
+      const processed = jobs.reduce((n, j) => n + (j.bytes_total || 0) * Math.max(0, Math.min(100, j.percent || 0)) / 100, 0);
+      const active = jobs.find(j => j.state === 'running' || j.state === 'paused');
+      return { percent: total ? Math.round(processed / total * 100) : 0, total, processed,
+        jobs: jobs.length, pending: jobs.some(j => j.state === 'pending'),
+        active: active?.label || 'No active transfer', eta: active?.state === 'running' ? fmtEta(active.eta_secs) : '--' };
     },
 
     isAdmin() {
@@ -187,6 +233,7 @@ function fcopy() {
       this.resetHistory();
       this.user = await r.json();
       this.connect();
+      this.loadRecovery();
       if (this.isAdmin()) this.loadSettings();
     },
 
@@ -199,6 +246,7 @@ function fcopy() {
       this.mode = 'local';
       this.jobs = {};
       this.resetHistory();
+      this.resetRecovery();
       this.logs = [];
       this.selected = {};
       this.torrents = [];
@@ -230,6 +278,7 @@ function fcopy() {
           if (!r.ok) {
             this.user = null;
             this.resetHistory();
+            this.resetRecovery();
             return;
           }
           this.connect();
@@ -259,9 +308,76 @@ function fcopy() {
       if (this.mode === 'history' && !this.historyBusy && (frame.jobs || []).some((job) => !this.isActive(job.state))) {
         this.loadHistory();
       }
+      if (!this.recoveryBusy && (frame.jobs || []).some((job) => !this.isActive(job.state))) {
+        this.loadRecovery();
+      }
     },
 
     // ---------- finished-job history ----------
+
+    resetRecovery() {
+      this.recovered = [];
+      this.recoveryNotice = '';
+      this.recoveryPassword = '';
+      this.recoverySelected = null;
+      this.recoveryBusy = false;
+      ++this.recoveryRequest;
+    },
+
+    async loadRecovery() {
+      const request = ++this.recoveryRequest;
+      const user = this.user;
+      this.recoveryBusy = true;
+      this.recoveryNotice = '';
+      try {
+        const r = await this.api('GET', '/api/recovery');
+        if (!r.ok) throw new Error(await errorText(r));
+        const body = await r.json();
+        if (this.user !== user || request !== this.recoveryRequest) return;
+        this.recovered = body.jobs;
+        this.recoveryPersistent = body.persistent;
+        this.recoveryNotice = body.error || '';
+      } catch (e) {
+        if (this.user === user && request === this.recoveryRequest) this.recoveryNotice = `Cannot load recovery: ${e.message}`;
+      } finally {
+        if (this.user === user && request === this.recoveryRequest) this.recoveryBusy = false;
+      }
+    },
+
+    recoveryRemote(job) {
+      return ['upload', 'download'].includes(job.destination.kind);
+    },
+
+    recoveryDestination(job) {
+      const d = job.destination;
+      return d.kind === 'download' ? `${d.path} (from ${d.target})` : (d.target || d.path);
+    },
+
+    async recover(job, action) {
+      if (this.recoveryBusy) return;
+      if (action === 'discard' && !window.confirm(`Discard saved job "${job.label}"? Copied data and partial files are left untouched.`)) return;
+      const user = this.user;
+      const password = this.recoverySelected === job.id ? this.recoveryPassword : '';
+      this.recoveryPassword = '';
+      this.recoveryBusy = true;
+      this.recoveryNotice = '';
+      ++this.recoveryRequest;
+      try {
+        const r = await this.api('POST', `/api/recovery/${job.id}`, { action, password: action === 'discard' ? '' : password });
+        if (!r.ok) throw new Error(await errorText(r));
+        if (this.user !== user) return;
+        this.recoverySelected = null;
+        await this.loadRecovery();
+      } catch (e) {
+        if (this.user === user) this.recoveryNotice = `${action === 'discard' ? 'Job was not discarded' : 'Job was not started'}: ${e.message}`;
+      } finally {
+        if (this.user === user) {
+          this.recoveryBusy = false;
+          this.recoveryPassword = '';
+          this.recoverySelected = null;
+        }
+      }
+    },
 
     resetHistory() {
       this.history = [];
@@ -496,8 +612,12 @@ function fcopy() {
     openModal(name) {
       this.modal = name;
       if (name === 'settings') {
-        this.loadUsers();
-        this.loadVpnProviders();
+        if (this.isAdmin()) {
+          this.loadUsers();
+          this.loadVpnProviders();
+        } else {
+          this.settingsTab = 'appearance';
+        }
       }
       if (name === 'add') {
         this.addNotice = '';
@@ -575,6 +695,8 @@ function fcopy() {
     },
 
     async setMode(m) {
+      this.recoveryPassword = '';
+      this.recoverySelected = null;
       this.mode = m;
       clearInterval(this.clientTimer);
       this.clientTimer = null;
@@ -583,6 +705,7 @@ function fcopy() {
         this.clientTimer = setInterval(() => this.loadClients(), 10000);
       }
       if (m === 'history') await this.loadHistory();
+      if (m === 'recovery') await this.loadRecovery();
     },
 
     async create() {

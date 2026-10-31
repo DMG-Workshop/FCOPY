@@ -139,12 +139,17 @@ per-file hooks, `Progress::count_file` (for concurrent small files),
    - Copy-to selector: Local path / Remote PC.
    - Dashboard link panel when `Snapshot.link` is present: RTT, acked vs sent, reconnects, "paused by remote".
 
-Not planned yet: single-instance IPC for the GUI, the Windows 11 modern context menu
+Not planned yet: the Windows 11 modern context menu
 (IExplorerCommand + sparse MSIX).
 
 ## Status: remote agent work (updated)
 
 Done since the handoff, each with tests:
+- Desktop single-instance handoff (`fc-gui/instance.rs`): one GUI queue per client
+  config directory, OS file lock plus authenticated bounded loopback IPC, sender-side
+  absolute paths, crash-safe ownership and draft-preserving ordered launches.
+  Windows foreground permission and native restoration are wired; interactive
+  regression script: `packaging/windows/test-single-instance.ps1`.
 - `RemoteBackend` (fc-remote/backend.rs): queue jobs to a paired PC. Reconnect with token then password, resume, identity refusal.
 - `fcopy-agent` (fc-agent): init, serve, fingerprint, share, user, unattended, allow, service install/uninstall/run (Windows service verified on this PC). systemd and launchd files in packaging/.
 - LAN discovery (fc-remote/discovery.rs): advertise and browse `_fcopy._udp.local.`. The agent announces itself when `discovery = true`.
@@ -165,6 +170,16 @@ Done since the handoff, each with tests:
   Web destinations remain confined to the console host's configured roots.
   Pause/resume, skip, cancel, shared live rate limits, reconnect/resume, and read-back comparison are tested.
 - Desktop GUI: Copy to a PC on the network; redesigned window (tab bar, sidebar, queue table, status bar).
+- Desktop/web appearance: shared queue-first orange console styling, planned-byte
+  progress summary and separate torrent lane. Desktop has a wide-screen telemetry
+  monitor; web uses cards and a collapsible monitor on narrow screens. Both offer
+  Light/Dark/Low-contrast/High-contrast/System, independent warm tint and manual or
+  local-time scheduled Night Shift. System tracks OS light/dark changes. Warmth is
+  app-only, takes the stronger filter (never adds them), and changes color accuracy.
+  Settings preview immediately; explicit Save persists desktop `appearance.toml`
+  or browser-local `fcopy.appearance.v1`. Never send browser appearance to the host.
+  `static/console.css` is authored CSS loaded after generated `static/app.css`;
+  `appearance.js` loads before `app.js` to apply the initial palette before paint.
 - File conflicts: desktop/web default to Ask; Replace, Skip, Keep both, Compare and
   job-scoped apply-all work for local copies/uploads/downloads. Compare skips identical
   files and asks again for differences. CLI `--conflict` supports unattended policies.
@@ -175,7 +190,20 @@ Done since the handoff, each with tests:
   thread even without subscribers. Desktop sidebar/web History offer search,
   details and confirmed clear. Web GET/DELETE `/api/history` are owner-scoped
   (admins see/clear all); absent `Config.state_dir` means memory-only history.
-  Failed writes are surfaced and retried on refresh. No queue recovery/CLI/torrent history.
+  Failed writes are surfaced and retried on refresh. No CLI/torrent history.
+- Queue recovery: shared `fc-remote::recovery` persists credential-free jobs before
+  enqueueing. Desktop `unfinished-desktop-jobs.toml` uses a background worker; web
+  `unfinished-jobs.toml` uses `Config.state_dir` (otherwise explicitly memory-only).
+  Jobs reopen paused, separate from the live queue, with Resume/Retry/Discard.
+  Resume compares destinations, skips identical content and asks for differences;
+  compatible remote partials resume with verification. Local interrupted files
+  restart from zero. Retry resets unfinished files once, then allows reconnect
+  resume. Discard never deletes data. Remote passwords are prompted again; saved
+  pins remain mandatory. Cross-process per-job claims prevent duplicate starts.
+  Shutdown interruption and failures retain records; success and explicit live
+  cancellation/removal clear them. Web GET `/api/recovery` and POST
+  `/api/recovery/{id}` enforce ownership/CSRF and current local roots; remote
+  recovery is admin-only. No CLI/torrent queue recovery.
 - Saved desktop PCs: Remote PCs supports create/edit/remove and background TLS connection
   tests; Add task selects saved profiles for upload/download. `desktop-profiles.toml`
   stores names, targets and explicitly confirmed pins, never passwords. Profile pins

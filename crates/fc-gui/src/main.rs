@@ -21,15 +21,19 @@
 //! * The UI thread **never blocks**: it drains with `try_recv()`.
 //! * egui coalesces repaint requests, and telemetry is throttled to ~10 Hz at
 //!   the source, so a 100 000-file job costs the same UI time as a 1-file job.
-//! * While idle the app does not repaint at all (0 % CPU).
+//! * Idle windows check scheduled appearance changes periodically; a visible
+//!   transfer monitor also repaints to keep its rolling graph current.
 
 // Release builds on Windows are GUI-subsystem apps: no console window flashes up
 // when launched from Explorer. Debug builds keep the console for logs.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod appearance;
 mod history;
+mod recovery;
 mod integration;
+mod instance;
 mod remote;
 mod profiles;
 mod state;
@@ -40,6 +44,8 @@ use fc_engine::units::parse_size;
 use std::path::PathBuf;
 
 /// Transfer requested on the command line.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Startup {
     pub sources: Vec<PathBuf>,
     pub dest: Option<PathBuf>,
@@ -47,6 +53,18 @@ pub struct Startup {
     pub verify: bool,
     pub torrent_dht: bool,
     pub torrent_trackers: bool,
+}
+
+impl Startup {
+    fn absolute_paths(&mut self) -> std::io::Result<()> {
+        for path in &mut self.sources {
+            *path = std::path::absolute(&*path)?;
+        }
+        if let Some(path) = &mut self.dest {
+            *path = std::path::absolute(&*path)?;
+        }
+        Ok(())
+    }
 }
 
 fn parse_startup() -> Result<Startup, String> {
@@ -98,18 +116,33 @@ fn parse_startup() -> Result<Startup, String> {
 }
 
 fn main() -> eframe::Result<()> {
-    let startup = match parse_startup() {
+    let mut startup = match parse_startup() {
         Ok(s) => s,
         Err(msg) => {
             eprintln!("{msg}");
             std::process::exit(2);
         }
     };
+    if let Err(error) = startup.absolute_paths() {
+        instance::report_startup_error(&format!("Cannot resolve launch paths: {error}"));
+        std::process::exit(1);
+    }
+    let primary = match instance::connect(&fc_remote::config::default_client_dir(), &startup) {
+        Ok(instance::Connection::Primary(primary)) => primary,
+        Ok(instance::Connection::Forwarded) => return Ok(()),
+        Err(error) => {
+            instance::report_startup_error(&format!(
+                "Could not open FCOPY or contact its existing window: {error}\n\
+                 No second copy queue was started. Try again after closing the existing window."
+            ));
+            std::process::exit(1);
+        }
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("fcopy")
             .with_app_id(integration::APP_ID) // Wayland app id: must match the .desktop file name
-            .with_inner_size([900.0, 620.0])
+            .with_inner_size([1280.0, 720.0])
             .with_min_inner_size([640.0, 420.0])
             .with_drag_and_drop(true),
         ..Default::default()
@@ -117,6 +150,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "fcopy",
         options,
-        Box::new(move |cc| Ok(Box::new(app::FcApp::new(cc, startup)))),
+        Box::new(move |cc| Ok(Box::new(app::FcApp::new(cc, startup, primary)?))),
     )
 }

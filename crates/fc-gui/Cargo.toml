@@ -13,6 +13,10 @@ fc-engine = { path = "../fc-engine" }
 fc-remote = { path = "../fc-remote" }
 fc-torrent = { path = "../fc-torrent" }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1.1.8"
+fs4 = "1.1.0"
 
 [[bin]]
 name = "fcopy-gui"
@@ -20,6 +24,8 @@ path = "src/main.rs"
 
 [target."cfg(windows)".dependencies]
 winreg = "0.56.0"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+raw-window-handle = "0.6"
 
 [build-dependencies]
 embed-resource = "3.0.12"

@@ -370,6 +370,7 @@ struct Inner {
     limiter: Arc<RateLimiter>,
     /// Read on every error, so it can change while a job runs.
     policy: RwLock<ErrorPolicy>,
+    copy_defaults: CopyOptions,
 }
 
 impl Inner {
@@ -442,6 +443,7 @@ impl Queue {
             notify: config.on_event.clone(),
             limiter: limiter.clone(),
             policy: RwLock::new(config.policy),
+            copy_defaults: config.options.clone(),
         });
 
         let mut options = config.options;
@@ -459,6 +461,10 @@ impl Queue {
             .expect("spawn queue worker");
 
         (Queue { inner, worker: Arc::new(Mutex::new(Some(worker))) }, rx)
+    }
+
+    pub fn copy_options(&self) -> CopyOptions {
+        self.inner.copy_defaults.clone()
     }
 
     /// Enqueue a transfer. Runs when everything before it has finished.
@@ -699,6 +705,11 @@ impl Queue {
         while st.active.is_some() || (!st.paused && st.has_pending()) {
             st = self.inner.wake.wait(st).unwrap_or_else(PoisonError::into_inner);
         }
+    }
+
+    /// Whether shutdown has begun, so frontends can preserve interrupted jobs.
+    pub fn is_shutting_down(&self) -> bool {
+        self.inner.lock().shutdown
     }
 
     /// Cancel the active job, stop the worker and wait for it to exit.

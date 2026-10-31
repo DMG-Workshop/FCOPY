@@ -186,12 +186,12 @@ pub async fn create_transfer(
             }
         }
     }
-    let mut request = match req.remote {
+    let (mut request, destination) = match req.remote {
         None => {
             if !within_roots(&s.roots, &req.dest) {
                 return Err(ApiError::BadRequest("destination is outside every share".into()));
             }
-            TransferRequest::into_dir(req.sources, &req.dest)
+            (TransferRequest::into_dir(req.sources, &req.dest), fc_remote::recovery::Destination::Directory { path: req.dest })
         }
         Some(remote) => {
             require_admin(&p)?;
@@ -212,22 +212,29 @@ pub async fn create_transfer(
             };
             let connector = Connector::new(spec).password(remote.password).pinned(Some(profile.fingerprint));
             let backend = RemoteBackend::new(connector).map_err(|e| ApiError::Remote(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let destination = backend.recovery_destination(download.then(|| req.dest.clone()))
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
             if download {
-                TransferRequest::to_backend(req.sources, Arc::new(PullBackend::new(Arc::new(backend), req.dest)))
+                (TransferRequest::to_backend(req.sources, Arc::new(PullBackend::new(Arc::new(backend), req.dest))), destination)
             } else {
-                TransferRequest::to_backend(req.sources, Arc::new(backend))
+                (TransferRequest::to_backend(req.sources, Arc::new(backend)), destination)
             }
         }
     };
     if let Some(label) = req.label.filter(|l| !l.trim().is_empty()) {
         request = request.with_label(label);
     }
-    let id = {
-        let mut owners = s.owners.write().unwrap_or_else(|e| e.into_inner());
-        let id = s.history.enqueue(&s.queue, request.with_conflict_policy(policy), p.name.clone());
-        owners.insert(id, p.name.clone());
-        id
-    };
+    let request = request.with_conflict_policy(policy);
+    let job = crate::recovery::saved_job(&request, destination, p.name.clone(), &s.queue.copy_options())?;
+    let state = s.clone();
+    let owner = p.name.clone();
+    let id = tokio::task::spawn_blocking(move || {
+        let mut owners = state.owners.write().unwrap_or_else(|e| e.into_inner());
+        let id = state.recovery.enqueue(&state, request, job)?;
+        owners.insert(id, owner);
+        Ok::<_, std::io::Error>(id)
+    }).await.map_err(|e| ApiError::Internal(format!("recovery worker failed: {e}")))?
+        .map_err(|e| ApiError::Internal(format!("job was not started because recovery could not be saved: {e}")))?;
     // A worker can already be waiting before ownership is registered.
     if let Some(info) = s.queue.job(id) {
         let frame = crate::telemetry::Frame {

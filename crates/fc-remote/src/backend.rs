@@ -72,6 +72,7 @@ pub struct RemoteBackend {
     /// Job-level wire counters, reset at the start of each run.
     sent: AtomicU64,
     acked: AtomicU64,
+    restart_files: bool,
 }
 
 impl RemoteBackend {
@@ -102,6 +103,23 @@ impl RemoteBackend {
             opens: AtomicU32::new(0),
             sent: AtomicU64::new(0),
             acked: AtomicU64::new(0),
+            restart_files: false,
+        })
+    }
+
+    /// Retry starts each file fresh, but connection-loss retries can still resume it.
+    pub fn with_restart_files(mut self, restart: bool) -> Self {
+        self.restart_files = restart;
+        self
+    }
+
+    pub fn recovery_destination(&self, local_download: Option<PathBuf>) -> std::io::Result<crate::recovery::Destination> {
+        let target = self.connector.spec().to_string();
+        let fingerprint = self.connector.pinned_fingerprint()
+            .ok_or_else(|| std::io::Error::other("recovery requires a confirmed remote fingerprint"))?;
+        Ok(match local_download {
+            Some(path) => crate::recovery::Destination::Download { target, fingerprint, path },
+            None => crate::recovery::Destination::Upload { target, fingerprint },
         })
     }
 
@@ -209,7 +227,7 @@ impl RemoteBackend {
             acked_hw: AtomicU64::new(0),
         };
         let mut attempts = 0;
-        let mut source_id = None;
+        let mut source_id = self.restart_files.then(fresh_source_id);
         let mut mismatch_retried = false;
         loop {
             let s = self.session(ctx.control).await.map_err(|e| to_copy_error(e, &item.src))?;
@@ -860,7 +878,8 @@ impl RemoteBackend {
             };
             let req = PullRequest { remote, local, algo: ctx.opts.algo, overwrite, preserve: ctx.opts.preserve };
             let ctl = PushControl { control: ctx.control, limiter: ctx.limiter };
-            match s.pull_file(&req, &ctl, &tally).await {
+            let resume = !self.restart_files || attempts > 0 || mismatch_retried;
+            match s.pull_file_with_resume(&req, &ctl, &tally, resume).await {
                 Ok(out) => break Ok(out),
                 Err(e) if e.is_retryable() && attempts < MAX_FILE_ATTEMPTS => {
                     attempts += 1;

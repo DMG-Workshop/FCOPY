@@ -5,13 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>fcopy</title>
   <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/console.css">
+  <script src="/static/appearance.js"></script>
   <script defer src="/static/alpine.min.js"></script>
   <script src="/static/app.js"></script>
 </head>
 <body class="flex h-dvh flex-col overflow-hidden bg-base font-sans text-xs text-body antialiased select-none" x-data="fcopy()" x-init="start()">
 
 <!-- ============ Sign in ============ -->
-<main x-show="!user" x-cloak class="mx-auto grid min-h-dvh w-full max-w-xs content-center gap-8 px-5">
+<main x-show="!user" x-cloak class="signin mx-auto grid min-h-dvh w-full max-w-xs content-center gap-8 px-5">
   <div>
     <p class="font-mono text-[11px] tracking-[0.2em] text-dim uppercase">fcopy daemon</p>
     <h1 class="mt-1 text-2xl font-semibold text-strong">Sign in</h1>
@@ -29,6 +31,13 @@
     <button type="submit" :disabled="busy" class="btn-primary h-10">Sign in</button>
   </form>
   <p x-show="certificate" class="break-all font-mono text-[10px] text-faint" title="Compare this with the fingerprint the other PC shows">Certificate <span x-text="certificate"></span></p>
+  <label class="grid gap-1">Appearance
+    <select class="field" x-model="appearance.theme" @change="previewAppearance()">
+      <option value="system">System (auto-switch)</option><option value="light">Light</option><option value="dark">Dark</option><option value="low_contrast">Low-contrast</option><option value="high_contrast">High-contrast</option>
+    </select>
+  </label>
+  <button class="btn-ghost h-8" @click="saveAppearance()">Save appearance</button>
+  <p x-show="appearanceNotice" x-text="appearanceNotice" role="status"></p>
 </main>
 
 <!-- ============ Workspace ============ -->
@@ -36,15 +45,16 @@
 <div class="flex h-dvh min-h-0 flex-col">
 
   <!-- Top bar -->
-  <header class="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-line bg-panel px-3 py-1.5">
+  <header class="console-header flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-line bg-panel px-3 py-1.5">
     <div class="flex min-w-0 flex-wrap items-center gap-4">
       <div class="flex items-center gap-2 border-r border-line pr-3">
         <span class="size-2.5 rounded-sm bg-brand"></span>
         <span class="font-mono text-sm font-bold tracking-tight text-strong">fcopy <span class="font-normal text-xs text-brand-light">daemon</span></span>
       </div>
       <nav class="flex flex-wrap gap-1 border border-line bg-base p-0.5" role="tablist" aria-label="Mode">
-        <button role="tab" :aria-selected="mode === 'local'" class="mode-btn" :class="mode === 'local' && 'mode-on'" @click="mode = 'local'">Local copy</button>
+        <button role="tab" :aria-selected="mode === 'local'" class="mode-btn" :class="mode === 'local' && 'mode-on'" @click="setMode('local')">Local copy</button>
         <button role="tab" :aria-selected="mode === 'history'" class="mode-btn" :class="mode === 'history' && 'mode-on'" @click="setMode('history')">History</button>
+        <button role="tab" :aria-selected="mode === 'recovery'" class="mode-btn" :class="mode === 'recovery' && 'mode-on'" @click="setMode('recovery')">Recovery (<span x-text="recovered.length"></span>)</button>
         <button role="tab" x-show="isAdmin()" :aria-selected="mode === 'remote'" class="mode-btn" :class="mode === 'remote' && 'mode-on'" @click="setMode('remote')">Remote node</button>
         <button role="tab" x-show="isAdmin()" :disabled="!torrentsEnabled" :aria-selected="mode === 'torrent'" :title="torrentsEnabled ? '' : 'BitTorrent is not enabled on this console'" class="mode-btn" :class="{ 'mode-on': mode === 'torrent', 'cursor-not-allowed opacity-40': !torrentsEnabled }" @click="setMode('torrent')">BitTorrent<span x-show="!torrentsEnabled" class="text-[10px]"> (off)</span></button>
       </nav>
@@ -58,11 +68,11 @@
         <span class="text-faint">|</span>
         <span class="text-dim" x-text="user.name"></span>
       </div>
-      <div class="flex items-center gap-1.5">
+      <div class="console-actions flex items-center gap-1.5">
         <button class="btn-primary h-7 px-2.5" @click="openModal('add')">+ Add task</button>
         <button class="btn-ghost h-7 px-2.5" @click="pauseAll()" x-show="!queuePaused">Pause all</button>
         <button class="btn-ghost h-7 px-2.5" @click="resumeAll()" x-show="queuePaused">Resume all</button>
-        <button x-show="isAdmin()" class="btn-ghost h-7 px-2" title="Settings" aria-label="Settings" @click="openModal('settings')">Settings</button>
+        <button class="btn-ghost h-7 px-2" title="Settings" aria-label="Settings" @click="openModal('settings')">Settings</button>
         <button class="btn-ghost h-7 px-2" @click="signOut()">Sign out</button>
       </div>
     </div>
@@ -73,6 +83,24 @@
 
     <!-- Left: queue or nodes -->
     <section class="flex min-h-[60dvh] min-w-0 flex-1 flex-col border-line lg:min-h-0 lg:border-r">
+
+      <section x-show="mode === 'local'" class="queue-overview shrink-0" aria-label="Copy queue overview">
+        <div class="overview-heading">
+          <strong class="overview-percent" x-text="`${queueOverview().percent}%`"></strong>
+          <div><h1 class="text-sm font-semibold text-strong">Copy queue</h1>
+            <p class="text-dim"><span x-text="queueOverview().jobs"></span> jobs - planned bytes only</p></div>
+        </div>
+        <div class="overview-track" role="progressbar" aria-label="Overall planned copy progress" :aria-valuenow="queueOverview().percent" aria-valuemin="0" aria-valuemax="100">
+          <div :style="{ width: `${queueOverview().percent}%` }"></div>
+        </div>
+        <div class="overview-details">
+          <span x-text="`Processed ${fmtBytes(queueOverview().processed)} / ${fmtBytes(queueOverview().total)}`"></span>
+          <span x-text="fmtRate(totalRate())"></span>
+          <span x-text="`Active ETA: ${queueOverview().eta}`"></span>
+        </div>
+        <p class="text-strong" x-text="queueOverview().active"></p>
+        <p x-show="queueOverview().pending" class="text-dim">Queued jobs are measured when they start; totals may grow.</p>
+      </section>
 
       <!-- Filters -->
       <div class="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-line bg-panel px-3 py-1.5">
@@ -118,13 +146,13 @@
                   <div class="flex items-center gap-2">
                     <span class="truncate font-sans text-[13px] font-semibold text-strong" x-text="job.label"></span>
                   </div>
-                  <div class="truncate text-[10px] text-faint" x-text="job.remote ? `→ ${job.destination}` : (job.current_file || job.owner || '—')"></div>
+                  <div class="truncate text-[10px] text-faint" x-text="job.destination ? `→ ${job.destination}` : (job.current_file || job.owner || '—')"></div>
                 </td>
                 <td class="hidden p-2 text-right tabular-nums text-body md:table-cell" x-text="fmtBytes(job.bytes_total)"></td>
                 <td class="mt-2 block p-0 md:table-cell md:p-2">
                   <div class="flex items-center gap-2">
                     <div class="h-1.5 flex-1 overflow-hidden bg-raised" role="progressbar" :aria-valuenow="Math.round(job.percent)" aria-valuemin="0" aria-valuemax="100" :aria-label="job.label">
-                      <div class="h-full transition-[width] duration-200" :class="job.state === 'completed' ? 'bg-ok' : 'bg-brand'" :style="`width:${job.percent}%`"></div>
+                      <div class="h-full transition-[width] duration-200" :class="job.state === 'completed' ? 'bg-ok' : 'bg-brand'" :style="{ width: `${job.percent}%` }"></div>
                     </div>
                     <span class="w-10 text-right text-[10px] tabular-nums text-body" x-text="`${Math.round(job.percent)}%`"></span>
                   </div>
@@ -182,6 +210,39 @@
         </template>
       </section>
 
+      <section x-show="mode === 'recovery'" x-cloak aria-label="Queue recovery" class="min-h-0 flex-1 overflow-auto p-4">
+        <h2 class="font-semibold text-strong">Queue recovery</h2>
+        <p class="text-dim">Restored jobs are paused. No transfers or connections start automatically.</p>
+        <p class="text-dim">Resume compares existing files and skips identical content; differences ask again. Compatible remote partials resume with verification. Interrupted local files are recopied safely.</p>
+        <p class="text-dim">Retry starts unfinished files from byte zero with the saved conflict policy. Discard removes only the saved job.</p>
+        <p x-show="!recoveryPersistent" class="text-warn">Memory only: configure a server state directory to recover jobs across restarts.</p>
+        <button :disabled="recoveryBusy" class="btn-ghost my-3 h-8 px-3" @click="loadRecovery()">Refresh recovery</button>
+        <p x-show="recoveryNotice" x-text="recoveryNotice" role="alert" class="text-bad"></p>
+        <p x-show="!recoveryBusy && recovered.length === 0" class="py-4 text-dim">No unfinished jobs to recover.</p>
+        <template x-for="job in recovered" :key="job.id">
+          <article class="grid gap-2 border-b border-line py-3 break-all">
+            <h3 class="font-semibold text-strong"><span x-text="job.label"></span> - Paused</h3>
+            <p x-show="isAdmin()" x-text="`Owner: ${job.owner || 'unassigned'}`"></p>
+            <p x-text="recoveryDestination(job)"></p>
+            <details><summary class="cursor-pointer">Sources</summary>
+              <template x-for="(source,index) in job.sources" :key="index"><p class="font-mono" x-text="source"></p></template>
+            </details>
+            <template x-if="recoveryRemote(job) && isAdmin()">
+              <label class="grid gap-1">
+                <span>PC password / access key (not saved)</span>
+                <input type="password" autocomplete="off" class="field h-8" :value="recoverySelected === job.id ? recoveryPassword : ''"
+                  @input="recoverySelected = job.id; recoveryPassword = $event.target.value" aria-label="Recovered PC password">
+              </label>
+            </template>
+            <div class="flex flex-wrap gap-2">
+              <button class="btn-mini" :disabled="recoveryBusy || (recoveryRemote(job) && (!isAdmin() || recoverySelected !== job.id || !recoveryPassword))" @click="recover(job,'resume')">Resume</button>
+              <button class="btn-mini" :disabled="recoveryBusy || (recoveryRemote(job) && (!isAdmin() || recoverySelected !== job.id || !recoveryPassword))" @click="recover(job,'retry')">Retry</button>
+              <button class="btn-mini" :disabled="recoveryBusy" @click="recover(job,'discard')">Discard</button>
+            </div>
+          </article>
+        </template>
+      </section>
+
       <!-- Remote nodes -->
       <div x-show="mode === 'remote'" x-cloak class="min-h-0 flex-1 overflow-auto">
         <p x-show="clients.length === 0" class="px-4 py-10 text-center text-dim">No PCs paired. Pair one to copy to it.</p>
@@ -226,7 +287,7 @@
                 <td class="mt-2 block p-0 md:table-cell md:p-2">
                   <div class="flex items-center gap-2">
                     <div class="h-1.5 flex-1 overflow-hidden bg-raised" role="progressbar" :aria-valuenow="Math.round(t.percent)" aria-valuemin="0" aria-valuemax="100" :aria-label="t.name">
-                      <div class="h-full transition-[width] duration-200" :class="t.finished ? 'bg-ok' : 'bg-brand'" :style="`width:${t.percent}%`"></div>
+                      <div class="h-full transition-[width] duration-200" :class="t.finished ? 'bg-ok' : 'bg-brand'" :style="{ width: `${t.percent}%` }"></div>
                     </div>
                     <span class="w-10 text-right text-[10px] tabular-nums text-body" x-text="`${Math.round(t.percent)}%`"></span>
                   </div>
@@ -263,7 +324,9 @@
     </section>
 
     <!-- Right: monitor and engine -->
-    <aside class="flex min-h-0 w-full shrink-0 flex-col divide-y divide-line overflow-y-auto bg-panel lg:w-96">
+    <aside class="console-monitor flex min-h-0 w-full shrink-0 flex-col overflow-y-auto" aria-label="Transfer monitor">
+      <button class="monitor-toggle btn-ghost" :aria-expanded="monitorOpen" aria-controls="monitor-content" @click="monitorOpen = !monitorOpen" x-text="monitorOpen ? 'Hide transfer monitor' : 'Show transfer monitor'"></button>
+      <div id="monitor-content" class="monitor-content" :class="!monitorOpen && 'monitor-collapsed'">
 
       <div class="p-3">
         <div class="mb-2 flex items-center justify-between">
@@ -285,8 +348,8 @@
         <div class="grid grid-cols-2 gap-1.5 font-mono text-[11px]">
           <div class="tile"><div class="tile-k">Throughput</div><div class="tile-v text-brand-light" x-text="fmtRate(totalRate())"></div></div>
           <div class="tile"><div class="tile-k">Active jobs</div><div class="tile-v" x-text="activeCount()"></div></div>
-          <div class="tile"><div class="tile-k">Done today</div><div class="tile-v text-ok" x-text="doneCount()"></div></div>
-          <div class="tile"><div class="tile-k">Errors</div><div class="tile-v" :class="logs.length ? 'text-warn' : ''" x-text="logs.length"></div></div>
+          <div class="tile"><div class="tile-k">Finished in queue</div><div class="tile-v text-ok" x-text="doneCount()"></div></div>
+          <div class="tile"><div class="tile-k">Log entries</div><div class="tile-v" :class="logs.length ? 'text-warn' : ''" x-text="logs.length"></div></div>
         </div>
       </div>
 
@@ -311,19 +374,10 @@
           </div>
         </div>
 
-        <div>
-          <label class="mb-1 block font-mono text-[11px] text-dim" for="integrity">Integrity check</label>
-          <select id="integrity" class="field h-8 w-full font-mono" disabled title="Not wired yet">
-            <option>Read-back, xxHash3</option>
-          </select>
-        </div>
-
-        <div class="grid gap-2 border-t border-line pt-3">
-          <label class="flex items-center gap-2 text-body"><input type="checkbox" checked disabled class="accent-brand"> Resume interrupted copies</label>
-          <label class="flex items-center gap-2 text-faint"><input type="checkbox" disabled class="accent-brand"> Delete source after verify <span class="text-[10px]">(not yet)</span></label>
-          <label class="flex items-center gap-2 text-faint"><input type="checkbox" disabled class="accent-brand"> Keep timestamps <span class="text-[10px]">(not yet)</span></label>
-        </div>
+        <p class="text-dim">Copy progress excludes torrents. Recovered jobs wait in Recovery until you resume them.</p>
+        <button class="btn-ghost h-8" @click="settingsTab = 'appearance'; openModal('settings')">Appearance / settings</button>
         <p x-show="settingsNotice" x-text="settingsNotice" role="status" class="font-mono text-[11px] text-dim"></p>
+      </div>
       </div>
     </aside>
   </main>
@@ -433,10 +487,39 @@
     <div x-show="modal === 'settings'" class="modal" role="dialog" aria-modal="true" aria-label="Settings">
       <header class="modal-head"><h3>Settings</h3><button class="btn-mini" @click="closeModal()">Close</button></header>
       <div class="flex gap-2 px-4 py-2" role="group" aria-label="Settings sections">
-        <button class="seg" :class="settingsTab === 'accounts' && 'seg-on'" :aria-pressed="settingsTab === 'accounts'" @click="settingsTab = 'accounts'">Accounts</button>
-        <button class="seg" :class="settingsTab === 'vpn' && 'seg-on'" :aria-pressed="settingsTab === 'vpn'" @click="settingsTab = 'vpn'">VPN</button>
+        <button class="seg" :class="settingsTab === 'appearance' && 'seg-on'" :aria-pressed="settingsTab === 'appearance'" @click="settingsTab = 'appearance'">Appearance</button>
+        <button x-show="isAdmin()" class="seg" :class="settingsTab === 'accounts' && 'seg-on'" :aria-pressed="settingsTab === 'accounts'" @click="settingsTab = 'accounts'">Accounts</button>
+        <button x-show="isAdmin()" class="seg" :class="settingsTab === 'vpn' && 'seg-on'" :aria-pressed="settingsTab === 'vpn'" @click="settingsTab = 'vpn'">VPN</button>
       </div>
-      <div x-show="settingsTab === 'vpn'" class="grid gap-3 p-4">
+      <section x-show="settingsTab === 'appearance'" class="appearance-fields" aria-label="Appearance settings">
+        <p>Changes preview immediately. Save to keep them in this browser, not on the console host.</p>
+        <label>Theme
+          <select class="field" x-model="appearance.theme" @change="previewAppearance()">
+            <option value="system">System (auto-switch)</option><option value="light">Light</option><option value="dark">Dark</option><option value="low_contrast">Low-contrast</option><option value="high_contrast">High-contrast</option>
+          </select>
+        </label>
+        <p class="text-dim">System follows this device's OS light/dark setting. Current palette: <span x-text="appearanceTheme"></span>.</p>
+        <label>Blue-light filter warmth: <span x-text="`${appearance.warmth}%`"></span>
+          <input type="range" min="0" max="60" step="1" x-model.number="appearance.warmth" @input="previewAppearance()" aria-label="Blue-light filter warmth">
+        </label>
+        <label>Night Shift
+          <select class="field" x-model="appearance.night" @change="previewAppearance()">
+            <option value="off">Off</option><option value="on">On</option><option value="scheduled">Scheduled</option>
+          </select>
+        </label>
+        <label>Night Shift warmth: <span x-text="`${appearance.nightWarmth}%`"></span>
+          <input type="range" min="0" max="60" step="1" x-model.number="appearance.nightWarmth" @input="previewAppearance()" aria-label="Night Shift warmth">
+        </label>
+        <div class="appearance-schedule">
+          <label>Start (local time)<input class="field" type="time" x-model="appearance.start" @change="previewAppearance()"></label>
+          <label>End (local time)<input class="field" type="time" x-model="appearance.end" @change="previewAppearance()"></label>
+        </div>
+        <p class="text-dim">Uses your browser device's clock, including overnight schedules. The stronger warmth wins; filters do not stack.</p>
+        <p class="text-warn">App-only warm tint, not an OS/display filter. Changes color accuracy and may reduce contrast. No health benefit is implied.</p>
+        <p x-show="appearanceNotice" x-text="appearanceNotice" role="status"></p>
+        <button class="btn-primary h-8" @click="saveAppearance()">Save appearance</button>
+      </section>
+      <div x-show="settingsTab === 'vpn' && isAdmin()" class="grid gap-3 p-4">
         <p class="text-dim">Ten popular VPN services, plus two private networks. Not a ranking or endorsement.</p>
         <p class="text-[11px] text-dim">Sign in and connect using the provider's app. FCOPY does not store VPN credentials, manage tunnels, or provide a kill switch.</p>
         <p class="text-[11px] text-warn">Links open on your browser's device. Connect the console host and remote PC to the VPN, not just the browser's machine. This console cannot launch their apps.</p>
@@ -472,7 +555,7 @@
         <p x-show="vpnNotice" x-text="vpnNotice" role="status" class="text-warn"></p>
         <button x-show="vpnNotice" class="btn-ghost h-8 px-3" :disabled="vpnLoading" @click="loadVpnProviders()">Reload VPN services</button>
       </div>
-      <div x-show="settingsTab === 'accounts'" class="grid gap-3 p-4">
+      <div x-show="settingsTab === 'accounts' && isAdmin()" class="grid gap-3 p-4">
         <div class="border border-line">
           <template x-for="u in users" :key="u.name">
             <div class="flex items-center justify-between border-b border-line/60 px-3 py-2 last:border-b-0">

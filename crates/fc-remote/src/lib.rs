@@ -7,6 +7,7 @@ pub mod discovery;
 pub mod history;
 pub mod protocol;
 pub mod profiles;
+pub mod recovery;
 pub mod server;
 pub mod tls;
 pub mod vpn;

@@ -1,8 +1,8 @@
 //! Drawing + commands. Reads [`AppState`], sends commands to the [`Queue`].
 //!
 //! Layout follows the desktop console: a tab bar and action bar on top, a
-//! navigation sidebar on the left, the queue table in the middle with the active
-//! transfer above it, and a status bar along the bottom. New transfers are
+//! optional navigation sidebar on the left, telemetry monitor on the right, the
+//! queue table and progress summary in the middle, and a bottom status bar. New transfers are
 //! entered in an "Add task" window.
 
 use std::collections::HashMap;
@@ -24,11 +24,13 @@ use crate::state::{AppState, JobRow, LogKind};
 use crate::torrent::{self, Torrents};
 use fc_engine::conflict::{ConflictPolicy, ConflictAction, ConflictChoice};
 
-pub(crate) const OK: Color32 = Color32::from_rgb(110, 200, 120);
-pub(crate) const WARN: Color32 = Color32::from_rgb(230, 180, 80);
-pub(crate) const BAD: Color32 = Color32::from_rgb(235, 100, 90);
-pub(crate) const ACCENT: Color32 = Color32::from_rgb(234, 88, 12);
-pub(crate) const DIM: Color32 = Color32::from_rgb(120, 124, 134);
+pub(crate) fn ok(ui: &egui::Ui) -> Color32 {
+    if ui.visuals().dark_mode { Color32::from_rgb(105, 225, 160) } else { Color32::from_rgb(16, 110, 65) }
+}
+pub(crate) fn warn(ui: &egui::Ui) -> Color32 { ui.visuals().warn_fg_color }
+pub(crate) fn bad(ui: &egui::Ui) -> Color32 { ui.visuals().error_fg_color }
+pub(crate) fn accent(ui: &egui::Ui) -> Color32 { ui.visuals().hyperlink_color }
+pub(crate) fn dim(ui: &egui::Ui) -> Color32 { ui.visuals().weak_text_color() }
 
 /// Speed presets for the throttle menu. `None` is unlimited.
 const THROTTLE: [(&str, Option<u64>); 7] = [
@@ -46,6 +48,7 @@ const THROTTLE: [(&str, Option<u64>); 7] = [
 enum View {
     Queue,
     History,
+    Recovery,
     Peers,
     Torrents,
     Logs,
@@ -102,7 +105,21 @@ struct NewTransfer {
     remote: RemoteForm,
 }
 
+impl NewTransfer {
+    fn from_startup(startup: &Startup) -> Self {
+        Self {
+            sources: startup.sources.clone(),
+            add_path: String::new(),
+            dest: startup.dest.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
+            verify: if startup.verify { VerifyMode::ReadBack } else { VerifyMode::Off },
+            conflict_policy: ConflictPolicy::Ask,
+            remote: RemoteForm::default(),
+        }
+    }
+}
+
 pub struct FcApp {
+    launch_listener_failed: bool,
     queue: Queue,
     events: Receiver<Event>,
     state: AppState,
@@ -111,8 +128,6 @@ pub struct FcApp {
     filter: Filter,
     search: String,
     show_add: bool,
-    /// Index into [`THROTTLE`].
-    throttle: usize,
     /// "Do this for all errors of this kind" answers.
     remembered: HashMap<ErrorClass, ErrorAction>,
     remember_choice: bool,
@@ -126,10 +141,16 @@ pub struct FcApp {
     vpn: crate::vpn::VpnSettings,
     profiles: crate::profiles::Profiles,
     history: crate::history::History,
+    recovery: crate::recovery::Recovery,
+    appearance: crate::appearance::Appearance,
+    rates: std::collections::VecDeque<f32>,
+    last_rate: std::time::Instant,
+    instance: crate::instance::Instance,
 }
 
 impl FcApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, startup: Startup) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, startup: Startup, instance: crate::instance::Instance) -> std::io::Result<Self> {
+        instance.attach(cc)?;
         // Event binding: the worker pokes egui whenever it sends an event, so the
         // UI repaints promptly while transferring and sleeps while idle.
         let ctx = cc.egui_ctx.clone();
@@ -141,35 +162,17 @@ impl FcApp {
             ..Default::default()
         });
 
-        let throttle = THROTTLE
-            .iter()
-            .position(|(_, l)| *l == startup.limit)
-            .unwrap_or(0);
-        cc.egui_ctx.set_visuals(accent_visuals());
         let mut app = Self {
+            instance,
+            launch_listener_failed: false,
             queue,
             events,
             state: AppState::default(),
-            form: NewTransfer {
-                sources: startup.sources,
-                add_path: String::new(),
-                dest: startup
-                    .dest
-                    .map(|d| d.display().to_string())
-                    .unwrap_or_default(),
-                verify: if startup.verify {
-                    VerifyMode::ReadBack
-                } else {
-                    VerifyMode::Off
-                },
-                conflict_policy: ConflictPolicy::Ask,
-                remote: RemoteForm::default(),
-            },
+            form: NewTransfer::from_startup(&startup),
             view: View::Queue,
             filter: Filter::All,
             search: String::new(),
-            show_add: false,
-            throttle,
+            show_add: !startup.sources.is_empty(),
             remembered: HashMap::new(),
             remember_choice: false,
             conflict_choice: None,
@@ -182,18 +185,61 @@ impl FcApp {
             vpn: crate::vpn::VpnSettings::default(),
             profiles: crate::profiles::Profiles::default(),
             history: crate::history::History::new(cc.egui_ctx.clone()),
+            recovery: crate::recovery::Recovery::new(cc.egui_ctx.clone()),
+            appearance: crate::appearance::Appearance::default(),
+            rates: std::collections::VecDeque::new(),
+            last_rate: std::time::Instant::now(),
         };
         app.state.speed_limit = startup.limit;
         if !app.form.sources.is_empty() && !app.form.dest.is_empty() {
             app.start_transfer();
         }
-        app
+        Ok(app)
+    }
+
+    fn pump_launches(&mut self) {
+        if self.show_add || self.recovery.is_busy() || self.launch_listener_failed { return; }
+        loop {
+            let startup = match self.instance.try_recv() {
+                Ok(Some(startup)) => startup,
+                Ok(None) => return,
+                Err(error) => {
+                    self.launch_listener_failed = true;
+                    self.notice = Some(error);
+                    self.show_add = true;
+                    return;
+                }
+            };
+            if let Some(limit) = startup.limit {
+                self.queue.set_speed_limit(Some(limit));
+                self.state.speed_limit = Some(limit);
+            }
+            if startup.sources.is_empty() {
+                if startup.verify { self.form.verify = VerifyMode::ReadBack; }
+                if startup.torrent_dht || startup.torrent_trackers {
+                    self.notice = Some("Torrent network options are startup-only. Close FCOPY before changing them.".into());
+                    self.show_add = true;
+                    return;
+                }
+                continue;
+            }
+            self.form = NewTransfer::from_startup(&startup);
+            self.browser = RemoteBrowser::default();
+            self.view = View::Queue;
+            self.notice = if startup.torrent_dht || startup.torrent_trackers {
+                Some("Files received. Torrent network options apply only when starting the first window.".into())
+            } else { None };
+            self.show_add = true;
+            if startup.dest.is_some() { self.start_transfer(); }
+            return;
+        }
     }
 
     /// Drain every pending event without blocking.
     fn pump_events(&mut self) {
         while let Ok(ev) = self.events.try_recv() {
             self.history.observe(&ev);
+            self.recovery.observe(&ev);
             if let Event::Decision(d) = ev {
                 if let Some(a) = self.remembered.get(&d.class) {
                     d.respond(*a);
@@ -207,8 +253,9 @@ impl FcApp {
     }
 
     fn start_transfer(&mut self) {
+        if self.recovery.is_busy() { self.notice = Some("Wait for the current job to be saved before adding another.".into()); return; }
         let sources = std::mem::take(&mut self.form.sources);
-        let (request, target) = if self.form.remote.enabled {
+        let (request, destination) = if self.form.remote.enabled {
             let backend = match remote::backend_for(&self.form.remote) {
                 Ok(b) => b,
                 Err(e) => {
@@ -217,19 +264,24 @@ impl FcApp {
                     return;
                 }
             };
-            let target = format!(
-                "{}/{}",
-                self.form.remote.address.trim(),
-                self.form.remote.folder.trim().trim_matches('/')
-            );
             self.form.remote.password.clear();
             if self.form.remote.download {
-                let dest = PathBuf::from(self.form.dest.trim());
-                let target = format!("{} (from {})", dest.display(), self.form.remote.address);
+                let dest = match fc_remote::recovery::absolute(std::path::Path::new(self.form.dest.trim())) {
+                    Ok(dest) => dest,
+                    Err(error) => { self.notice = Some(error.to_string()); self.form.sources = sources; return; }
+                };
+                let destination = match backend.recovery_destination(Some(dest.clone())) {
+                    Ok(destination) => destination,
+                    Err(error) => { self.notice = Some(error.to_string()); self.form.sources = sources; return; }
+                };
                 let backend = Arc::new(fc_remote::backend::PullBackend::new(backend, dest));
-                (TransferRequest::to_backend(sources.clone(), backend), target)
+                (TransferRequest::to_backend(sources.clone(), backend), destination)
             } else {
-                (TransferRequest::to_backend(sources.clone(), backend), target)
+                let destination = match backend.recovery_destination(None) {
+                    Ok(destination) => destination,
+                    Err(error) => { self.notice = Some(error.to_string()); self.form.sources = sources; return; }
+                };
+                (TransferRequest::to_backend(sources.clone(), backend), destination)
             }
         } else {
             let dest = PathBuf::from(self.form.dest.trim());
@@ -238,7 +290,11 @@ impl FcApp {
             } else {
                 TransferRequest::into_dir(sources.clone(), &dest)
             };
-            (request, dest.display().to_string())
+            let destination = match &request.target {
+                fc_engine::Target::FileTo(path) => fc_remote::recovery::Destination::File { path: path.clone() },
+                _ => fc_remote::recovery::Destination::Directory { path: dest },
+            };
+            (request, destination)
         };
         let options = CopyOptions {
             verify: self.form.verify,
@@ -246,16 +302,40 @@ impl FcApp {
             ..Default::default()
         };
         self.notice = None;
-        let id = self.history.enqueue(&self.queue, request.with_options(options).with_conflict_policy(self.form.conflict_policy));
-        self.state.details.insert(id, (sources, target));
+        let mut request = request.with_options(options).with_conflict_policy(self.form.conflict_policy);
+        if !self.form.remote.enabled || !self.form.remote.download {
+            let absolute: Result<Vec<_>, _> = request.sources.iter().map(|p| fc_remote::recovery::absolute(p)).collect();
+            match absolute {
+                Ok(paths) => request.sources = paths,
+                Err(error) => { self.notice = Some(error.to_string()); self.form.sources = sources; return; }
+            }
+        }
+        let destination = match destination {
+            fc_remote::recovery::Destination::File { path } => fc_remote::recovery::absolute(&path).map(|path| fc_remote::recovery::Destination::File { path }),
+            fc_remote::recovery::Destination::Directory { path } => fc_remote::recovery::absolute(&path).map(|path| fc_remote::recovery::Destination::Directory { path }),
+            other => Ok(other),
+        };
+        let job = destination.and_then(|dest| {
+            match &dest {
+                fc_remote::recovery::Destination::File { path } => request.target = fc_engine::Target::FileTo(path.clone()),
+                fc_remote::recovery::Destination::Directory { path } => request.target = fc_engine::Target::IntoDir(path.clone()),
+                _ => {}
+            }
+            fc_remote::recovery::Job::new(&request, dest, None, &self.queue.copy_options())
+        });
+        match job {
+            Ok(job) => self.recovery.save(job, request),
+            Err(error) => { self.notice = Some(format!("Job was not started: {error}")); self.form.sources = sources; return; }
+        }
+        self.form.sources = sources;
         self.show_add = false;
     }
 
     // ----- top of the window -----
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("■").color(ACCENT));
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("■").color(accent(ui)));
             ui.label(RichText::new("fcopy").strong().size(16.0));
             ui.label(RichText::new("v1.0.0").weak().small());
             ui.add_space(12.0);
@@ -271,6 +351,8 @@ impl FcApp {
             {
                 self.view = View::Peers;
             }
+            if ui.selectable_label(self.view == View::History, "History").clicked() { self.view = View::History; }
+            if ui.selectable_label(self.view == View::Recovery, "Recovery").clicked() { self.view = View::Recovery; }
             let running = self.torrents.is_running();
             let tab = ui.add_enabled(
                 running,
@@ -287,6 +369,10 @@ impl FcApp {
                     "The BitTorrent engine could not start. See the BitTorrent tab.",
                 );
             }
+            if ui.selectable_label(self.view == View::Logs, "Logs").clicked() {
+                self.view = View::Logs;
+                self.state.unseen = 0;
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.selectable_label(self.view == View::Settings, "Settings").clicked() {
                     self.view = View::Settings;
@@ -296,13 +382,13 @@ impl FcApp {
     }
 
     fn action_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let add = egui::Button::new(
                 RichText::new("+ Add task / files")
                     .strong()
                     .color(Color32::WHITE),
             )
-            .fill(ACCENT);
+            .fill(Color32::from_rgb(156, 51, 6));
             if ui.add(add).clicked() {
                 self.show_add = true;
             }
@@ -330,22 +416,6 @@ impl FcApp {
             if ui.button("Clear finished").clicked() {
                 self.queue.clear_finished();
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let before = self.throttle;
-                egui::ComboBox::from_id_salt("throttle")
-                    .selected_text(THROTTLE[self.throttle].0)
-                    .width(130.0)
-                    .show_ui(ui, |ui| {
-                        for (i, (label, _)) in THROTTLE.iter().enumerate() {
-                            ui.selectable_value(&mut self.throttle, i, *label);
-                        }
-                    });
-                ui.label("Throttle");
-                if self.throttle != before {
-                    let limit = THROTTLE[self.throttle].1;
-                    self.queue.set_speed_limit(limit);
-                }
-            });
         });
     }
 
@@ -371,7 +441,7 @@ impl FcApp {
             .count();
 
         ui.add_space(6.0);
-        ui.label(RichText::new("TRANSFERS").small().color(DIM));
+        ui.label(RichText::new("TRANSFERS").small().color(dim(ui)));
         if ui
             .selectable_label(
                 self.view == View::Queue && self.filter == Filter::All,
@@ -406,9 +476,8 @@ impl FcApp {
         if ui.selectable_label(self.view == View::History, "Transfer history").clicked() {
             self.view = View::History;
         }
-        ui.label(RichText::new("FEEDS & LOGS").small().color(DIM));
-        ui.add_enabled(false, egui::Label::new("Torrent feeds"))
-            .on_disabled_hover_text("Not built yet");
+        if ui.selectable_label(self.view == View::Recovery, "Queue recovery").clicked() { self.view = View::Recovery; }
+        ui.label(RichText::new("LOGS & SETTINGS").small().color(dim(ui)));
         if ui
             .selectable_label(
                 self.view == View::Logs,
@@ -419,8 +488,7 @@ impl FcApp {
             self.view = View::Logs;
             self.state.unseen = 0;
         }
-        ui.add_enabled(false, egui::Label::new("Settings"))
-            .on_disabled_hover_text("Not built yet");
+        if ui.selectable_label(self.view == View::Settings, "Settings / appearance").clicked() { self.view = View::Settings; }
 
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             let running = self
@@ -437,12 +505,99 @@ impl FcApp {
                 .count();
             ui.weak(format!("Failed jobs   {failed}"));
             ui.weak(format!("Running jobs   {running}"));
-            ui.label(RichText::new("ENGINE").small().color(DIM));
+            ui.label(RichText::new("ENGINE").small().color(dim(ui)));
             ui.add_space(8.0);
         });
     }
 
     // ----- main panel -----
+
+    fn bandwidth(&mut self, ui: &mut egui::Ui) {
+        let before = self.state.speed_limit;
+        let mut limit = before;
+        egui::ComboBox::from_id_salt("throttle")
+            .selected_text(limit.map(|value| human_rate(value as f64)).unwrap_or_else(|| "Unlimited".into()))
+            .show_ui(ui, |ui| {
+                for (label, value) in THROTTLE { ui.selectable_value(&mut limit, value, label); }
+            });
+        if limit != before {
+            self.queue.set_speed_limit(limit);
+            self.state.speed_limit = limit;
+        }
+    }
+
+    fn active_paused(&self) -> bool {
+        self.state.paused || self.state.active.as_ref().is_some_and(|active| {
+            self.state.jobs.iter().any(|job| job.id == active.job && job.paused)
+        })
+    }
+
+    fn current_rate(&self) -> f64 {
+        if self.active_paused() { 0.0 } else {
+            self.state.active.as_ref().and_then(|a| a.telemetry.as_ref()).map_or(0.0, |t| t.rate_bps)
+        }
+    }
+
+    fn monitor(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.heading("Transfer monitor");
+            ui.add_space(8.0);
+            ui.label("Global bandwidth cap");
+            self.bandwidth(ui);
+            ui.separator();
+            let rate = self.current_rate();
+            ui.label(RichText::new(human_rate(rate)).size(26.0).strong().color(accent(ui)));
+            ui.weak("Copy throughput - recent samples");
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 110.0), egui::Sense::hover());
+            let painter = ui.painter_at(rect);
+            for step in 1..4 {
+                let y = rect.top() + rect.height() * step as f32 / 4.0;
+                painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color));
+            }
+            let max = self.rates.iter().copied().fold(1.0_f32, f32::max);
+            if self.rates.len() > 1 {
+                let points = self.rates.iter().enumerate().map(|(i, value)| {
+                    egui::pos2(rect.left() + rect.width() * i as f32 / 119.0, rect.bottom() - rect.height() * value / max)
+                }).collect();
+                painter.add(egui::Shape::line(points, egui::Stroke::new(2.0_f32, accent(ui))));
+            }
+            ui.weak(format!("Scale: {} peak", human_rate(f64::from(max))));
+            ui.separator();
+            ui.label(format!("Queued: {}", self.state.jobs.iter().filter(|j| j.state == JobState::Pending).count()));
+            ui.label(format!("Finished: {}", self.state.jobs.iter().filter(|j| j.state.is_finished()).count()));
+            if let Some(t) = self.state.active.as_ref().and_then(|a| a.telemetry.as_ref()) {
+                ui.label(format!("ETA: {}", t.eta.map(human_duration).unwrap_or_else(|| "--".into())));
+                if let Some(link) = &t.link {
+                    ui.separator();
+                    ui.strong("Remote link");
+                    ui.label(format!("RTT: {} ms", link.rtt.as_millis()));
+                    ui.label(format!("Reconnects: {}", link.reconnects));
+                    if link.remote_paused { ui.label("Paused by remote PC"); }
+                }
+            }
+            ui.separator();
+            ui.weak("Torrent activity stays in its own tab and is not included in copy progress.");
+            if ui.button("Appearance / settings").clicked() { self.view = View::Settings; }
+        });
+    }
+
+    fn queue_summary(&self, ui: &mut egui::Ui) {
+        let planned: u64 = self.state.jobs.iter().map(|j| j.bytes_total).sum();
+        let processed: f64 = self.state.jobs.iter().map(|j| j.bytes_total as f64 * j.fraction.clamp(0.0, 1.0)).sum();
+        let fraction = if planned > 0 { (processed / planned as f64) as f32 } else { 0.0 };
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(format!("{:.0}%", fraction * 100.0)).size(34.0).strong().color(accent(ui)));
+                ui.vertical(|ui| {
+                    ui.strong("Copy queue");
+                    ui.weak(format!("{} jobs - planned bytes only", self.state.jobs.len()));
+                });
+            });
+            ui.add(egui::ProgressBar::new(fraction).desired_width(ui.available_width()).desired_height(8.0).fill(accent(ui)));
+            ui.label(format!("Processed {} / {} planned", human_bytes(processed as u64), human_bytes(planned)));
+            if self.state.jobs.iter().any(|j| j.state == JobState::Pending) { ui.weak("Queued jobs are measured when they start; totals may grow."); }
+        });
+    }
 
     fn active_card(&self, ui: &mut egui::Ui) {
         let Some(active) = self.state.active.clone() else {
@@ -472,15 +627,14 @@ impl FcApp {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Active transfer").small().color(DIM));
+                ui.label(RichText::new("Active transfer").small().color(dim(ui)));
                 ui.label(RichText::new(&name).strong());
                 ui.weak(format!("→ {target}"));
-                if self.state.paused {
+                if self.active_paused() {
                     ui.label(
                         RichText::new(" PAUSED ")
                             .strong()
-                            .color(Color32::BLACK)
-                            .background_color(WARN),
+                            .color(warn(ui)),
                     );
                 }
             });
@@ -488,10 +642,10 @@ impl FcApp {
                 egui::ProgressBar::new(t.fraction as f32)
                     .show_percentage()
                     .desired_height(14.0)
-                    .fill(ACCENT),
+                    .fill(accent(ui)),
             );
             ui.horizontal_wrapped(|ui| {
-                let speed = if self.state.paused {
+                let speed = if self.active_paused() {
                     "—".to_string()
                 } else {
                     human_rate(t.rate_bps)
@@ -538,7 +692,7 @@ impl FcApp {
     }
 
     fn filter_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             for (f, label) in Filter::ALL {
                 let count = self.state.jobs.iter().filter(|r| f.matches(r)).count();
                 let text = format!("{label} ({count})");
@@ -584,7 +738,7 @@ impl FcApp {
             return;
         }
 
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 egui::Grid::new("queue")
@@ -603,7 +757,7 @@ impl FcApp {
                             "STATUS",
                             "ACTIONS",
                         ] {
-                            ui.label(RichText::new(h).small().color(DIM));
+                            ui.label(RichText::new(h).small().color(dim(ui)));
                         }
                         ui.end_row();
 
@@ -618,11 +772,11 @@ impl FcApp {
                                     .unwrap_or_default(),
                                 n => format!("{} items", n),
                             };
-                            let (icon, color) = status_icon(&row.state, row.paused);
+                            let (icon, color) = status_icon(ui, &row.state, row.paused);
                             ui.colored_label(color, icon);
                             ui.vertical(|ui| {
                                 ui.label(RichText::new(&name).strong());
-                                ui.label(RichText::new(&target).small().color(DIM));
+                                ui.label(RichText::new(&target).small().color(dim(ui)));
                             });
                             let size = row.bytes_total;
                             ui.monospace(human_bytes(size));
@@ -630,7 +784,7 @@ impl FcApp {
                                 ui.add(
                                     egui::ProgressBar::new(row.fraction as f32)
                                         .desired_width(140.0)
-                                        .fill(progress_color(&row.state)),
+                                        .fill(progress_color(ui, &row.state)),
                                 );
                                 ui.monospace(format!("{:.0}%", row.fraction * 100.0));
                             });
@@ -653,7 +807,7 @@ impl FcApp {
                                     .min(row.summary.as_ref().map_or(0, |s| s.files_copied)),
                                 row.files_total
                             ));
-                            ui.label(status_text(&row.state, row.paused));
+                            ui.label(status_text(ui, &row.state, row.paused));
                             ui.horizontal(|ui| {
                                 let held = row.paused || row.state == JobState::Pending;
                                 if held
@@ -693,11 +847,16 @@ impl FcApp {
     }
 
     fn queue_view(&mut self, ui: &mut egui::Ui) {
+        self.queue_summary(ui);
+        ui.add_space(6.0);
         self.active_card(ui);
         if self.state.active.is_some() {
             ui.add_space(8.0);
         }
         self.filter_bar(ui);
+        if ui.ctx().screen_rect().width() < 1100.0 {
+            ui.horizontal_wrapped(|ui| { ui.label("Bandwidth cap"); self.bandwidth(ui); });
+        }
         ui.separator();
         self.queue_table(ui);
     }
@@ -764,9 +923,9 @@ impl FcApp {
                     ui.label(RichText::new(&peer.name).strong());
                     ui.monospace(&addr);
                     match remote::trusted_fingerprint(&addr) {
-                        Some(fp) if fp == peer.fingerprint => ui.colored_label(OK, "trusted"),
-                        Some(_) => ui.colored_label(BAD, "FINGERPRINT CHANGED"),
-                        None => ui.colored_label(WARN, "not yet trusted"),
+                        Some(fp) if fp == peer.fingerprint => ui.colored_label(ok(ui), "trusted"),
+                        Some(_) => ui.colored_label(bad(ui), "FINGERPRINT CHANGED"),
+                        None => ui.colored_label(warn(ui), "not yet trusted"),
                     };
                 });
                 ui.weak(format!("fingerprint {}", peer.fingerprint));
@@ -813,9 +972,9 @@ impl FcApp {
             .show(ui, |ui| {
                 for e in self.state.log.iter().rev() {
                     let (tag, color) = match e.kind {
-                        LogKind::Skipped => ("SKIPPED", WARN),
-                        LogKind::Failed => ("FAILED ", BAD),
-                        LogKind::JobFailed => ("JOB    ", BAD),
+                        LogKind::Skipped => ("SKIPPED", warn(ui)),
+                        LogKind::Failed => ("FAILED ", bad(ui)),
+                        LogKind::JobFailed => ("JOB    ", bad(ui)),
                         LogKind::Warning => ("warning", ui.visuals().weak_text_color()),
                     };
                     ui.horizontal(|ui| {
@@ -953,7 +1112,7 @@ impl FcApp {
                 });
         });
         if let Some(msg) = &self.notice {
-            ui.colored_label(WARN, msg);
+            ui.colored_label(warn(ui), msg);
         }
         ui.add_space(4.0);
         let ready = !self.form.sources.is_empty()
@@ -982,7 +1141,7 @@ impl FcApp {
             ui.monospace(if self.browser.path.is_empty() { "Shares" } else { &self.browser.path });
             if self.browser.busy() { ui.spinner(); }
         });
-        if let Some(error) = &self.browser.error { ui.colored_label(WARN, error); }
+        if let Some(error) = &self.browser.error { ui.colored_label(warn(ui), error); }
         let mut selected = None;
         egui::ScrollArea::vertical().id_salt("remote-browser").max_height(160.0).show(ui, |ui| {
             for entry in &self.browser.entries {
@@ -1140,7 +1299,7 @@ impl FcApp {
                 .count();
             ui.label(format!("Remote transfers {remote_running}"));
             if self.state.paused {
-                ui.colored_label(WARN, "queue paused");
+                ui.colored_label(warn(ui), "queue paused");
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
@@ -1151,7 +1310,7 @@ impl FcApp {
                     self.state.unseen = 0;
                 }
                 if self.state.unseen > 0 {
-                    ui.colored_label(WARN, format!("{} new", self.state.unseen));
+                    ui.colored_label(warn(ui), format!("{} new", self.state.unseen));
                 }
             });
         });
@@ -1253,42 +1412,60 @@ impl FcApp {
     }
 }
 
-fn status_icon(state: &JobState, paused: bool) -> (&'static str, Color32) {
+fn status_icon(ui: &egui::Ui, state: &JobState, paused: bool) -> (&'static str, Color32) {
     match state {
-        JobState::Pending => ("◌", DIM),
-        JobState::Running if paused => ("⏸", WARN),
-        JobState::Running => ("●", ACCENT),
-        JobState::Completed => ("✔", OK),
-        JobState::CompletedWithErrors => ("⚠", WARN),
-        JobState::Failed(_) => ("✖", BAD),
-        JobState::Cancelled => ("⊘", DIM),
+        JobState::Pending => ("◌", dim(ui)),
+        JobState::Running if paused => ("⏸", warn(ui)),
+        JobState::Running => ("●", accent(ui)),
+        JobState::Completed => ("✔", ok(ui)),
+        JobState::CompletedWithErrors => ("⚠", warn(ui)),
+        JobState::Failed(_) => ("✖", bad(ui)),
+        JobState::Cancelled => ("⊘", dim(ui)),
     }
 }
 
-fn status_text(state: &JobState, paused: bool) -> RichText {
+fn status_text(ui: &egui::Ui, state: &JobState, paused: bool) -> RichText {
     let (text, color) = match state {
-        JobState::Pending => ("Queued".to_string(), DIM),
-        JobState::Running if paused => ("Paused".to_string(), WARN),
-        JobState::Running => ("Active".to_string(), ACCENT),
-        JobState::Completed => ("Complete".to_string(), OK),
-        JobState::CompletedWithErrors => ("Complete with errors".to_string(), WARN),
-        JobState::Failed(msg) => (format!("Failed: {msg}"), BAD),
-        JobState::Cancelled => ("Cancelled".to_string(), DIM),
+        JobState::Pending => ("Queued".to_string(), dim(ui)),
+        JobState::Running if paused => ("Paused".to_string(), warn(ui)),
+        JobState::Running => ("Active".to_string(), accent(ui)),
+        JobState::Completed => ("Complete".to_string(), ok(ui)),
+        JobState::CompletedWithErrors => ("Complete with errors".to_string(), warn(ui)),
+        JobState::Failed(msg) => (format!("Failed: {msg}"), bad(ui)),
+        JobState::Cancelled => ("Cancelled".to_string(), dim(ui)),
     };
     RichText::new(text).color(color)
 }
 
-fn progress_color(state: &JobState) -> Color32 {
+fn progress_color(ui: &egui::Ui, state: &JobState) -> Color32 {
     match state {
-        JobState::Completed => OK,
-        JobState::Failed(_) => BAD,
-        _ => ACCENT,
+        JobState::Completed => ok(ui),
+        JobState::Failed(_) => bad(ui),
+        _ => accent(ui),
     }
 }
 
 impl eframe::App for FcApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.appearance.apply(ctx);
         self.pump_events();
+        self.pump_launches();
+        if self.last_rate.elapsed() >= Duration::from_millis(500) {
+            let rate = self.current_rate();
+            self.rates.push_back(rate as f32);
+            if self.rates.len() > 120 { self.rates.pop_front(); }
+            self.last_rate = std::time::Instant::now();
+        }
+        for (saved_id, request) in self.recovery.poll() {
+            let details = (request.sources.clone(), request.target.describe());
+            let id = self.history.enqueue(&self.queue, request);
+            self.recovery.bind(id, saved_id);
+            self.state.details.insert(id, details);
+            self.view = View::Queue;
+        }
+        if self.recovery.take_attention() { self.view = View::Recovery; }
+        if self.view != View::Recovery { self.recovery.hide(); }
+        if self.recovery.is_busy() { ctx.request_repaint_after(Duration::from_millis(100)); }
         if let Some(error) = self.history.poll() { self.notice = Some(error); }
         self.handle_drops(ctx);
         if let Some(found) = self.peers.poll() {
@@ -1307,6 +1484,15 @@ impl eframe::App for FcApp {
         egui::TopBottomPanel::top("actions").show(ctx, |ui| {
             ui.add_space(2.0);
             self.action_bar(ui);
+            if self.instance.pending() > 0 {
+                ui.label(format!(
+                    "{} incoming launch(es) waiting. Finish or close Add task to open the next selection.",
+                    self.instance.pending()
+                ));
+            }
+            if self.launch_listener_failed {
+                ui.colored_label(bad(ui), "Desktop launch listener stopped. Restart FCOPY after finishing current transfers.");
+            }
             ui.add_space(4.0);
         });
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
@@ -1314,19 +1500,27 @@ impl eframe::App for FcApp {
             self.status_bar(ui);
             ui.add_space(2.0);
         });
-        egui::SidePanel::left("nav")
-            .resizable(false)
-            .exact_width(210.0)
-            .show(ctx, |ui| self.sidebar(ui));
+        if ctx.screen_rect().width() >= 1450.0 {
+            egui::SidePanel::left("nav").resizable(false).exact_width(180.0).show(ctx, |ui| self.sidebar(ui));
+        }
+        if ctx.screen_rect().width() >= 1100.0 && self.view == View::Queue {
+            ctx.request_repaint_after(Duration::from_millis(500));
+            egui::SidePanel::right("monitor").resizable(true).default_width(260.0).width_range(220.0..=340.0)
+                .show(ctx, |ui| self.monitor(ui));
+        }
         self.torrents.refresh();
         egui::CentralPanel::default().show(ctx, |ui| match self.view {
             View::Queue => self.queue_view(ui),
             View::History => self.history.show(ui),
+            View::Recovery => self.recovery.show(ui),
             View::Peers => self.peers_view(ui),
             View::Torrents => torrent::show(ui, &mut self.torrents),
             View::Logs => self.logs_view(ui),
             View::Settings => {
-                if let Some(remote) = self.vpn.show(ui) {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    self.appearance.show(ui);
+                    ui.separator();
+                    if let Some(remote) = self.vpn.show(ui) {
                     self.form.sources = if remote.download {
                         vec![PathBuf::from(&remote.folder)]
                     } else {
@@ -1336,7 +1530,8 @@ impl eframe::App for FcApp {
                     self.browser = RemoteBrowser::default();
                     self.notice = None;
                     self.show_add = true;
-                }
+                    }
+                });
             }
         });
 
@@ -1359,6 +1554,9 @@ impl eframe::App for FcApp {
             self.browser = RemoteBrowser::default();
         }
         self.show_add &= open;
+        if self.instance.pending() > 0 && !self.show_add && !self.recovery.is_busy() {
+            ctx.request_repaint();
+        }
 
         self.decision_modal(ctx);
         self.conflict_modal(ctx);
@@ -1371,22 +1569,17 @@ impl eframe::App for FcApp {
         if self.torrents.is_busy() {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
+        self.appearance.overlay(ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // Cancel cleanly so no .fcpart files are left behind.
+        self.instance.shutdown();
+        // Keep job descriptions while the worker cleans up interrupted local files.
+        self.recovery.suspend();
         self.queue.shutdown();
         self.pump_events();
+        self.recovery.shutdown();
         self.history.shutdown();
         self.torrents.shutdown();
     }
-}
-
-/// Dark visuals with the orange accent on selections instead of the default blue.
-fn accent_visuals() -> egui::Visuals {
-    let mut v = egui::Visuals::dark();
-    v.selection.bg_fill = Color32::from_rgb(120, 48, 10);
-    v.selection.stroke = egui::Stroke::new(1.0_f32, ACCENT);
-    v.hyperlink_color = ACCENT;
-    v
 }

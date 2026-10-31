@@ -15,6 +15,7 @@ pub mod api;
 pub mod clients;
 pub mod https;
 pub mod history;
+pub mod recovery;
 pub mod auth;
 pub mod telemetry;
 
@@ -58,6 +59,7 @@ pub struct AppState {
     pub telemetry: broadcast::Sender<Arc<telemetry::Frame>>,
     pub clients: clients::ClientStore,
     pub history: Arc<history::History>,
+    pub recovery: Arc<recovery::Recovery>,
     pub cookie_secure: bool,
     /// The console certificate's fingerprint, shown on the sign-in page to compare by eye.
     pub certificate_fingerprint: Option<String>,
@@ -102,6 +104,8 @@ pub enum BuildError {
     Store(#[from] clients::StoreError),
     #[error("cannot open transfer history: {0}")]
     History(#[from] std::io::Error),
+    #[error("cannot open unfinished queue recovery: {0}")]
+    Recovery(std::io::Error),
 }
 
 /// Create the shared state and start the telemetry producer. Must be called
@@ -123,7 +127,8 @@ pub fn build(queue: Queue, events: std::sync::mpsc::Receiver<Event>, config: Con
         owners: RwLock::new(HashMap::new()),
         telemetry,
         clients: clients::ClientStore::open(config.state_dir.as_ref().map(|d| d.join("clients.json")))?,
-        history: Arc::new(history::History::open(config.state_dir.map(|d| d.join("transfer-history.toml")))?),
+        history: Arc::new(history::History::open(config.state_dir.as_ref().map(|d| d.join("transfer-history.toml")))?),
+        recovery: Arc::new(recovery::Recovery::open(config.state_dir.map(|d| d.join("unfinished-jobs.toml"))).map_err(BuildError::Recovery)?),
         cookie_secure: config.cookie_secure,
         certificate_fingerprint: config.certificate_fingerprint,
         torrents: config.torrents,
@@ -135,6 +140,8 @@ pub fn build(queue: Queue, events: std::sync::mpsc::Receiver<Event>, config: Con
 const INDEX_HTML: &str = include_str!("../static/index.html");
 const APP_JS: &str = include_str!("../static/app.js");
 const APP_CSS: &str = include_str!("../static/app.css");
+const CONSOLE_CSS: &str = include_str!("../static/console.css");
+const APPEARANCE_JS: &str = include_str!("../static/appearance.js");
 const ALPINE_JS: &str = include_str!("../static/alpine.min.js");
 
 /// Content-Security-Policy for the dashboard: everything comes from this server.
@@ -162,6 +169,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/", get(|| asset("text/html; charset=utf-8", INDEX_HTML)))
         .route("/static/app.js", get(|| asset("text/javascript; charset=utf-8", APP_JS)))
         .route("/static/app.css", get(|| asset("text/css; charset=utf-8", APP_CSS)))
+        .route("/static/console.css", get(|| asset("text/css; charset=utf-8", CONSOLE_CSS)))
+        .route("/static/appearance.js", get(|| asset("text/javascript; charset=utf-8", APPEARANCE_JS)))
         .route("/static/alpine.min.js", get(|| asset("text/javascript; charset=utf-8", ALPINE_JS)))
         .route("/api/auth/login", post(api::login))
         .route("/api/auth/logout", post(api::logout))
@@ -169,6 +178,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/me", get(api::me))
         .route("/api/transfers", get(api::list_transfers).post(api::create_transfer))
         .route("/api/history", get(history::list).delete(history::clear))
+        .route("/api/recovery", get(recovery::list))
+        .route("/api/recovery/{id}", post(recovery::act))
         .route("/api/transfers/{id}", delete(api::cancel_transfer))
         .route("/api/transfers/{id}/pause", post(api::pause_transfer))
         .route("/api/transfers/{id}/resume", post(api::resume_transfer))

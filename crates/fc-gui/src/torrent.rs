@@ -12,7 +12,7 @@ use eframe::egui::{self, Color32, RichText};
 use fc_engine::units::human_rate;
 use fc_torrent::{AddOptions, EngineConfig, TorrentEngine, TorrentPhase, TorrentStatus};
 
-use crate::app::{ACCENT, BAD, DIM, OK, WARN};
+use crate::app::{accent, bad, dim, ok, warn};
 
 /// Most peer addresses given with one transfer.
 const MAX_PEERS: usize = 50;
@@ -101,13 +101,13 @@ pub fn phase_label(phase: TorrentPhase) -> &'static str {
     }
 }
 
-fn phase_color(phase: TorrentPhase) -> Color32 {
+fn phase_color(ui: &egui::Ui, phase: TorrentPhase) -> Color32 {
     match phase {
-        TorrentPhase::Downloading => ACCENT,
-        TorrentPhase::Seeding => OK,
-        TorrentPhase::Paused => WARN,
-        TorrentPhase::Failed => BAD,
-        TorrentPhase::WaitingForMetadata | TorrentPhase::Checking => DIM,
+        TorrentPhase::Downloading => accent(ui),
+        TorrentPhase::Seeding => ok(ui),
+        TorrentPhase::Paused => warn(ui),
+        TorrentPhase::Failed => bad(ui),
+        TorrentPhase::WaitingForMetadata | TorrentPhase::Checking => dim(ui),
     }
 }
 
@@ -266,7 +266,7 @@ impl Torrents {
 pub fn show(ui: &mut egui::Ui, t: &mut Torrents) {
     if t.lane.is_none() {
         ui.add_space(12.0);
-        ui.colored_label(BAD, "The BitTorrent engine could not start.");
+        ui.colored_label(bad(ui), "The BitTorrent engine could not start.");
         if let Some(e) = &t.start_error {
             ui.weak(e);
         }
@@ -326,9 +326,9 @@ pub fn show(ui: &mut egui::Ui, t: &mut Torrents) {
                         );
                     }
                     ui.vertical(|ui| {
-                        ui.colored_label(phase_color(phase), phase_label(phase));
+                        ui.colored_label(phase_color(ui, phase), phase_label(phase));
                         if let Some(e) = &row.error {
-                            ui.colored_label(BAD, RichText::new(e).small());
+                            ui.colored_label(bad(ui), RichText::new(e).small());
                         }
                     });
                     ui.label(format!(

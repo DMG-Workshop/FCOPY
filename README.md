@@ -72,6 +72,69 @@ consistent. Library callers without a conflict resolver retain the existing
 parallel-upload behavior. Explicit skips (including identical comparisons)
 retain the existing non-clean result / nonzero CLI exit status.
 
+## Layout and appearance
+
+### One desktop window
+
+Launching `fcopy-gui` again restores and focuses the existing window instead of
+starting another copy queue. File-manager **Copy with fcopy** selections
+(`--sources PATH...`) open its Add task form; choose a destination before copying.
+An explicit `SOURCE... DEST` launch is sent to the same queue, preserving
+`--verify` and an explicitly supplied global `--limit`.
+
+An open Add task draft is not overwritten. Incoming selections wait in order;
+finish or close the draft to open the next one. Active copies, recovery jobs and
+the separate torrent lane continue unchanged. Torrent DHT/tracker startup flags
+require closing the existing application before relaunching with those options.
+
+Single-instance ownership is scoped to the client configuration directory
+(`FCOPY_CONFIG_DIR` overrides it). An OS-held lock prevents competing GUI queues;
+authenticated, bounded loopback IPC forwards launches without exposing a LAN
+listener. The runtime endpoint contains a random handoff token, not remote
+passwords. Failed handoff is reported instead of silently opening another queue;
+after a crash the next launch replaces the stale endpoint automatically.
+Pending Add task selections are drafts, not saved recovery jobs, until submitted.
+Foreground focus remains subject to the OS/window manager's activation policy;
+Windows also requests taskbar attention if foreground permission is declined.
+
+Windows validation (no elevation required): build with `cargo build -p fc-gui`,
+then run `.\packaging\windows\test-single-instance.ps1` in an interactive desktop.
+The [test script](packaging/windows/test-single-instance.ps1) uses isolated state
+and checks a byte-identical forwarded copy, restoration/focus, secondary exit,
+and preservation of an open Add task draft.
+
+### Appearance
+
+Desktop and web share a queue-first console design: orange accents, a compact
+overall progress card, readable transfer rows, separate History and Recovery
+views, and live copy telemetry with a bandwidth cap. Torrent activity stays in
+its own tab and does not inflate copy progress. Queue totals cover planned bytes;
+pending jobs are measured when they start, so totals can grow.
+
+Open **Settings -> Appearance** (desktop) or **Settings -> Appearance** (web).
+Choose **Light**, **Dark**, **Low-contrast** (muted dark surfaces),
+**High-contrast** (black surfaces, bright text and borders), or **System**.
+System follows the device's OS light/dark setting as it changes; the desktop
+falls back to Dark when the OS preference is unavailable. Web layouts use
+transfer cards and a collapsible monitor on smaller screens; desktop keeps a
+wide queue with a monitor panel when space allows.
+
+The **blue-light filter** is an independent, adjustable warm tint. **Night Shift**
+can be Off, On, or Scheduled with start/end times on the viewing device's local
+clock, including overnight schedules. When both are enabled, the stronger warmth
+wins rather than stacking the filters. Scheduling updates within about 30 seconds
+while the app is awake. These are **app-only color adjustments**, not OS/display
+filters; they affect color accuracy and may reduce contrast. No health benefit is
+implied. Leave both off for the unmodified high-contrast palette.
+
+Changes preview immediately; select **Save appearance** to persist them.
+Desktop saves `appearance.toml` in the client configuration directory
+(`FCOPY_CONFIG_DIR` overrides it). Web saves `fcopy.appearance.v1` in this
+browser's local storage, not in account profiles or on the console host; all
+accounts using that browser/origin share the appearance. Blocked storage or
+damaged settings are reported rather than silently overwritten. No credentials
+are included in appearance settings.
+
 ## Transfer history
 
 Open **Transfer history** in the desktop sidebar or **History** in the web console.
@@ -103,6 +166,49 @@ Web API: `GET /api/history` returns `{entries, persistent}` (newest first);
 `DELETE /api/history` clears the caller's scope and requires the normal
 authentication and CSRF header. History IDs remain unique across restarts and
 clears; they are not queue job IDs.
+
+## Recover unfinished transfers
+
+Open **Queue recovery** in the desktop sidebar or **Recovery** in the web console.
+Local copies, uploads and downloads are saved **before** entering the live queue.
+After a restart they appear **paused**, without starting disk work or connecting to
+another PC. Choose:
+
+- **Resume**: compare existing destinations by content, skip identical files and
+  ask again for differences. Compatible remote partials resume with full-file
+  integrity checks. An interrupted local file is safely recopied from byte zero;
+  local byte-offset resume is not supported.
+- **Retry**: start unfinished files from byte zero with the original conflict
+  policy. A connection drop during that attempt can still resume its new partial.
+- **Discard**: remove only the saved job. Already copied data and partial files
+  are not deleted.
+
+Enter the remote PC's password or access key again for every recovered remote
+job. Recovery saves the confirmed fingerprint with the address/share and refuses
+an identity change; it never stores passwords, access keys or session tokens.
+Saved destinations are snapshots, independent of later PC-profile edits.
+
+Jobs interrupted by closing the app are retained. Successfully finished jobs and
+explicitly cancelled/removed unfinished live jobs leave recovery. Failed jobs
+remain available to retry. Comparison skips count as skips in the normal
+queue/history summaries.
+Recovery does not apply to CLI or BitTorrent jobs.
+
+Desktop records live in `unfinished-desktop-jobs.toml` in the client configuration
+directory (`FCOPY_CONFIG_DIR` overrides it). Web records use `unfinished-jobs.toml`
+in the configured server state directory; without one, recovery is explicitly
+memory-only. Paths, labels, copy options, trusted fingerprints and web account
+names are saved on disk. Records are written atomically, and advisory claims
+prevent two app instances from running or discarding the same job simultaneously.
+A failed save prevents execution; corrupt state is reported, not silently reset.
+
+Web accounts see and recover their own local jobs; administrators can manage all
+jobs and recover remote jobs. Current local share restrictions are rechecked
+before execution. `GET /api/recovery` returns `{jobs, persistent, error}`, with
+each job's `state` set to `paused`; `POST /api/recovery/{id}` accepts
+`{"action":"resume|retry|discard","password":"..."}` and requires authentication
+and the normal CSRF header. Omit `password` for local jobs and discards.
+Recovery IDs are independent of live queue IDs and finished-history IDs.
 
 ## Saved desktop PCs
 

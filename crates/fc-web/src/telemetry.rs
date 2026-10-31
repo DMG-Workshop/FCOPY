@@ -181,11 +181,14 @@ pub struct Frame {
 pub fn spawn_producer(state: Arc<AppState>, events: std::sync::mpsc::Receiver<Event>) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let history = state.history.clone();
+    let weak_state = Arc::downgrade(&state);
+    let reader_state = weak_state.clone();
     std::thread::Builder::new()
         .name("fc-web-events".into())
         .spawn(move || {
             while let Ok(ev) = events.recv() {
                 history.observe(&ev);
+                if let Some(state) = reader_state.upgrade() { state.recovery.observe(&ev, state.queue.is_shutting_down()); }
                 if tx.send(ev).is_err() {
                     break;
                 }
@@ -201,19 +204,27 @@ pub fn spawn_producer(state: Arc<AppState>, events: std::sync::mpsc::Receiver<Ev
         // Torrent stats change without queue events, so the lane is compared each tick.
         let mut last_torrents: Option<Vec<TorrentDto>> = None;
         loop {
-            tokio::select! {
-                ev = rx.recv() => match ev {
+            let event = tokio::select! {
+                ev = rx.recv() => Some(ev),
+                _ = tick.tick() => None,
+            };
+            let Some(state) = weak_state.upgrade() else { break; };
+            match event {
+                Some(ev) => match ev {
                     Some(ev) => {
                         if let Event::Finished { job, .. } = &ev {
                             if let Some(error) = crate::history::persistence_error(&state) {
                                 logs.push(LogLine { job: *job, kind: "history_error", message: format!("Transfer history was not saved: {error}. Open History and Refresh to retry.") });
+                            }
+                            if let Some(error) = state.recovery.error() {
+                                logs.push(LogLine { job: *job, kind: "recovery_error", message: error });
                             }
                         }
                         collect(ev, &mut dirty, &mut removed, &mut logs);
                     },
                     None => break,
                 },
-                _ = tick.tick() => {
+                None => {
                     let torrents = state.torrents.as_ref().map(torrent_rows).filter(|now| last_torrents.as_ref() != Some(now));
                     if torrents.is_some() {
                         last_torrents = torrents.clone();

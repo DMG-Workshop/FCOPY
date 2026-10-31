@@ -832,6 +832,12 @@ impl Session {
         ctl: &PushControl<'_>,
         observer: &dyn PullObserver,
     ) -> Result<PullOutcome, ClientError> {
+        self.pull_file_with_resume(req, ctl, observer, true).await
+    }
+
+    pub async fn pull_file_with_resume(
+        &self, req: &PullRequest<'_>, ctl: &PushControl<'_>, observer: &dyn PullObserver, resume: bool,
+    ) -> Result<PullOutcome, ClientError> {
         let dest = req.local;
         let (mut send, mut recv) = self.open_stream().await?;
         write_msg(&mut send, &Message::FileRequest { path: req.remote.to_string(), algo: req.algo })
@@ -862,7 +868,7 @@ impl Session {
         let id_path = sidecar(dest, ID_SUFFIX);
         let (file, resume_from) = {
             let (d, t, i) = (dest.to_path_buf(), tmp.clone(), id_path.clone());
-            tokio::task::spawn_blocking(move || prepare_download(&d, &t, &i, size, id))
+            tokio::task::spawn_blocking(move || prepare_download(&d, &t, &i, size, id, resume))
                 .await
                 .map_err(|e| ClientError::local(dest, io::Error::other(e)))?
                 .map_err(|e| ClientError::local(dest, e))?
@@ -1225,10 +1231,10 @@ pub trait PullObserver: Send + Sync {
 impl PullObserver for () {}
 
 /// Open or reopen the partial file and decide where the download resumes.
-fn prepare_download(dest: &Path, tmp: &Path, id_path: &Path, size: u64, id: [u8; 16]) -> io::Result<(std::fs::File, u64)> {
+fn prepare_download(dest: &Path, tmp: &Path, id_path: &Path, size: u64, id: [u8; 16], resume: bool) -> io::Result<(std::fs::File, u64)> {
     let parent = dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
-    let same_version = std::fs::read(id_path).is_ok_and(|v| v == id);
+    let same_version = resume && std::fs::read(id_path).is_ok_and(|v| v == id);
     let existing = if same_version { std::fs::metadata(tmp).map(|m| m.len()).unwrap_or(0) } else { 0 };
     // The tail of an interrupted write may be torn, so resume on an aligned boundary.
     let resume_from = (existing.min(size) / RESUME_ALIGN) * RESUME_ALIGN;
