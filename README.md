@@ -42,6 +42,95 @@ followed or overwritten implicitly. Remote files are transferred sequentially.
 
 Developer context and roadmap: [CLAUDE.md](CLAUDE.md).
 
+## Existing files
+
+Local copies, uploads and downloads support **Ask**, **Replace**, **Skip**,
+**Keep both**, and **Compare**. Desktop and web Add task default to **Ask**.
+Decisions appear while the queue waits; cancelling or skipping the current file
+also releases a pending decision. Web decisions require the job's owner or an
+administrator.
+
+* **Keep both** writes `name (copy 1).ext`, increasing the number past occupied
+  names. The original is untouched. A file arriving at the chosen destination
+  before commit is never silently replaced; the operation fails safely.
+* **Compare** reads both files without changing them. Identical files are skipped;
+  different contents prompt again for Replace, Skip or Keep both.
+* **Apply to remaining conflicts** lasts for this job only. Compare-all and the
+  answer for differing files are remembered separately.
+
+The CLI accepts `--conflict ask|replace|skip|keep-both|compare`; `--overwrite`
+remains supported but cannot be combined with `--conflict`. Interactive CLI
+copies default to Ask. Without a terminal, the default refuses existing files;
+an explicit Ask or a comparison that differs fails/cancels safely rather than
+waiting for input. Use Replace, Skip or Keep both for unattended jobs.
+Uppercase prompt answers apply to remaining conflicts in the job.
+
+Remote comparisons read the remote file over the network, so they can be as
+expensive as a download; they honor pause, cancellation and bandwidth limits.
+Conflict-enabled uploads serialize small files to keep naming and decisions
+consistent. Library callers without a conflict resolver retain the existing
+parallel-upload behavior. Explicit skips (including identical comparisons)
+retain the existing non-clean result / nonzero CLI exit status.
+
+## Transfer history
+
+Open **Transfer history** in the desktop sidebar or **History** in the web console.
+The latest **1,000 finished jobs** are retained, newest first, until cleared.
+Search names or paths and expand a job for its sources, destination, finish time,
+duration, copied bytes, and copied/skipped/failed file counts. Completed,
+completed-with-errors, failed and cancelled jobs are included. History is separate
+from the live queue: removing a queue row does not delete its summary, and clearing
+history changes neither files nor queued jobs.
+
+Desktop summaries are saved in `desktop-history.toml` in the client configuration
+directory (`FCOPY_CONFIG_DIR` overrides it). Desktop times are UTC; browser times
+use the browser's locale. Web summaries are saved in `transfer-history.toml` inside
+the console's configured state directory. With no state directory the web view
+explicitly reports memory-only history. Web accounts see/clear only their own
+summaries; administrators see and can clear all accounts. The 1,000-job limit is
+shared across all accounts on that console.
+
+Only summary fields are saved, never backend objects, passwords, access keys,
+session tokens, fingerprints or raw error/log messages. Paths, labels and web
+account names **are stored on disk**; use clear history to remove them. Writes are
+atomic and locked across app instances. Corrupt history is reported, not silently
+discarded. Failed writes stay pending in memory; **Refresh / retry saving** retries
+after the storage problem is fixed. An abrupt process exit can lose results still
+pending a successful write. History is not crash recovery, a per-file audit log,
+or automatic transfer resumption, and does not include CLI or BitTorrent jobs.
+
+Web API: `GET /api/history` returns `{entries, persistent}` (newest first);
+`DELETE /api/history` clears the caller's scope and requires the normal
+authentication and CSRF header. History IDs remain unique across restarts and
+clears; they are not queue job IDs.
+
+## Saved desktop PCs
+
+Open **Remote PCs → New PC**, or **Save PC profile** beside a discovered agent.
+Enter a name and a target such as `alice@nas:47800:/backup/photos`. Targets include
+the account, address, port and share/folder; IPv6 addresses use brackets.
+
+**Test / read fingerprint** runs a background TLS reachability check without
+sending credentials. Compare a new fingerprint with `fcopy-agent fingerprint`
+on the remote PC, check the confirmation box, and save. You can also paste and
+confirm a fingerprint while the PC is offline. Testing a saved fingerprint
+rejects identity changes; it does not verify account login or share permissions.
+
+Saved rows offer **Upload**, **Download**, **Edit**, **Test connection**, and
+confirmed **Remove**. The Add task form also has a saved-PC selector and
+**Save as profile** / **Edit profile**. Downloads prefill the saved remote path;
+uploads use it as their destination. Enter the account password/access key for
+each operation, as before.
+
+Profiles persist in `desktop-profiles.toml` in the client configuration directory,
+separately from the web console's paired PCs. Only IDs, names, targets and confirmed
+fingerprints are saved, never passwords. A selected profile's pin is enforced
+even if a separate `known_hosts` entry differs; profile operations do not change
+that file. Changing the address clears the selected identity and password.
+Editing/removing a profile invalidates an open form using its previous values;
+already queued transfers keep their original settings. Corrupt files and failed
+saves are reported instead of silently discarding profiles.
+
 ## VPN settings and private PC links
 
 **Desktop Settings / VPN** and **web Settings / VPN** link to official downloads

@@ -156,6 +156,7 @@ impl AppState {
                 self.push_log(job, LogKind::Failed, Some(src), reason);
             }
             Event::Decision(d) => self.decisions.push_back(d),
+            Event::Conflict { .. } => {}
             Event::Paused => self.paused = true,
             Event::Resumed => self.paused = false,
             Event::JobPaused { job } => {

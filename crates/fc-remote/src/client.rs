@@ -631,7 +631,11 @@ impl Session {
 
         let sender = async {
             let mut hasher = hasher;
-            let mut file = tokio::fs::File::open(local).await.map_err(|e| ClientError::local(local, e))?;
+            let path = local.to_path_buf();
+            let file = tokio::task::spawn_blocking(move || fc_engine::conflict::open_comparison_file(&path))
+                .await.map_err(|e| ClientError::local(local, io::Error::other(e)))?
+                .map_err(|e| ClientError::local(local, e))?;
+            let mut file = tokio::fs::File::from_std(file);
             file.seek(io::SeekFrom::Start(resume_from)).await.map_err(|e| ClientError::local(local, e))?;
             let mut chunk = vec![0u8; CHUNK];
             let mut offset = resume_from;
@@ -755,6 +759,68 @@ impl Session {
             Message::FileReject { reason, message } => Err(ClientError::Rejected { reason, message }),
             other => Err(ClientError::Protocol(format!("expected FileMeta, got {other:?}"))),
         }
+    }
+
+    /// Compare a remote file with a local one without writing either file.
+    pub async fn matches_local(&self, remote: &str, local: &Path, ctl: &PushControl<'_>) -> Result<bool, ClientError> {
+        let (mut send, mut recv) = self.open_stream().await?;
+        let comparison = async {
+            let mut file = tokio::fs::File::open(local).await.map_err(|e| ClientError::local(local, e))?;
+            let before = file.metadata().await.map_err(|e| ClientError::local(local, e))?;
+            if !before.is_file() { return Err(ClientError::local(local, io::Error::other("only regular files can be compared"))); }
+            write_msg(&mut send, &Message::FileRequest { path: remote.into(), algo: HashAlgo::Sha256 }).await.map_err(|e| self.wire_error(e))?;
+            let mut buf = Vec::new();
+            let size = match read_msg(&mut recv, &mut buf).await.map_err(|e| self.wire_error(e))? {
+                Message::FileMeta { size, .. } => size,
+                Message::FileReject { reason, message } => return Err(ClientError::Rejected { reason, message }),
+                other => return Err(ClientError::Protocol(format!("expected FileMeta, got {other:?}"))),
+            };
+            if before.len() != size { return Ok(false); }
+            write_msg(&mut send, &Message::PullStart { resume_from: 0 }).await.map_err(|e| self.wire_error(e))?;
+            let mut expected = 0;
+            let mut hasher = Hasher::new(fc_engine::Algorithm::Sha256);
+            let mut local_bytes = Vec::new();
+            loop {
+                self.gate(ctl).await?;
+                match read_frame(&mut recv, &mut buf).await.map_err(|e| self.wire_error(e))? {
+                    Some(Frame::Data { offset, bytes }) => {
+                        if offset != expected || bytes.len() as u64 > size.saturating_sub(expected) {
+                            return Err(ClientError::Protocol("invalid comparison offset".into()));
+                        }
+                        local_bytes.resize(bytes.len(), 0);
+                        file.read_exact(&mut local_bytes).await.map_err(|e| ClientError::local(local, e))?;
+                        if local_bytes != bytes { return Ok(false); }
+                        hasher.update(bytes);
+                        expected += bytes.len() as u64;
+                        self.throttle(ctl, bytes.len() as u64).await?;
+                    }
+                    Some(Frame::Msg(Message::FileEnd { size: end, digest })) => {
+                        if end != size || expected != size || hasher.finalize().as_bytes() != digest {
+                            return Err(ClientError::Protocol("comparison stream failed integrity check".into()));
+                        }
+                        let after = file.metadata().await.map_err(|e| ClientError::local(local, e))?;
+                        if before.len() != after.len() || before.modified().map_err(|e| ClientError::local(local, e))? != after.modified().map_err(|e| ClientError::local(local, e))? {
+                            return Err(ClientError::local(local, io::Error::other("local file changed during comparison")));
+                        }
+                        write_msg(&mut send, &Message::FileDone { ok: true, digest: vec![], message: String::new() }).await.map_err(|e| self.wire_error(e))?;
+                        return Ok(true);
+                    }
+                    Some(Frame::Msg(Message::FileDone { ok: false, message, .. })) => return Err(ClientError::Remote(message)),
+                    other => return Err(ClientError::Protocol(format!("unexpected comparison frame: {other:?}"))),
+                }
+            }
+        };
+        let abort = async {
+            loop {
+                tokio::time::sleep(ABORT_POLL).await;
+                if ctl.control.is_cancelled() { return ClientError::Cancelled; }
+                if ctl.control.take_skip() { return ClientError::Skipped; }
+            }
+        };
+        let result = tokio::select! { result = comparison => result, error = abort => Err(error) };
+        let _ = send.reset(0u32.into());
+        let _ = recv.stop(0u32.into());
+        result
     }
 
     /// Download one file to `req.local`, resuming a partial download of the
@@ -904,8 +970,8 @@ impl Session {
 
         let std_file = file.into_std().await;
         let committed = {
-            let (t, d, i, preserve) = (tmp.clone(), dest.to_path_buf(), id_path.clone(), req.preserve);
-            tokio::task::spawn_blocking(move || commit_download(std_file, &t, &d, &i, preserve.then_some((mtime, mode))))
+            let (t, d, i, preserve, overwrite) = (tmp.clone(), dest.to_path_buf(), id_path.clone(), req.preserve, req.overwrite);
+            tokio::task::spawn_blocking(move || commit_download(std_file, &t, &d, &i, preserve.then_some((mtime, mode)), overwrite))
                 .await
                 .map_err(|e| ClientError::local(dest, io::Error::other(e)))?
         };
@@ -916,7 +982,7 @@ impl Session {
         let _ = write_msg(&mut send, &verdict).await;
         let _ = send.finish();
         committed.map_err(|e| ClientError::local(dest, e))?;
-        Ok(PullOutcome { size, resumed_from: resume_from, digest })
+        Ok(PullOutcome { size, resumed_from: resume_from, digest, local: dest.into() })
     }
 
     async fn throttle(&self, ctl: &PushControl<'_>, bytes: u64) -> Result<(), ClientError> {
@@ -1141,6 +1207,7 @@ pub struct PullRequest<'a> {
 
 #[derive(Debug, Clone)]
 pub struct PullOutcome {
+    pub local: PathBuf,
     pub size: u64,
     /// Bytes already on disk from an earlier attempt.
     pub resumed_from: u64,
@@ -1177,7 +1244,7 @@ fn prepare_download(dest: &Path, tmp: &Path, id_path: &Path, size: u64, id: [u8;
 }
 
 /// Set times and permissions, then rename the finished partial into place.
-fn commit_download(file: std::fs::File, tmp: &Path, dest: &Path, id_path: &Path, meta: Option<((i64, u32), u32)>) -> io::Result<()> {
+fn commit_download(file: std::fs::File, tmp: &Path, dest: &Path, id_path: &Path, meta: Option<((i64, u32), u32)>, overwrite: bool) -> io::Result<()> {
     if let Some((mtime, mode)) = meta {
         if mtime.0 >= 0 && mtime.1 < 1_000_000_000 {
             if let Some(t) = UNIX_EPOCH.checked_add(Duration::new(mtime.0 as u64, mtime.1)) {
@@ -1195,7 +1262,7 @@ fn commit_download(file: std::fs::File, tmp: &Path, dest: &Path, id_path: &Path,
         let _ = mode;
     }
     drop(file);
-    std::fs::rename(tmp, dest)?;
+    fc_engine::conflict::commit_file(tmp, dest, overwrite)?;
     let _ = std::fs::remove_file(id_path);
     Ok(())
 }

@@ -165,6 +165,21 @@ Done since the handoff, each with tests:
   Web destinations remain confined to the console host's configured roots.
   Pause/resume, skip, cancel, shared live rate limits, reconnect/resume, and read-back comparison are tested.
 - Desktop GUI: Copy to a PC on the network; redesigned window (tab bar, sidebar, queue table, status bar).
+- File conflicts: desktop/web default to Ask; Replace, Skip, Keep both, Compare and
+  job-scoped apply-all work for local copies/uploads/downloads. Compare skips identical
+  files and asks again for differences. CLI `--conflict` supports unattended policies.
+- Transfer history: shared `fc-remote::history` stores the latest 1,000 finished
+  summaries with cross-process locking and atomic private writes, never credentials
+  or raw error messages. Desktop `desktop-history.toml` uses a background writer,
+  flushed on normal shutdown; web `transfer-history.toml` uses the event-reader
+  thread even without subscribers. Desktop sidebar/web History offer search,
+  details and confirmed clear. Web GET/DELETE `/api/history` are owner-scoped
+  (admins see/clear all); absent `Config.state_dir` means memory-only history.
+  Failed writes are surfaced and retried on refresh. No queue recovery/CLI/torrent history.
+- Saved desktop PCs: Remote PCs supports create/edit/remove and background TLS connection
+  tests; Add task selects saved profiles for upload/download. `desktop-profiles.toml`
+  stores names, targets and explicitly confirmed pins, never passwords. Profile pins
+  are bound to their endpoints and separate from web profiles/known_hosts.
 - VPN settings: shared catalog of ten consumer VPNs plus Tailscale/ZeroTier. Desktop saves
   app executable links and a VPN target in `vpn-links.toml`; web provides admin-only links
   and hands VPN targets to normal pinned pairing. Tunnels, login, routing and kill switches

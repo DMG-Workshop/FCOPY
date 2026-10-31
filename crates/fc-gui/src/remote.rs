@@ -26,6 +26,35 @@ pub struct RemoteForm {
     pub fingerprint: String,
     /// The user has compared `fingerprint` with the PC's own fingerprint.
     pub fingerprint_checked: bool,
+    /// A saved pin, bound to the profile's endpoint rather than editable text.
+    pub profile: Option<fc_remote::profiles::Profile>,
+}
+
+impl RemoteForm {
+    pub fn for_target(target: &str, download: bool) -> Result<Self, String> {
+        let spec = RemoteSpec::parse(target.trim()).map_err(|e| e.to_string())?;
+        let user = spec.user.as_ref().map(|user| format!("{user}@")).unwrap_or_default();
+        Ok(Self {
+            enabled: true, download,
+            address: format!("{user}{}", spec.host_port()),
+            folder: spec.path, ..Default::default()
+        })
+    }
+
+    pub fn from_profile(profile: fc_remote::profiles::Profile, download: bool) -> Result<Self, String> {
+        let mut form = Self::for_target(&profile.target, download)?;
+        form.fingerprint = profile.fingerprint.clone();
+        form.fingerprint_checked = true;
+        form.profile = Some(profile);
+        Ok(form)
+    }
+
+    pub fn clear_identity(&mut self) {
+        self.profile = None;
+        self.password.clear();
+        self.fingerprint.clear();
+        self.fingerprint_checked = false;
+    }
 }
 
 pub fn known_hosts_path() -> PathBuf {
@@ -43,6 +72,12 @@ pub fn trusted_fingerprint(address: &str) -> Option<String> {
 /// Build the backend a job will use. The error says what is missing, and is
 /// shown in the form.
 pub fn backend_for(form: &RemoteForm) -> Result<Arc<RemoteBackend>, String> {
+    let connector = connector_for(form)?;
+    let backend = RemoteBackend::new(connector).map_err(|e| e.to_string())?;
+    Ok(Arc::new(backend))
+}
+
+fn connector_for(form: &RemoteForm) -> Result<Connector, String> {
     let folder = if form.download { "browse" } else { form.folder.trim().trim_matches('/') };
     let spec = RemoteSpec::parse(&format!("{}:/{}", form.address.trim(), folder))
         .map_err(|e| e.to_string())?;
@@ -50,8 +85,16 @@ pub fn backend_for(form: &RemoteForm) -> Result<Arc<RemoteBackend>, String> {
         return Err("enter the PC's password or access key".into());
     }
     let host_port = spec.host_port();
-    let known = KnownHosts::load(&known_hosts_path());
-    let pinned = match known.get(&host_port) {
+    let pinned = if let Some(profile) = &form.profile {
+        let saved = fc_remote::profiles::validate(&profile.name, &profile.target, &profile.fingerprint)
+            .map_err(|e| e.to_string())?;
+        if saved.host_port() != host_port {
+            return Err("the address no longer matches the saved profile; select the PC again".into());
+        }
+        profile.fingerprint.clone()
+    } else {
+        let known = KnownHosts::load(&known_hosts_path());
+        match known.get(&host_port) {
         Some(fp) => fp.to_string(),
         None if form.fingerprint_checked && !form.fingerprint.is_empty() => {
             // The user has confirmed this fingerprint, so trust it and remember it.
@@ -65,12 +108,11 @@ pub fn backend_for(form: &RemoteForm) -> Result<Arc<RemoteBackend>, String> {
                 "compare the PC's fingerprint with the one it shows, then tick the box".into(),
             );
         }
+        }
     };
-    let connector = Connector::new(spec)
+    Ok(Connector::new(spec)
         .password(form.password.clone())
-        .pinned(Some(pinned));
-    let backend = RemoteBackend::new(connector).map_err(|e| e.to_string())?;
-    Ok(Arc::new(backend))
+        .pinned(Some(pinned)))
 }
 
 type BrowseResult = Result<(String, Vec<fc_remote::protocol::DirEntry>), String>;
@@ -167,6 +209,32 @@ pub fn address_for(current: &str, peer: &Peer) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn saved_profiles_prefill_both_directions_and_pin_the_exact_endpoint() {
+        let profile = fc_remote::profiles::Profile {
+            id: 1, name: "VPN NAS".into(),
+            target: "alice@[fd00::1]:47801:/backup/photos".into(),
+            fingerprint: fc_remote::crypto::fingerprint(b"saved certificate"),
+        };
+        for download in [false, true] {
+            let mut form = RemoteForm::from_profile(profile.clone(), download).unwrap();
+            assert_eq!(form.address, "alice@[fd00::1]:47801");
+            assert_eq!(form.folder, "backup/photos");
+            assert_eq!(form.download, download);
+            assert!(form.password.is_empty());
+            form.password = "operation-only".into();
+            form.fingerprint = fc_remote::crypto::fingerprint(b"untrusted UI text");
+            let connector = connector_for(&form).unwrap();
+            assert_eq!(connector.pinned_fingerprint().as_deref(), Some(profile.fingerprint.as_str()));
+            form.address = "alice@[fd00::2]:47801".into();
+            assert!(connector_for(&form).err().unwrap().contains("no longer matches"));
+            form.clear_identity();
+            assert!(form.profile.is_none());
+            assert!(form.password.is_empty() && form.fingerprint.is_empty());
+            assert!(!form.fingerprint_checked);
+        }
+    }
+
     fn form() -> RemoteForm {
         RemoteForm {
             enabled: true,
@@ -176,6 +244,7 @@ mod tests {
             password: "agent-pass-1".into(),
             fingerprint: "SHA256:abc".into(),
             fingerprint_checked: false,
+            profile: None,
         }
     }
 
@@ -235,8 +304,15 @@ mod tests {
             tokio::spawn(server.run());
             handle
         });
-        let spec = RemoteSpec::parse(&format!("alice@127.0.0.1:{}:/read-only", handle.local_addr().unwrap().port())).unwrap();
-        let backend = Arc::new(RemoteBackend::new(Connector::new(spec).password("password1").pinned(Some(handle.fingerprint().into()))).unwrap());
+        let profile = fc_remote::profiles::Profile {
+            id: 1,
+            name: "Browser test".into(),
+            target: format!("alice@127.0.0.1:{}:/read-only", handle.local_addr().unwrap().port()),
+            fingerprint: handle.fingerprint().into(),
+        };
+        let mut form = RemoteForm::from_profile(profile, true).unwrap();
+        form.password = "password1".into();
+        let backend = backend_for(&form).unwrap();
         let ctx = egui::Context::default();
         let mut browser = RemoteBrowser::default();
         for path in ["", "read-only"] {

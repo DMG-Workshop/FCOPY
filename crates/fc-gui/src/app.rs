@@ -22,6 +22,7 @@ use crate::Startup;
 use crate::remote::{self, PeerSearch, RemoteBrowser, RemoteForm};
 use crate::state::{AppState, JobRow, LogKind};
 use crate::torrent::{self, Torrents};
+use fc_engine::conflict::{ConflictPolicy, ConflictAction, ConflictChoice};
 
 pub(crate) const OK: Color32 = Color32::from_rgb(110, 200, 120);
 pub(crate) const WARN: Color32 = Color32::from_rgb(230, 180, 80);
@@ -44,6 +45,7 @@ const THROTTLE: [(&str, Option<u64>); 7] = [
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
     Queue,
+    History,
     Peers,
     Torrents,
     Logs,
@@ -96,7 +98,7 @@ struct NewTransfer {
     add_path: String,
     dest: String,
     verify: VerifyMode,
-    overwrite: bool,
+    conflict_policy: ConflictPolicy,
     remote: RemoteForm,
 }
 
@@ -114,12 +116,16 @@ pub struct FcApp {
     /// "Do this for all errors of this kind" answers.
     remembered: HashMap<ErrorClass, ErrorAction>,
     remember_choice: bool,
+    conflict_choice: Option<(u64, u64)>,
+    conflict_all: bool,
     peers: PeerSearch,
     peer_list: Vec<fc_remote::discovery::Peer>,
     browser: RemoteBrowser,
     torrents: Torrents,
     notice: Option<String>,
     vpn: crate::vpn::VpnSettings,
+    profiles: crate::profiles::Profiles,
+    history: crate::history::History,
 }
 
 impl FcApp {
@@ -156,7 +162,7 @@ impl FcApp {
                 } else {
                     VerifyMode::Off
                 },
-                overwrite: false,
+                conflict_policy: ConflictPolicy::Ask,
                 remote: RemoteForm::default(),
             },
             view: View::Queue,
@@ -166,12 +172,16 @@ impl FcApp {
             throttle,
             remembered: HashMap::new(),
             remember_choice: false,
+            conflict_choice: None,
+            conflict_all: false,
             peers: PeerSearch::default(),
             peer_list: Vec::new(),
             browser: RemoteBrowser::default(),
             torrents: Torrents::start(startup.torrent_dht, startup.torrent_trackers),
             notice: None,
             vpn: crate::vpn::VpnSettings::default(),
+            profiles: crate::profiles::Profiles::default(),
+            history: crate::history::History::new(cc.egui_ctx.clone()),
         };
         app.state.speed_limit = startup.limit;
         if !app.form.sources.is_empty() && !app.form.dest.is_empty() {
@@ -183,6 +193,7 @@ impl FcApp {
     /// Drain every pending event without blocking.
     fn pump_events(&mut self) {
         while let Ok(ev) = self.events.try_recv() {
+            self.history.observe(&ev);
             if let Event::Decision(d) = ev {
                 if let Some(a) = self.remembered.get(&d.class) {
                     d.respond(*a);
@@ -232,11 +243,10 @@ impl FcApp {
         let options = CopyOptions {
             verify: self.form.verify,
             algorithm: Algorithm::Xxh3,
-            overwrite: self.form.overwrite,
             ..Default::default()
         };
         self.notice = None;
-        let id = self.queue.add(request.with_options(options));
+        let id = self.history.enqueue(&self.queue, request.with_options(options).with_conflict_policy(self.form.conflict_policy));
         self.state.details.insert(id, (sources, target));
         self.show_add = false;
     }
@@ -393,6 +403,9 @@ impl FcApp {
         }
 
         ui.add_space(14.0);
+        if ui.selectable_label(self.view == View::History, "Transfer history").clicked() {
+            self.view = View::History;
+        }
         ui.label(RichText::new("FEEDS & LOGS").small().color(DIM));
         ui.add_enabled(false, egui::Label::new("Torrent feeds"))
             .on_disabled_hover_text("Not built yet");
@@ -689,7 +702,43 @@ impl FcApp {
         self.queue_table(ui);
     }
 
+    fn select_profile(&mut self, profile: fc_remote::profiles::Profile, download: bool) {
+        match RemoteForm::from_profile(profile, download) {
+            Ok(form) => {
+                if download {
+                    self.form.sources = vec![PathBuf::from(&form.folder)];
+                } else if self.form.remote.download {
+                    self.form.sources.clear();
+                }
+                self.form.add_path.clear();
+                self.form.remote = form;
+                self.browser = RemoteBrowser::default();
+                self.notice = None;
+                self.show_add = true;
+            }
+            Err(e) => self.notice = Some(e),
+        }
+    }
+
+    fn edit_profile(&mut self) {
+        self.profiles.edit_form(&self.form.remote);
+        self.form.remote.password.clear();
+        self.browser = RemoteBrowser::default();
+        self.show_add = false;
+        self.view = View::Peers;
+    }
+
     fn peers_view(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            if let Some((profile, download)) = self.profiles.show(ui) {
+                self.select_profile(profile, download);
+            }
+            ui.separator();
+            self.discovered_peers(ui);
+        });
+    }
+
+    fn discovered_peers(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.strong("PCs on this network");
             if ui
@@ -707,39 +756,41 @@ impl FcApp {
             ui.weak("No PCs found. Make sure their agents are running on this network, then search again.");
             return;
         }
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for peer in self.peer_list.clone() {
-                    let addr = remote::address_for("", &peer);
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(&peer.name).strong());
-                            ui.monospace(&addr);
-                            match remote::trusted_fingerprint(&addr) {
-                                Some(fp) if fp == peer.fingerprint => {
-                                    ui.colored_label(OK, "trusted")
-                                }
-                                Some(_) => ui.colored_label(BAD, "FINGERPRINT CHANGED"),
-                                None => ui.colored_label(WARN, "not yet trusted"),
-                            };
-                        });
-                        ui.weak(format!("fingerprint {}", peer.fingerprint));
-                        if ui.button("Copy to this PC").clicked() {
-                            if self.form.remote.download { self.form.sources.clear(); }
-                            self.form.remote.download = false;
-                            self.browser = RemoteBrowser::default();
-                            self.form.remote.enabled = true;
-                            self.form.remote.address =
-                                remote::address_for(&self.form.remote.address, &peer);
-                            self.form.remote.fingerprint = peer.fingerprint.clone();
-                            self.form.remote.fingerprint_checked = false;
-                            self.show_add = true;
-                        }
-                    });
+        for peer in self.peer_list.clone() {
+            let addr = remote::address_for("", &peer);
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&peer.name).strong());
+                    ui.monospace(&addr);
+                    match remote::trusted_fingerprint(&addr) {
+                        Some(fp) if fp == peer.fingerprint => ui.colored_label(OK, "trusted"),
+                        Some(_) => ui.colored_label(BAD, "FINGERPRINT CHANGED"),
+                        None => ui.colored_label(WARN, "not yet trusted"),
+                    };
+                });
+                ui.weak(format!("fingerprint {}", peer.fingerprint));
+                if ui.button("Copy to this PC").clicked() {
+                    self.form.remote.clear_identity();
+                    if self.form.remote.download { self.form.sources.clear(); }
+                    self.form.remote.download = false;
+                    self.browser = RemoteBrowser::default();
+                    self.form.remote.enabled = true;
+                    self.form.remote.address = remote::address_for(&self.form.remote.address, &peer);
+                    self.form.remote.fingerprint = peer.fingerprint.clone();
+                    self.show_add = true;
+                }
+                if ui.add_enabled(self.profiles.available(), egui::Button::new("Save PC profile")).clicked() {
+                    let form = RemoteForm {
+                        enabled: true,
+                        address: remote::address_for(&self.form.remote.address, &peer),
+                        fingerprint: peer.fingerprint.clone(),
+                        ..Default::default()
+                    };
+                    self.profiles.edit_form(&form);
                 }
             });
+        }
     }
 
     fn logs_view(&mut self, ui: &mut egui::Ui) {
@@ -817,6 +868,9 @@ impl FcApp {
             self.form.sources.clear();
             self.form.add_path.clear();
             self.browser = RemoteBrowser::default();
+            if self.form.remote.download && self.form.remote.profile.is_some() {
+                self.form.sources.push(PathBuf::from(&self.form.remote.folder));
+            }
         }
         ui.horizontal(|ui| {
             ui.label("Source");
@@ -851,7 +905,7 @@ impl FcApp {
             self.remote_fields(ui);
             if self.form.remote.address != address {
                 self.browser = RemoteBrowser::default();
-                if self.form.remote.download { self.form.sources.clear(); }
+                if self.form.remote.download && self.form.remote.profile.is_none() { self.form.sources.clear(); }
             }
             if self.form.remote.download {
                 self.remote_browser(ui);
@@ -888,7 +942,15 @@ impl FcApp {
                         "Read back & compare",
                     );
                 });
-            ui.checkbox(&mut self.form.overwrite, "Overwrite existing");
+            egui::ComboBox::from_label("Existing files")
+                .selected_text(format!("{:?}", self.form.conflict_policy))
+                .show_ui(ui, |ui| {
+                    for (policy, label) in [
+                        (ConflictPolicy::Ask, "Ask"), (ConflictPolicy::Replace, "Replace"),
+                        (ConflictPolicy::Skip, "Skip"), (ConflictPolicy::KeepBoth, "Keep both"),
+                        (ConflictPolicy::Compare, "Compare; ask if different"),
+                    ] { ui.selectable_value(&mut self.form.conflict_policy, policy, label); }
+                });
         });
         if let Some(msg) = &self.notice {
             ui.colored_label(WARN, msg);
@@ -950,6 +1012,30 @@ impl FcApp {
 
     /// The remote destination: a PC from discovery, or an address typed by hand.
     fn remote_fields(&mut self, ui: &mut egui::Ui) {
+        let current = self.form.remote.profile.clone();
+        let label = current.as_ref().map(|p| p.name.as_str()).unwrap_or("Manual address");
+        let mut selected = None;
+        let mut manual = false;
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("saved-pc")
+                .selected_text(label)
+                .show_ui(ui, |ui| {
+                    manual = ui.selectable_label(current.is_none(), "Manual address").clicked();
+                    for profile in self.profiles.list() {
+                        if ui.selectable_label(current.as_ref().is_some_and(|p| p.id == profile.id), format!("{} - {}", profile.name, profile.target)).clicked() {
+                            selected = Some(profile.clone());
+                        }
+                    }
+                });
+            if ui.add_enabled(self.profiles.available(), egui::Button::new(if current.is_some() { "Edit profile" } else { "Save as profile" })).clicked() {
+                self.edit_profile();
+            }
+        });
+        if manual {
+            self.form.remote.clear_identity();
+            self.browser = RemoteBrowser::default();
+        }
+        if let Some(profile) = selected { self.select_profile(profile, self.form.remote.download); }
         ui.horizontal(|ui| {
             ui.label("PC");
             let before = self.peer_list.clone();
@@ -965,6 +1051,7 @@ impl FcApp {
                             .selectable_label(false, format!("{}  {addr}", peer.name))
                             .clicked()
                         {
+                            self.form.remote.clear_identity();
                             self.form.remote.address =
                                 remote::address_for(&self.form.remote.address, peer);
                             self.form.remote.fingerprint = peer.fingerprint.clone();
@@ -984,11 +1071,12 @@ impl FcApp {
         });
         ui.horizontal(|ui| {
             ui.label("Address");
-            ui.add(
+            let changed = ui.add(
                 egui::TextEdit::singleline(&mut self.form.remote.address)
                     .hint_text("user@host:port")
                     .desired_width(220.0),
-            );
+            ).changed();
+            if changed { self.form.remote.clear_identity(); }
             if !self.form.remote.download {
                 ui.label("Folder");
                 ui.add(
@@ -1007,7 +1095,9 @@ impl FcApp {
                     .desired_width(220.0),
             );
         });
-        if let Some(trusted) = remote::trusted_fingerprint(&self.form.remote.address) {
+        if let Some(profile) = &self.form.remote.profile {
+            ui.weak(format!("Saved profile pin: {}", profile.fingerprint));
+        } else if let Some(trusted) = remote::trusted_fingerprint(&self.form.remote.address) {
             ui.weak(format!("Trusted: {trusted}"));
         } else if !self.form.remote.fingerprint.is_empty() {
             ui.weak(format!("The PC presents {}", self.form.remote.fingerprint));
@@ -1016,7 +1106,7 @@ impl FcApp {
                 "I checked this matches the PC's own fingerprint",
             );
         } else {
-            ui.weak("First time with this PC: pick it from the list, so its fingerprint can be checked.");
+            ui.weak("First time with this PC: use Save as profile to test its address and confirm its fingerprint, or pick a discovered PC.");
         }
     }
 
@@ -1065,6 +1155,38 @@ impl FcApp {
                 }
             });
         });
+    }
+
+    fn conflict_modal(&mut self, ctx: &egui::Context) {
+        let Some(job) = self.queue.active_job() else { return; };
+        let Some(conflict) = job.conflict else { return; };
+        if self.conflict_choice != Some((job.id, conflict.id)) {
+            self.conflict_choice = Some((job.id, conflict.id));
+            self.conflict_all = false;
+        }
+        let mut answer = None;
+        egui::Modal::new(egui::Id::new("file-conflict")).show(ctx, |ui| {
+            ui.set_width(480.0);
+            ui.heading(if conflict.details.different { "Files have different contents" } else { "Destination already exists" });
+            ui.label(format!("Source: {}", conflict.details.source.display()));
+            ui.label(format!("Destination: {}", conflict.details.destination.display()));
+            ui.checkbox(&mut self.conflict_all, "Apply to remaining conflicts in this job");
+            ui.horizontal_wrapped(|ui| {
+                for (action, label) in [
+                    (ConflictAction::Replace, "Replace"), (ConflictAction::Skip, "Skip"),
+                    (ConflictAction::KeepBoth, "Keep both"), (ConflictAction::Compare, "Compare"),
+                    (ConflictAction::Cancel, "Cancel job"),
+                ] {
+                    if action == ConflictAction::Compare && conflict.details.different { continue; }
+                    if ui.button(label).clicked() { answer = Some(action); }
+                }
+            });
+        });
+        if let Some(action) = answer {
+            if !self.queue.resolve_conflict(job.id, conflict.id, ConflictChoice { action, apply_to_all: self.conflict_all }) {
+                self.notice = Some("That conflict is no longer waiting for an answer.".into());
+            }
+        }
     }
 
     fn decision_modal(&mut self, ctx: &egui::Context) {
@@ -1167,6 +1289,7 @@ fn progress_color(state: &JobState) -> Color32 {
 impl eframe::App for FcApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_events();
+        if let Some(error) = self.history.poll() { self.notice = Some(error); }
         self.handle_drops(ctx);
         if let Some(found) = self.peers.poll() {
             match found {
@@ -1198,6 +1321,7 @@ impl eframe::App for FcApp {
         self.torrents.refresh();
         egui::CentralPanel::default().show(ctx, |ui| match self.view {
             View::Queue => self.queue_view(ui),
+            View::History => self.history.show(ui),
             View::Peers => self.peers_view(ui),
             View::Torrents => torrent::show(ui, &mut self.torrents),
             View::Logs => self.logs_view(ui),
@@ -1216,6 +1340,14 @@ impl eframe::App for FcApp {
             }
         });
 
+        if let Some(selected) = &self.form.remote.profile {
+            if !self.profiles.list().iter().any(|p| p == selected) {
+                self.form.remote.clear_identity();
+                self.browser = RemoteBrowser::default();
+                if self.form.remote.download { self.form.sources.clear(); }
+                self.notice = Some("The selected profile changed or was removed. Select the saved PC again before transferring.".into());
+            }
+        }
         let mut open = self.show_add;
         egui::Window::new("Add task / files")
             .open(&mut open)
@@ -1229,6 +1361,7 @@ impl eframe::App for FcApp {
         self.show_add &= open;
 
         self.decision_modal(ctx);
+        self.conflict_modal(ctx);
 
         // Keep "Elapsed" ticking between telemetry events (e.g. at very low speed limits).
         if self.state.active.is_some() && !self.state.paused {
@@ -1243,6 +1376,8 @@ impl eframe::App for FcApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Cancel cleanly so no .fcpart files are left behind.
         self.queue.shutdown();
+        self.pump_events();
+        self.history.shutdown();
         self.torrents.shutdown();
     }
 }

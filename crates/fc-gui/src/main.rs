@@ -28,8 +28,10 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod history;
 mod integration;
 mod remote;
+mod profiles;
 mod state;
 mod torrent;
 mod vpn;

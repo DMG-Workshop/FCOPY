@@ -393,6 +393,94 @@ fn queued_pull(a: &Agent, queue: &Queue, sources: &[&str], dest: &Path) -> u64 {
     queue.add(TransferRequest::to_backend(sources.iter().map(Into::into).collect(), std::sync::Arc::new(backend)))
 }
 
+#[test]
+fn download_conflicts_preserve_originals_and_report_keep_both_path() {
+    use fc_engine::conflict::{ConflictPolicy as P, ConflictAction as A, ConflictChoice};
+    use std::sync::Arc;
+    let a = agent();
+    fs::write(a.share.path().join("note.txt"), b"new").unwrap();
+    let out = tempfile::tempdir().unwrap();
+    for (policy, identical) in [(P::Skip, false), (P::Replace, false), (P::KeepBoth, false), (P::Compare, true), (P::Compare, false)] {
+        fs::write(out.path().join("note.txt"), if identical { b"new" } else { b"old" }).unwrap();
+        let (q, events) = Queue::start(QueueConfig::default());
+        let backend = PullBackend::new(Arc::new(a.backend()), out.path().into());
+        let id = q.add(TransferRequest::to_backend(vec!["backup/note.txt".into()], Arc::new(backend)).with_conflict_policy(policy));
+        if policy == P::Compare && !identical {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(conflict) = q.job(id).unwrap().conflict {
+                    assert!(conflict.details.different);
+                    assert!(q.resolve_conflict(id, conflict.id, ConflictChoice { action: A::KeepBoth, apply_to_all: false }));
+                    break;
+                }
+                let event = events.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
+                assert!(!matches!(event, Event::Finished { .. }), "{event:?}");
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut copied_path = None;
+        let state = loop {
+            match events.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap() {
+                Event::FileCopied { dst, .. } => copied_path = Some(dst),
+                Event::Finished { state, .. } => break state,
+                _ => {}
+            }
+        };
+        assert_eq!(state, if policy == P::Skip || identical { JobState::CompletedWithErrors } else { JobState::Completed });
+        assert_eq!(fs::read(out.path().join("note.txt")).unwrap(), if policy == P::Replace || identical { b"new" } else { b"old" });
+        if policy == P::KeepBoth || (policy == P::Compare && !identical) {
+            let n = if policy == P::KeepBoth { 1 } else { 2 };
+            let dest = out.path().join(format!("note (copy {n}).txt"));
+            assert_eq!(copied_path.as_ref(), Some(&dest));
+            assert_eq!(fs::read(dest).unwrap(), b"new");
+        }
+        assert_eq!(q.job(id).unwrap().telemetry.unwrap().files_done, 1);
+        q.shutdown();
+    }
+    a.handle.shutdown();
+}
+
+#[test]
+fn direct_pull_conflicts_and_comparison_cancel_are_responsive() {
+    use fc_engine::conflict::{ConflictPolicy as P, ConflictResolver};
+    use std::sync::Arc;
+    let a = agent();
+    fs::write(a.share.path().join("note"), b"new").unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let local = out.path().join("note");
+    fs::write(&local, b"old").unwrap();
+    let backend = a.backend();
+    let opts = PullOptions { conflicts: Some(Arc::new(ConflictResolver::new(P::KeepBoth))), ..Default::default() };
+    let report = backend.pull("backup/note", &local, &opts, &JobControl::new(), None, &()).unwrap();
+    assert_eq!(report.files, 1);
+    assert!(report.failed.is_empty());
+    assert_eq!(fs::read(&local).unwrap(), b"old");
+    assert_eq!(fs::read(out.path().join("note (copy 1)")).unwrap(), b"new");
+    let opts = PullOptions { conflicts: Some(Arc::new(ConflictResolver::new(P::Compare))), ..Default::default() };
+    let error = backend.pull("backup/note", &local, &opts, &JobControl::new(), None, &()).unwrap_err();
+    assert!(matches!(error, ClientError::Remote(ref message) if message.contains("interactive decision")), "{error:?}");
+    assert_eq!(fs::read(&local).unwrap(), b"old");
+
+    let bytes = data(4 * MIB, 24);
+    fs::write(&local, &bytes).unwrap();
+    fs::write(a.share.path().join("note"), &bytes).unwrap();
+    let session = a.login(None);
+    let control = JobControl::new();
+    let limiter = fc_engine::RateLimiter::new(Some(1024));
+    a.rt.block_on(async {
+        let cancel = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            control.cancel();
+        };
+        let ctl = PushControl { control: &control, limiter: Some(&limiter) };
+        let compare = session.matches_local("backup/note", &local, &ctl);
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(compare, cancel) }).await.unwrap();
+        assert!(matches!(result, Err(ClientError::Cancelled)), "{result:?}");
+    });
+    no_leftovers(out.path());
+    a.handle.shutdown();
+}
+
 fn wait_finished(events: &std::sync::mpsc::Receiver<Event>, id: u64) -> (JobState, fc_engine::JobSummary) {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {

@@ -49,6 +49,7 @@ use crate::error::{ErrorClass, Operation};
 use crate::progress::{Progress, Snapshot};
 use crate::recovery::{AutoHandler, ErrorAction, ErrorContext, ErrorHandler, RetryPolicy};
 use crate::throttle::RateLimiter;
+use crate::conflict::{Conflict, ConflictAction, ConflictChoice, ConflictResolver};
 
 pub type JobId = u64;
 
@@ -132,24 +133,30 @@ pub struct TransferRequest {
     /// Per-job engine options (verify mode, overwrite…). `None` = queue defaults.
     /// The queue's shared speed limit always applies.
     pub options: Option<CopyOptions>,
+    pub conflict_policy: Option<crate::conflict::ConflictPolicy>,
 }
 
 impl TransferRequest {
     pub fn into_dir(sources: Vec<PathBuf>, dir: impl Into<PathBuf>) -> Self {
-        Self { sources, target: Target::IntoDir(dir.into()), label: None, options: None }
+        Self { sources, target: Target::IntoDir(dir.into()), label: None, options: None, conflict_policy: None }
     }
 
     pub fn file_to(src: impl Into<PathBuf>, dst: impl Into<PathBuf>) -> Self {
-        Self { sources: vec![src.into()], target: Target::FileTo(dst.into()), label: None, options: None }
+        Self { sources: vec![src.into()], target: Target::FileTo(dst.into()), label: None, options: None, conflict_policy: None }
     }
 
     /// Copy `sources` into a backend destination (e.g. a remote agent).
     pub fn to_backend(sources: Vec<PathBuf>, backend: Arc<dyn TransferBackend>) -> Self {
-        Self { sources, target: Target::Backend(backend), label: None, options: None }
+        Self { sources, target: Target::Backend(backend), label: None, options: None, conflict_policy: None }
     }
 
     pub fn with_options(mut self, options: CopyOptions) -> Self {
         self.options = Some(options);
+        self
+    }
+
+    pub fn with_conflict_policy(mut self, policy: crate::conflict::ConflictPolicy) -> Self {
+        self.conflict_policy = Some(policy);
         self
     }
 
@@ -158,7 +165,8 @@ impl TransferRequest {
         self
     }
 
-    fn display_label(&self) -> String {
+    /// The label shown by the queue, also suitable for a finished-job summary.
+    pub fn display_label(&self) -> String {
         if let Some(l) = &self.label {
             return l.clone();
         }
@@ -214,6 +222,13 @@ pub struct JobInfo {
     pub telemetry: Option<Snapshot>,
     pub queued_at: SystemTime,
     pub elapsed: Option<Duration>,
+    pub conflict: Option<PendingConflict>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingConflict {
+    pub id: u64,
+    pub details: Conflict,
 }
 
 /// Totals reported when a job ends.
@@ -266,6 +281,7 @@ pub enum Event {
     FileSkipped { job: JobId, src: PathBuf, reason: String },
     FileFailed { job: JobId, src: PathBuf, reason: String },
     Decision(DecisionRequest),
+    Conflict { job: JobId },
     Paused,
     Resumed,
     JobPaused { job: JobId },
@@ -327,6 +343,8 @@ struct QState {
     paused: bool,
     shutdown: bool,
     active: Option<JobId>,
+    next_conflict: u64,
+    conflict_reply: Option<(JobId, u64, Sender<ConflictChoice>)>,
 }
 
 impl QState {
@@ -371,6 +389,37 @@ impl Inner {
         if let Some(j) = self.lock().job_mut(id) {
             f(&mut j.info);
         }
+    }
+
+    fn ask_conflict(&self, job: JobId, details: &Conflict, control: &JobControl) -> ConflictChoice {
+        let cancel = ConflictChoice { action: ConflictAction::Cancel, apply_to_all: false };
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut state = self.lock();
+            state.next_conflict += 1;
+            let id = state.next_conflict;
+            let Some(entry) = state.job_mut(job) else { return cancel; };
+            entry.info.conflict = Some(PendingConflict { id, details: details.clone() });
+            state.conflict_reply = Some((job, id, tx));
+        }
+        let delivered = self.events.send(Event::Conflict { job }).is_ok();
+        if let Some(notify) = &self.notify { notify(); }
+        let answer = loop {
+            if !delivered || control.is_cancelled() { break cancel; }
+            if control.take_skip() { break ConflictChoice { action: ConflictAction::Skip, apply_to_all: false }; }
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(answer) => break answer,
+                Err(RecvTimeoutError::Disconnected) => break cancel,
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        };
+        {
+            let mut state = self.lock();
+            state.conflict_reply = None;
+            if let Some(entry) = state.job_mut(job) { entry.info.conflict = None; }
+        }
+        self.emit(Event::Conflict { job });
+        answer
     }
 }
 
@@ -436,6 +485,7 @@ impl Queue {
                     telemetry: None,
                     queued_at: SystemTime::now(),
                     elapsed: None,
+                    conflict: None,
                 },
                 request,
                 control: Arc::new(JobControl::new()),
@@ -628,6 +678,21 @@ impl Queue {
         st.jobs.iter().find(|j| j.info.id == id).map(|j| j.info.clone())
     }
 
+    /// Reject stale replies rather than applying them to the next file.
+    pub fn resolve_conflict(&self, job: JobId, id: u64, choice: ConflictChoice) -> bool {
+        let mut state = self.inner.lock();
+        let valid = state.jobs.iter().find(|j| j.info.id == job).is_some_and(|j| {
+            !j.control.is_cancelled() && j.info.conflict.as_ref().is_some_and(|c| {
+                c.id == id && !(c.details.different && choice.action == ConflictAction::Compare)
+            })
+        });
+        if !valid { return false; }
+        match state.conflict_reply.take() {
+            Some((pending_job, pending_id, sender)) if pending_job == job && pending_id == id => sender.send(choice).is_ok(),
+            other => { state.conflict_reply = other; false }
+        }
+    }
+
     /// Block until nothing is running and nothing runnable is pending.
     pub fn wait_idle(&self) {
         let mut st = self.inner.lock();
@@ -686,8 +751,17 @@ fn worker_loop(inner: Arc<Inner>, engines: Engines, plan_opts: PlanOptions, inte
         };
 
         let started = Instant::now();
-        let custom = request.options.clone().map(|mut o| {
+        let custom = request.options.clone()
+            .or_else(|| (request.conflict_policy.is_some() || engines.default.options().conflicts.is_some()).then(|| engines.default.options().clone()))
+            .map(|mut o| {
             o.rate_limit = Some(engines.limiter.clone());
+            if let Some(policy) = request.conflict_policy { o.conflicts = Some(Arc::new(ConflictResolver::new(policy))); }
+            if let Some(resolver) = &o.conflicts {
+                let inner = inner.clone();
+                o.conflicts = Some(Arc::new(ConflictResolver::new(resolver.policy).with_handler(Arc::new(
+                    move |details, control| inner.ask_conflict(id, details, control)
+                ))));
+            }
             Copier::new(o, engines.handler.clone())
         });
         let copier = custom.as_ref().unwrap_or(&engines.default);

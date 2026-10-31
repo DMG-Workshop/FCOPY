@@ -454,6 +454,7 @@ struct Prepared {
     tmp: PathBuf,
     dest: PathBuf,
     resume_from: u64,
+    overwrite: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -487,7 +488,7 @@ fn prepare_file(share: &Share, dest: PathBuf, size: u64, source_id: [u8; 16], ov
     file.set_len(resume_from).map_err(io_err)?;
     file.seek(SeekFrom::Start(resume_from)).map_err(io_err)?;
     fs::write(&id_path, source_id).map_err(io_err)?;
-    Ok(Prepared { file, tmp, dest, resume_from })
+    Ok(Prepared { file, tmp, dest, resume_from, overwrite })
 }
 
 /// fsync, re-read from disk (cache dropped where possible), hash, compare, commit.
@@ -526,7 +527,7 @@ fn finalize_file(p: &Prepared, algo: HashAlgo, expected: &[u8], mtime: (i64, u32
     }
     #[cfg(not(unix))]
     let _ = mode;
-    fs::rename(&p.tmp, &p.dest)?;
+    fc_engine::conflict::commit_file(&p.tmp, &p.dest, p.overwrite)?;
     let _ = fs::remove_file(sidecar(&p.dest, ID_SUFFIX));
     Ok(Ok(digest))
 }

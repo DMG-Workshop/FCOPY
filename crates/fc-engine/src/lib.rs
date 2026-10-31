@@ -41,6 +41,7 @@ pub mod buffer;
 mod cache;
 pub mod checksum;
 pub mod control;
+pub mod conflict;
 pub mod copy;
 pub mod error;
 pub mod platform;

@@ -84,6 +84,8 @@ pub struct CopyOptions {
     pub algorithm: Algorithm,
     /// Replace an existing destination file.
     pub overwrite: bool,
+    /// Optional conflict policy; queues attach a per-job interactive handler.
+    pub conflicts: Option<Arc<crate::conflict::ConflictResolver>>,
     /// `fsync` the file (and its directory) before committing.
     pub fsync: bool,
     /// Copy access and modification times (plus creation time on Windows/macOS).
@@ -118,6 +120,7 @@ impl Default for CopyOptions {
             verify: VerifyMode::Off,
             algorithm: Algorithm::default(),
             overwrite: false,
+            conflicts: None,
             fsync: false,
             preserve_mtime: true,
             preserve_permissions: true,
@@ -262,13 +265,14 @@ impl Copier {
         *size_out = size;
         progress.set_file_size(size);
 
-        // Conflicts that need a human decision are reported, not retried.
-        if fs::symlink_metadata(dst).is_ok() {
-            let same = matches!((fs::canonicalize(src), fs::canonicalize(dst)), (Ok(a), Ok(b)) if a == b);
-            if !opts.overwrite || same {
-                return Err(Abort::Fatal(CopyError::DestinationExists(dst.to_path_buf())));
-            }
-        }
+        let (destination, overwrite) = crate::conflict::local_destination(
+            src, dst, opts.overwrite, opts.conflicts.as_deref(), rec.control,
+        ).map_err(|e| match e {
+            CopyError::SkippedByUser => Abort::Skip(e),
+            CopyError::Cancelled => Abort::Cancel,
+            _ => Abort::Fatal(e),
+        })?;
+        let dst = destination.as_path();
 
         if opts.create_parent_dirs {
             if let Some(parent) = dst.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -293,7 +297,7 @@ impl Copier {
 
         let mut attempt = 0;
         loop {
-            match self.attempt(rec, src, dst, &meta, size, progress) {
+            match self.attempt(rec, src, dst, &meta, size, progress, overwrite) {
                 Ok(report) => return Ok(report),
                 Err(AttemptError::Abort(a)) => return Err(a),
                 Err(AttemptError::Restart(op, err)) => {
@@ -308,6 +312,7 @@ impl Copier {
     }
 
     /// One complete copy attempt of one file.
+    #[allow(clippy::too_many_arguments)]
     fn attempt(
         &self,
         rec: &Recovery<'_>,
@@ -316,6 +321,7 @@ impl Copier {
         meta0: &fs::Metadata,
         size: u64,
         progress: &Progress,
+        overwrite: bool,
     ) -> std::result::Result<CopyReport, AttemptError> {
         let opts = &self.options;
         let tmp = temp_path(dst);
@@ -419,7 +425,7 @@ impl Copier {
         drop(src_file);
 
         // ---- commit ----
-        rec.run(dst, Operation::Finalize, None, |_| fs::rename(&tmp, dst))?;
+        rec.run(dst, Operation::Finalize, None, |_| crate::conflict::commit_file(&tmp, dst, overwrite))?;
         guard.disarm();
         if opts.fsync {
             cache::sync_parent_dir(dst);

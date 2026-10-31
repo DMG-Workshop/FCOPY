@@ -96,6 +96,12 @@ function fcopy() {
     search: '',
     selected: {},
     jobs: {},
+    history: [],
+    historySearch: '',
+    historyNotice: '',
+    historyBusy: false,
+    historyPersistent: true,
+    historyRequest: 0,
     logs: [],
     logOpen: false,
     graphHistory: [],
@@ -103,6 +109,11 @@ function fcopy() {
 
     // modals and forms
     modal: null,
+    conflictPolicy: 'ask',
+    conflictAll: false,
+    conflictAllId: null,
+    conflictBusy: false,
+    conflictNotice: '',
     addForm: { sources: '', dest: '', label: '', mode: 'local', clientId: '', password: '' },
     addNotice: '',
     remoteBrowser: { path: '', entries: [], busy: false, error: '' },
@@ -137,6 +148,7 @@ function fcopy() {
       }
       const r = await this.api('GET', '/api/me');
       if (r.ok) {
+        this.resetHistory();
         this.user = await r.json();
         this.connect();
         if (this.isAdmin()) this.loadSettings();
@@ -172,6 +184,7 @@ function fcopy() {
         this.error = r.status === 401 ? 'Wrong account or password.' : await errorText(r);
         return;
       }
+      this.resetHistory();
       this.user = await r.json();
       this.connect();
       if (this.isAdmin()) this.loadSettings();
@@ -185,10 +198,15 @@ function fcopy() {
       this.user = null;
       this.mode = 'local';
       this.jobs = {};
+      this.resetHistory();
       this.logs = [];
       this.selected = {};
       this.torrents = [];
       this.vpnTarget = '';
+      this.conflictPolicy = 'ask';
+      this.conflictAll = false;
+      this.conflictAllId = null;
+      this.conflictNotice = '';
     },
 
     // ---------- live queue ----------
@@ -211,6 +229,7 @@ function fcopy() {
           const r = await this.api('GET', '/api/me');
           if (!r.ok) {
             this.user = null;
+            this.resetHistory();
             return;
           }
           this.connect();
@@ -237,6 +256,69 @@ function fcopy() {
       }
       // The whole list arrives whenever it changes; absent means unchanged.
       if (frame.torrents) this.torrents = frame.torrents;
+      if (this.mode === 'history' && !this.historyBusy && (frame.jobs || []).some((job) => !this.isActive(job.state))) {
+        this.loadHistory();
+      }
+    },
+
+    // ---------- finished-job history ----------
+
+    resetHistory() {
+      this.history = [];
+      this.historyNotice = '';
+      this.historySearch = '';
+      ++this.historyRequest;
+      this.historyBusy = false;
+      this.historyPersistent = true;
+    },
+
+    async loadHistory() {
+      const request = ++this.historyRequest;
+      const user = this.user;
+      this.historyBusy = true;
+      this.historyNotice = '';
+      try {
+        const r = await this.api('GET', '/api/history');
+        if (!r.ok) throw new Error(await errorText(r));
+        const body = await r.json();
+        if (this.user !== user || request !== this.historyRequest) return;
+        this.history = body.entries;
+        this.historyPersistent = body.persistent;
+      } catch (e) {
+        if (this.user === user && request === this.historyRequest) this.historyNotice = `Cannot load history: ${e.message}`;
+      } finally {
+        if (this.user === user && request === this.historyRequest) this.historyBusy = false;
+      }
+    },
+
+    visibleHistory() {
+      const query = this.historySearch.trim().toLowerCase();
+      return this.history.filter((entry) => !query ||
+        [entry.label, entry.destination, entry.owner || '', ...entry.sources].some((text) => text.toLowerCase().includes(query)));
+    },
+
+    historyTime(ms) {
+      return new Date(ms).toLocaleString();
+    },
+
+    async clearHistory() {
+      if (this.historyBusy || !window.confirm(this.isAdmin()
+        ? 'Clear all saved transfer history for every account? Files and queued transfers are not changed.'
+        : 'Clear your saved transfer history? Files and queued transfers are not changed.')) return;
+      const user = this.user;
+      this.historyBusy = true;
+      this.historyNotice = '';
+      // Invalidate a previous refresh before clearing.
+      ++this.historyRequest;
+      try {
+        const r = await this.api('DELETE', '/api/history');
+        if (!r.ok) throw new Error(await errorText(r));
+        if (this.user === user) await this.loadHistory();
+      } catch (e) {
+        if (this.user === user) this.historyNotice = `Cannot clear history: ${e.message}`;
+      } finally {
+        if (this.user === user) this.historyBusy = false;
+      }
     },
 
     // ---------- BitTorrent ----------
@@ -500,12 +582,14 @@ function fcopy() {
         await this.loadClients();
         this.clientTimer = setInterval(() => this.loadClients(), 10000);
       }
+      if (m === 'history') await this.loadHistory();
     },
 
     async create() {
       this.addNotice = '';
       const sources = this.addForm.sources.split('\n').map((s) => s.trim()).filter(Boolean);
-      const body = { sources, dest: this.addForm.dest.trim(), label: this.addForm.label.trim() || null };
+      const body = { sources, dest: this.addForm.dest.trim(), label: this.addForm.label.trim() || null,
+        conflict: this.conflictPolicy };
       if (this.addForm.mode === 'remote' || this.addForm.mode === 'download') {
         if (!this.addForm.clientId) {
           this.addNotice = 'Choose a paired PC.';
@@ -528,6 +612,36 @@ function fcopy() {
         this.closeModal();
       } else {
         this.addNotice = await errorText(r);
+      }
+    },
+
+    pendingConflict() {
+      return Object.values(this.jobs).find((job) => job.conflict) || null;
+    },
+
+    async resolveConflict(action) {
+      const job = this.pendingConflict();
+      if (!job || this.conflictBusy) {
+        this.conflictNotice = 'No conflict is currently available to answer.';
+        return;
+      }
+      const id = job.conflict.id;
+      this.conflictBusy = true;
+      this.conflictNotice = '';
+      try {
+        const r = await this.api('POST', `/api/transfers/${job.id}/conflict`, {
+          conflict_id: id, action, apply_to_all: this.conflictAll && this.conflictAllId === id,
+        });
+        if (!r.ok) {
+          this.conflictNotice = await errorText(r);
+          return;
+        }
+        if (this.jobs[job.id]?.conflict?.id === id) this.jobs[job.id].conflict = null;
+        this.conflictAll = false;
+      } catch (e) {
+        this.conflictNotice = `Cannot answer conflict: ${e.message}`;
+      } finally {
+        this.conflictBusy = false;
       }
     },
 

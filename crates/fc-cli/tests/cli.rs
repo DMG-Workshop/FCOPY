@@ -9,6 +9,25 @@ fn fcopy() -> Command {
     Command::new(env!("CARGO_BIN_EXE_fcopy"))
 }
 
+#[test]
+fn explicit_conflict_policies_work_without_a_terminal() {
+    for policy in ["replace", "skip", "keep-both", "compare", "ask"] {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        fs::write(&src, b"incoming").unwrap();
+        fs::write(&dst, b"existing").unwrap();
+        let output = fcopy().args(["copy", "--conflict", policy]).arg(&src).arg(&dst).output().unwrap();
+        if matches!(policy, "replace" | "keep-both") {
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        } else { assert!(!output.status.success()); }
+        assert_eq!(fs::read(&dst).unwrap(), if policy == "replace" { b"incoming" } else { b"existing" });
+        if policy == "keep-both" {
+            assert_eq!(fs::read(dir.path().join("dst (copy 1)")).unwrap(), b"incoming");
+        }
+    }
+}
+
 fn data(len: usize) -> Vec<u8> {
     (0..len).map(|i| ((i * 2654435761usize) >> 13) as u8).collect()
 }

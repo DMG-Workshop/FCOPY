@@ -107,6 +107,15 @@ pub struct JobDto {
     pub files_failed: u64,
     pub bytes_total: u64,
     pub bytes_copied: u64,
+    pub conflict: Option<ConflictDto>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ConflictDto {
+    pub id: u64,
+    pub source: String,
+    pub destination: String,
+    pub different: bool,
 }
 
 impl JobDto {
@@ -138,6 +147,10 @@ impl JobDto {
             files_failed: info.files_failed,
             bytes_total: info.bytes_total,
             bytes_copied: info.bytes_copied,
+            conflict: info.conflict.as_ref().map(|c| ConflictDto {
+                id: c.id, source: c.details.source.display().to_string(),
+                destination: c.details.destination.display().to_string(), different: c.details.different,
+            }),
         }
     }
 }
@@ -167,10 +180,12 @@ pub struct Frame {
 /// into an async channel, and a task turns those events into frames.
 pub fn spawn_producer(state: Arc<AppState>, events: std::sync::mpsc::Receiver<Event>) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let history = state.history.clone();
     std::thread::Builder::new()
         .name("fc-web-events".into())
         .spawn(move || {
             while let Ok(ev) = events.recv() {
+                history.observe(&ev);
                 if tx.send(ev).is_err() {
                     break;
                 }
@@ -188,7 +203,14 @@ pub fn spawn_producer(state: Arc<AppState>, events: std::sync::mpsc::Receiver<Ev
         loop {
             tokio::select! {
                 ev = rx.recv() => match ev {
-                    Some(ev) => collect(ev, &mut dirty, &mut removed, &mut logs),
+                    Some(ev) => {
+                        if let Event::Finished { job, .. } = &ev {
+                            if let Some(error) = crate::history::persistence_error(&state) {
+                                logs.push(LogLine { job: *job, kind: "history_error", message: format!("Transfer history was not saved: {error}. Open History and Refresh to retry.") });
+                            }
+                        }
+                        collect(ev, &mut dirty, &mut removed, &mut logs);
+                    },
                     None => break,
                 },
                 _ = tick.tick() => {
@@ -214,6 +236,7 @@ pub fn spawn_producer(state: Arc<AppState>, events: std::sync::mpsc::Receiver<Ev
 fn collect(ev: Event, dirty: &mut BTreeSet<JobId>, removed: &mut Vec<JobId>, logs: &mut Vec<LogLine>) {
     match ev {
         Event::Queued { job, .. }
+        | Event::Conflict { job }
         | Event::Started { job, .. }
         | Event::Progress { job, .. }
         | Event::FileCopied { job, .. }
@@ -340,6 +363,7 @@ mod tests {
             files_failed: 0,
             bytes_total: 100,
             bytes_copied: 10,
+            conflict: None,
         }
     }
 
@@ -400,6 +424,7 @@ mod tests {
             telemetry: None,
             queued_at: std::time::SystemTime::now(),
             elapsed: None,
+            conflict: None,
         };
         let d = JobDto::from_info(&info, Some("alice"));
         assert_eq!(d.state, "paused");

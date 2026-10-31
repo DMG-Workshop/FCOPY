@@ -196,6 +196,10 @@ impl RemoteBackend {
 
     /// Upload one file. Retries across reconnects resume from the server's offset.
     async fn send_file(&self, ctx: &BackendContext<'_>, item: &CopyItem, remote: &str) -> Result<CopyReport, CopyError> {
+        let ctl = PushControl { control: ctx.control, limiter: ctx.options.rate_limit.as_deref() };
+        let (remote, _, overwrite) = self.conflict_destination(
+            remote, &item.src, true, ctx.options.overwrite, ctx.options.conflicts.as_deref(), &ctl,
+        ).await.map_err(|e| to_copy_error(e, &item.src))?;
         let started = Instant::now();
         let tally = Tally {
             sent: &self.sent,
@@ -211,9 +215,9 @@ impl RemoteBackend {
             let s = self.session(ctx.control).await.map_err(|e| to_copy_error(e, &item.src))?;
             let req = PushRequest {
                 local: &item.src,
-                remote,
+                remote: &remote,
                 algo: wire_algo(ctx.options.algorithm),
-                overwrite: ctx.options.overwrite,
+                overwrite,
                 source_id,
             };
             let ctl = PushControl { control: ctx.control, limiter: ctx.options.rate_limit.as_deref() };
@@ -221,7 +225,7 @@ impl RemoteBackend {
                 Ok(out) => {
                     return Ok(CopyReport {
                         src: item.src.clone(),
-                        dst: PathBuf::from(remote),
+                        dst: PathBuf::from(&remote),
                         bytes: out.size,
                         source_digest: Some(out.digest),
                         verified: true,
@@ -308,7 +312,7 @@ impl RemoteBackend {
                 (item, result)
             }
         }))
-        .buffer_unordered(SMALL_PARALLEL);
+        .buffer_unordered(if ctx.options.conflicts.is_some() { 1 } else { SMALL_PARALLEL });
         while let Some((item, result)) = lane.next().await {
             if !self.record(ctx, item, result, &mut report, on_file) {
                 return Ok(report);
@@ -342,18 +346,19 @@ impl RemoteBackend {
 /// loops, and the server is not trusted to be finite.
 const MAX_PULL_DEPTH: usize = 64;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PullOptions {
     pub algo: HashAlgo,
     /// Replace files that already exist locally.
     pub overwrite: bool,
+    pub conflicts: Option<Arc<fc_engine::conflict::ConflictResolver>>,
     /// Copy modification times and (on Unix) permissions from the server.
     pub preserve: bool,
 }
 
 impl Default for PullOptions {
     fn default() -> Self {
-        Self { algo: HashAlgo::Xxh3, overwrite: false, preserve: true }
+        Self { algo: HashAlgo::Xxh3, overwrite: false, preserve: true, conflicts: None }
     }
 }
 
@@ -488,6 +493,7 @@ impl PullBackend {
             let opts = PullOptions {
                 algo: wire_algo(ctx.options.algorithm),
                 overwrite: ctx.options.overwrite,
+                conflicts: ctx.options.conflicts.clone(),
                 preserve: ctx.options.preserve_mtime || ctx.options.preserve_permissions,
             };
             let pull_ctx = PullCtx { opts: &opts, control: ctx.control, limiter: ctx.options.rate_limit.as_deref(), progress: &progress };
@@ -504,7 +510,7 @@ impl PullBackend {
             match result {
                 Ok(out) => {
                     let rep = CopyReport {
-                        src: item.src.clone(), dst: item.dst.clone(), bytes: out.size,
+                        src: item.src.clone(), dst: out.local.clone(), bytes: out.size,
                         source_digest: Some(out.digest), verified: true, retries: 0,
                         elapsed: file_started.elapsed(), warnings: vec![],
                     };
@@ -721,17 +727,138 @@ impl RemoteBackend {
         }
     }
 
+    async fn remote_exists(&self, remote: &str, control: &JobControl) -> Result<bool, ClientError> {
+        match self.remote_size(remote, control).await {
+            Ok(_) | Err(ClientError::Rejected { reason: RejectReason::IsDirectory, .. }) => Ok(true),
+            Err(ClientError::Rejected { reason: RejectReason::NotFound, .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn remote_size(&self, remote: &str, control: &JobControl) -> Result<u64, ClientError> {
+        let mut attempts = 0;
+        loop {
+            if control.is_cancelled() { return Err(ClientError::Cancelled); }
+            if control.take_skip() { return Err(ClientError::Skipped); }
+            let session = self.session(control).await?;
+            let abort = async {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    if control.is_cancelled() { return ClientError::Cancelled; }
+                    if control.take_skip() { return ClientError::Skipped; }
+                }
+            };
+            let result = tokio::select! {
+                result = session.file_size(remote) => result,
+                error = abort => Err(error),
+            };
+            match result {
+                Ok(size) => return Ok(size),
+                Err(e) if e.is_retryable() && attempts < MAX_FILE_ATTEMPTS => {
+                    attempts += 1;
+                    self.drop_session(&session).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    async fn compare_remote(&self, remote: &str, local: &Path, ctl: &PushControl<'_>) -> Result<bool, ClientError> {
+        let mut attempts = 0;
+        loop {
+            let session = self.session(ctl.control).await?;
+            match session.matches_local(remote, local, ctl).await {
+                Ok(equal) => return Ok(equal),
+                Err(e) if e.is_retryable() && attempts < MAX_FILE_ATTEMPTS => {
+                    attempts += 1;
+                    self.drop_session(&session).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    async fn conflict_destination(
+        &self, remote: &str, local: &Path, upload: bool, overwrite: bool,
+        resolver: Option<&fc_engine::conflict::ConflictResolver>, ctl: &PushControl<'_>,
+    ) -> Result<(String, PathBuf, bool), ClientError> {
+        use fc_engine::conflict::{ConflictAction, exists, keep_both_path};
+        let overwrite = resolver.map_or(overwrite, |r| r.policy == fc_engine::conflict::ConflictPolicy::Replace);
+        let original = || (remote.to_owned(), local.to_path_buf(), overwrite);
+        let Some(resolver) = resolver else { return Ok(original()); };
+        let present = if upload {
+            self.remote_exists(remote, ctl.control).await?
+        } else {
+            // Directory offers must still reach the recursive-download planner.
+            self.remote_size(remote, ctl.control).await?;
+            exists(local).map_err(|e| ClientError::Local { path: local.into(), source: e })?
+        };
+        if !present { return Ok(original()); }
+        let (source, destination) = if upload { (local, Path::new(remote)) } else { (Path::new(remote), local) };
+        let mut different = false;
+        loop {
+            let action = tokio::task::block_in_place(|| resolver.choose(source, destination, different, ctl.control))
+                .map_err(|e| match e {
+                    CopyError::Cancelled => ClientError::Cancelled,
+                    CopyError::SkippedByUser => ClientError::Skipped,
+                    _ => ClientError::Remote(e.to_string()),
+                })?;
+            match action {
+                ConflictAction::Replace => return Ok((remote.into(), local.into(), true)),
+                ConflictAction::Skip => return Err(ClientError::Skipped),
+                ConflictAction::Cancel => return Err(ClientError::Cancelled),
+                ConflictAction::Compare => {
+                    if self.compare_remote(remote, local, ctl).await? { return Err(ClientError::Skipped); }
+                    different = true;
+                }
+                ConflictAction::KeepBoth => {
+                    for number in 1..u64::MAX {
+                        if ctl.control.is_cancelled() { return Err(ClientError::Cancelled); }
+                        let candidate = keep_both_path(destination, number);
+                        if upload {
+                            let candidate = candidate.to_string_lossy().replace('\\', "/");
+                            if !self.remote_exists(&candidate, ctl.control).await? { return Ok((candidate, local.into(), false)); }
+                        } else if !exists(&candidate).map_err(|e| ClientError::Local { path: candidate.clone(), source: e })? {
+                            validate_download_path(&candidate)?;
+                            return Ok((remote.into(), candidate, false));
+                        }
+                    }
+                    return Err(ClientError::Remote("keep-both suffixes exhausted".into()));
+                }
+            }
+        }
+    }
+
     /// Download one file. Retries after a dropped connection resume from the bytes on disk.
     async fn pull_file_retrying(&self, ctx: &PullCtx<'_>, remote: &str, local: &Path) -> Result<PullOutcome, ClientError> {
+        let result = self.pull_file_with_conflicts(ctx, remote, local).await;
+        // Directory discovery is not a completed file.
+        if !matches!(result, Err(ClientError::Rejected { reason: RejectReason::IsDirectory, .. })) {
+            ctx.progress.finish(remote, result.as_ref().map(|o| o.size));
+        }
+        result
+    }
+
+    async fn pull_file_with_conflicts(&self, ctx: &PullCtx<'_>, remote: &str, local: &Path) -> Result<PullOutcome, ClientError> {
+        let ctl = PushControl { control: ctx.control, limiter: ctx.limiter };
+        let (_, destination, overwrite) = self.conflict_destination(
+            remote, local, false, ctx.opts.overwrite, ctx.opts.conflicts.as_deref(), &ctl,
+        ).await?;
+        let local = destination.as_path();
+        if ctx.opts.conflicts.is_some() {
+            for path in [destination.clone(), crate::server::sidecar(local, crate::server::TEMP_SUFFIX), crate::server::sidecar(local, crate::server::ID_SUFFIX)] {
+                validate_download_path(&path)?;
+            }
+        }
         let tally = PullTally { progress: ctx.progress, remote, started: AtomicBool::new(false), high_water: AtomicU64::new(0) };
         let mut attempts = 0;
         let mut mismatch_retried = false;
-        let result = loop {
+        loop {
             let s = match self.session(ctx.control).await {
                 Ok(s) => s,
                 Err(e) => break Err(e),
             };
-            let req = PullRequest { remote, local, algo: ctx.opts.algo, overwrite: ctx.opts.overwrite, preserve: ctx.opts.preserve };
+            let req = PullRequest { remote, local, algo: ctx.opts.algo, overwrite, preserve: ctx.opts.preserve };
             let ctl = PushControl { control: ctx.control, limiter: ctx.limiter };
             match s.pull_file(&req, &ctl, &tally).await {
                 Ok(out) => break Ok(out),
@@ -745,12 +872,7 @@ impl RemoteBackend {
                 }
                 Err(e) => break Err(e),
             }
-        };
-        // "Is a directory" is how a folder target is discovered, not a failure.
-        if !matches!(result, Err(ClientError::Rejected { reason: RejectReason::IsDirectory, .. })) {
-            ctx.progress.finish(remote, result.as_ref().map(|o| o.size));
         }
-        result
     }
 }
 

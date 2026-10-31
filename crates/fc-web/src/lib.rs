@@ -14,6 +14,7 @@
 pub mod api;
 pub mod clients;
 pub mod https;
+pub mod history;
 pub mod auth;
 pub mod telemetry;
 
@@ -56,6 +57,7 @@ pub struct AppState {
     pub owners: RwLock<HashMap<JobId, String>>,
     pub telemetry: broadcast::Sender<Arc<telemetry::Frame>>,
     pub clients: clients::ClientStore,
+    pub history: Arc<history::History>,
     pub cookie_secure: bool,
     /// The console certificate's fingerprint, shown on the sign-in page to compare by eye.
     pub certificate_fingerprint: Option<String>,
@@ -70,7 +72,7 @@ pub struct Config {
     pub cookie_secure: bool,
     pub session_ttl: Duration,
     pub hash_cost: HashCost,
-    /// Where paired clients are saved. `None` keeps them in memory.
+    /// Where paired clients and transfer history are saved. `None` keeps them in memory.
     pub state_dir: Option<PathBuf>,
     pub certificate_fingerprint: Option<String>,
     pub torrents: Option<TorrentEngine>,
@@ -98,6 +100,8 @@ pub enum BuildError {
     BadRoot(PathBuf),
     #[error(transparent)]
     Store(#[from] clients::StoreError),
+    #[error("cannot open transfer history: {0}")]
+    History(#[from] std::io::Error),
 }
 
 /// Create the shared state and start the telemetry producer. Must be called
@@ -118,7 +122,8 @@ pub fn build(queue: Queue, events: std::sync::mpsc::Receiver<Event>, config: Con
         roots,
         owners: RwLock::new(HashMap::new()),
         telemetry,
-        clients: clients::ClientStore::open(config.state_dir.map(|d| d.join("clients.json")))?,
+        clients: clients::ClientStore::open(config.state_dir.as_ref().map(|d| d.join("clients.json")))?,
+        history: Arc::new(history::History::open(config.state_dir.map(|d| d.join("transfer-history.toml")))?),
         cookie_secure: config.cookie_secure,
         certificate_fingerprint: config.certificate_fingerprint,
         torrents: config.torrents,
@@ -163,9 +168,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/info", get(api::info))
         .route("/api/me", get(api::me))
         .route("/api/transfers", get(api::list_transfers).post(api::create_transfer))
+        .route("/api/history", get(history::list).delete(history::clear))
         .route("/api/transfers/{id}", delete(api::cancel_transfer))
         .route("/api/transfers/{id}/pause", post(api::pause_transfer))
         .route("/api/transfers/{id}/resume", post(api::resume_transfer))
+        .route("/api/transfers/{id}/conflict", post(api::resolve_conflict))
         .route("/api/queue", get(api::queue_state))
         .route("/api/queue/pause", post(api::pause_queue))
         .route("/api/queue/resume", post(api::resume_queue))
@@ -226,6 +233,7 @@ pub enum ApiError {
     NotFound,
     BadRequest(String),
     Conflict(String),
+    Internal(String),
     LockedOut(Duration),
     /// A call to a paired agent failed; the status says whether it was refused or unreachable.
     Remote(StatusCode, String),
@@ -239,6 +247,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
+            ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m.clone()),
             ApiError::Remote(status, m) => (*status, m.clone()),
             ApiError::LockedOut(wait) => (
                 StatusCode::TOO_MANY_REQUESTS,

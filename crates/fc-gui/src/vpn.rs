@@ -5,7 +5,6 @@ use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
 
 use eframe::egui;
-use fc_remote::client::RemoteSpec;
 use fc_remote::vpn::{DesktopLinks, PROVIDERS};
 
 use crate::remote::RemoteForm;
@@ -50,19 +49,7 @@ fn settings_path() -> PathBuf {
 }
 
 pub fn remote_form(target: &str, download: bool) -> Result<RemoteForm, String> {
-    let spec = RemoteSpec::parse(target.trim()).map_err(|e| e.to_string())?;
-    let user = spec
-        .user
-        .as_ref()
-        .map(|user| format!("{user}@"))
-        .unwrap_or_default();
-    Ok(RemoteForm {
-        enabled: true,
-        download,
-        address: format!("{user}{}", spec.host_port()),
-        folder: spec.path,
-        ..Default::default()
-    })
+    RemoteForm::for_target(target, download)
 }
 
 fn launch_command(path: &Path) -> Result<Command, String> {

@@ -37,13 +37,14 @@
 
   <!-- Top bar -->
   <header class="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-line bg-panel px-3 py-1.5">
-    <div class="flex items-center gap-4">
+    <div class="flex min-w-0 flex-wrap items-center gap-4">
       <div class="flex items-center gap-2 border-r border-line pr-3">
         <span class="size-2.5 rounded-sm bg-brand"></span>
         <span class="font-mono text-sm font-bold tracking-tight text-strong">fcopy <span class="font-normal text-xs text-brand-light">daemon</span></span>
       </div>
-      <nav class="flex gap-1 border border-line bg-base p-0.5" role="tablist" aria-label="Mode">
+      <nav class="flex flex-wrap gap-1 border border-line bg-base p-0.5" role="tablist" aria-label="Mode">
         <button role="tab" :aria-selected="mode === 'local'" class="mode-btn" :class="mode === 'local' && 'mode-on'" @click="mode = 'local'">Local copy</button>
+        <button role="tab" :aria-selected="mode === 'history'" class="mode-btn" :class="mode === 'history' && 'mode-on'" @click="setMode('history')">History</button>
         <button role="tab" x-show="isAdmin()" :aria-selected="mode === 'remote'" class="mode-btn" :class="mode === 'remote' && 'mode-on'" @click="setMode('remote')">Remote node</button>
         <button role="tab" x-show="isAdmin()" :disabled="!torrentsEnabled" :aria-selected="mode === 'torrent'" :title="torrentsEnabled ? '' : 'BitTorrent is not enabled on this console'" class="mode-btn" :class="{ 'mode-on': mode === 'torrent', 'cursor-not-allowed opacity-40': !torrentsEnabled }" @click="setMode('torrent')">BitTorrent<span x-show="!torrentsEnabled" class="text-[10px]"> (off)</span></button>
       </nav>
@@ -148,6 +149,38 @@
         </table>
         <p x-show="visibleJobs().length === 0" class="px-4 py-10 text-center text-dim">Nothing here.</p>
       </div>
+
+      <section x-show="mode === 'history'" x-cloak aria-label="Transfer history" class="min-h-0 flex-1 overflow-auto p-4">
+        <h2 class="font-semibold text-strong">Transfer history</h2>
+        <p class="text-dim">Latest 1,000 finished jobs on the console host. Clearing history does not change files or the queue.</p>
+        <p x-show="!historyPersistent" class="text-warn">Memory only: configure a server state directory to keep history across restarts.</p>
+        <div class="my-3 flex flex-wrap items-center gap-2">
+          <input x-model="historySearch" aria-label="Search history" placeholder="Search name, source or destination" class="field h-8 w-full">
+          <button :disabled="historyBusy" class="btn-ghost h-8 px-3" @click="loadHistory()">Refresh / retry saving</button>
+          <button :disabled="historyBusy" class="btn-ghost h-8 px-3" @click="clearHistory()" x-text="isAdmin() ? 'Clear all history' : 'Clear my history'"></button>
+          <span x-show="historyBusy" role="status" class="text-dim">Loading...</span>
+        </div>
+        <p x-show="historyNotice" x-text="historyNotice" role="alert" class="text-bad"></p>
+        <p x-show="!historyBusy && visibleHistory().length === 0" class="py-4 text-dim">No saved transfers match.</p>
+        <template x-for="entry in visibleHistory()" :key="entry.id">
+          <details class="border-b border-line py-3">
+            <summary class="cursor-pointer break-all text-strong">
+              <span x-text="entry.label"></span> -
+              <span :class="stateClass(entry.outcome)" x-text="stateLabel(entry.outcome)"></span> -
+              <span x-text="historyTime(entry.finished_at_ms)"></span>
+            </summary>
+            <div class="grid gap-2 py-2 break-all">
+              <p x-show="isAdmin()" x-text="`Owner: ${entry.owner || 'unassigned'}`"></p>
+              <p x-text="`${entry.remote ? 'Remote transfer' : 'Local copy'} | ${fmtBytes(entry.bytes_copied)} copied | ${fmtEta(entry.elapsed_ms / 1000)}`"></p>
+              <p x-text="`Queued: ${historyTime(entry.queued_at_ms)}`"></p>
+              <p x-text="`Copied: ${entry.files_copied} | Skipped: ${entry.files_skipped} | Failed: ${entry.files_failed}`"></p>
+              <p x-text="`Destination: ${entry.destination}`"></p>
+              <p>Sources:</p>
+              <template x-for="(source, index) in entry.sources" :key="index"><p class="font-mono" x-text="source"></p></template>
+            </div>
+          </details>
+        </template>
+      </section>
 
       <!-- Remote nodes -->
       <div x-show="mode === 'remote'" x-cloak class="min-h-0 flex-1 overflow-auto">
@@ -309,6 +342,27 @@
     <button class="text-brand hover:underline" @click="logOpen = !logOpen" x-text="logOpen ? 'Hide log' : 'Log console'"></button>
   </footer>
 
+  <div x-show="pendingConflict() && !modal" x-cloak class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/70 p-4">
+    <section class="modal" role="dialog" aria-modal="true" aria-label="File conflict">
+      <header class="modal-head"><h3 x-text="pendingConflict()?.conflict?.different ? 'Files have different contents' : 'Destination already exists'"></h3></header>
+      <div class="grid gap-3 p-4">
+        <p class="break-all font-mono" x-text="`Source: ${pendingConflict()?.conflict?.source || ''}`"></p>
+        <p class="break-all font-mono" x-text="`Destination: ${pendingConflict()?.conflict?.destination || ''}`"></p>
+        <label><input type="checkbox" :checked="conflictAll && conflictAllId === pendingConflict()?.conflict?.id"
+          @change="conflictAll = $event.target.checked; conflictAllId = pendingConflict()?.conflict?.id"> Apply to remaining conflicts in this job</label>
+        <p class="text-[11px] text-dim">Compare reads both files and skips identical content. If they differ, you will be asked again.</p>
+        <p x-show="conflictNotice" x-text="conflictNotice" role="status" class="text-warn"></p>
+      </div>
+      <footer class="grid gap-2 p-4">
+        <button class="btn-mini" :disabled="conflictBusy" @click="resolveConflict('replace')">Replace</button>
+        <button class="btn-mini" :disabled="conflictBusy" @click="resolveConflict('skip')">Skip</button>
+        <button class="btn-mini" :disabled="conflictBusy" @click="resolveConflict('keep_both')">Keep both</button>
+        <button x-show="!pendingConflict()?.conflict?.different" class="btn-mini" :disabled="conflictBusy" @click="resolveConflict('compare')">Compare</button>
+        <button class="btn-mini" :disabled="conflictBusy" @click="resolveConflict('cancel')">Cancel job</button>
+      </footer>
+    </section>
+  </div>
+
   <!-- ============ Modals ============ -->
   <div x-show="modal" x-cloak class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/70 p-4" :class="modal !== 'settings' && 'md:items-center'" @keydown.escape.window="closeModal()">
 
@@ -365,6 +419,13 @@
         </div>
         <p x-show="addNotice" x-text="addNotice" role="status" class="font-mono text-[11px] text-dim"></p>
       </div>
+      <label class="grid gap-1 px-4 py-2"><span class="text-[11px] text-dim">Existing destination files</span>
+        <select x-model="conflictPolicy" class="field">
+          <option value="ask">Ask for each conflict</option><option value="replace">Replace</option>
+          <option value="skip">Skip</option><option value="keep_both">Keep both (rename incoming)</option>
+          <option value="compare">Compare; ask if different</option>
+        </select>
+      </label>
       <footer class="modal-foot"><button type="button" class="btn-ghost h-8 px-3" @click="closeModal()">Cancel</button><button class="btn-primary h-8 px-4">Queue transfer</button></footer>
     </form>
 

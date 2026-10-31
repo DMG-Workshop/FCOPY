@@ -113,6 +113,145 @@ fn target(e: &Env) -> String {
     format!("alice@127.0.0.1:{}:/backup", e.agent_port)
 }
 
+async fn history_entries(e: &Env, cookie: &str, count: usize) -> Value {
+    for _ in 0..200 {
+        let response = send(e, "GET", "/api/history", Some(cookie), None).await;
+        if response.status == StatusCode::OK && response.json["entries"].as_array().unwrap().len() == count {
+            return response.json;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("history did not reach {count} entries");
+}
+
+async fn history_job(e: &Env, cookie: &str, name: &str) -> u64 {
+    let src = e.root.path().join(name);
+    std::fs::write(&src, b"history bytes").unwrap();
+    let response = send(e, "POST", "/api/transfers", Some(cookie), Some(json!({
+        "sources": [src], "dest": e.root.path().join("history-out"), "label": name,
+    }))).await;
+    assert_eq!(response.status, StatusCode::ACCEPTED);
+    response.json["id"].as_u64().unwrap()
+}
+
+#[tokio::test]
+async fn history_survives_restart_filters_owners_and_clears_without_touching_files() {
+    let mut e = env().await;
+    assert_eq!(send(&e, "GET", "/api/history", None, None).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(send(&e, "DELETE", "/api/history", None, None).await.status, StatusCode::UNAUTHORIZED);
+    let bob = login(&e, "bob", "bobs-password").await;
+    let admin = login(&e, "admin", "admin-password").await;
+    let first_job = history_job(&e, &bob, "bob-first").await;
+    history_job(&e, &admin, "admin-first").await;
+    let bob_history = history_entries(&e, &bob, 1).await;
+    assert_eq!(bob_history["persistent"], true);
+    assert_eq!(bob_history["entries"][0]["owner"], "bob");
+    let all = history_entries(&e, &admin, 2).await;
+    let oldest_id = all["entries"][1]["id"].as_u64().unwrap();
+    assert_eq!(all["entries"][1]["outcome"], "completed");
+    assert_eq!(all["entries"][1]["files_copied"], 1);
+    assert_eq!(all["entries"][1]["bytes_copied"], 13);
+    assert!(all["entries"][1]["finished_at_ms"].as_u64().unwrap() >= all["entries"][1]["queued_at_ms"].as_u64().unwrap());
+    // Removing the queue row does not remove its independent history record.
+    assert_eq!(send(&e, "DELETE", &format!("/api/transfers/{first_job}"), Some(&bob), None).await.status, StatusCode::NO_CONTENT);
+    assert_eq!(history_entries(&e, &bob, 1).await["entries"][0]["id"], oldest_id);
+    e.state.queue.shutdown();
+    let (queue, events) = Queue::start(QueueConfig::default());
+    let state = build(queue, events, Config {
+        roots: vec![e.root.path().into()],
+        cookie_secure: false,
+        hash_cost: HashCost { m_kib: 256, t: 1, p: 1 },
+        state_dir: Some(e.state_dir.path().into()),
+        ..Default::default()
+    }).unwrap();
+    state.users.add("admin", "admin-password", Role::Admin).unwrap();
+    state.users.add("bob", "bobs-password", Role::User).unwrap();
+    e.router = router(state.clone());
+    e.state = state;
+    let bob = login(&e, "bob", "bobs-password").await;
+    let admin = login(&e, "admin", "admin-password").await;
+    assert_eq!(history_entries(&e, &admin, 2).await["entries"], all["entries"]);
+    assert_eq!(history_job(&e, &bob, "bob-after-restart").await, first_job, "queue IDs restart");
+    let bob_history = history_entries(&e, &bob, 2).await;
+    assert!(bob_history["entries"][0]["id"].as_u64().unwrap() > oldest_id);
+    let mut request = Request::builder().method("DELETE").uri("/api/history").header(COOKIE, &bob).body(Body::empty()).unwrap();
+    request.extensions_mut().insert(ConnectInfo(fc_web::https::PeerAddr(SocketAddr::from(([127, 0, 0, 1], 40_000)))));
+    assert_eq!(e.router.clone().oneshot(request).await.unwrap().status(), StatusCode::FORBIDDEN);
+    assert_eq!(send(&e, "DELETE", "/api/history", Some(&bob), None).await.status, StatusCode::NO_CONTENT);
+    history_entries(&e, &bob, 0).await;
+    let admin_history = history_entries(&e, &admin, 1).await;
+    assert_eq!(admin_history["entries"][0]["owner"], "admin");
+    assert_eq!(send(&e, "DELETE", "/api/history", Some(&admin), None).await.status, StatusCode::NO_CONTENT);
+    history_entries(&e, &admin, 0).await;
+    assert_eq!(std::fs::read(e.root.path().join("history-out/bob-first")).unwrap(), b"history bytes");
+    assert!(!e.state.queue.jobs().is_empty(), "clearing history must not clear the live queue");
+    e.state.queue.shutdown();
+    e.agent.shutdown();
+}
+
+#[tokio::test]
+async fn history_write_errors_are_reported_and_refresh_retries_without_duplicates() {
+    let e = env().await;
+    let admin = login(&e, "admin", "admin-password").await;
+    let mut frames = e.state.telemetry.subscribe();
+    let blocker = e.state_dir.path().join("transfer-history.tmp");
+    std::fs::create_dir(&blocker).unwrap();
+    history_job(&e, &admin, "retry-summary").await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = frames.recv().await.unwrap();
+            if frame.logs.iter().any(|log| log.kind == "history_error") { break; }
+        }
+    }).await.unwrap();
+    let failed = send(&e, "GET", "/api/history", Some(&admin), None).await;
+    assert_eq!(failed.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(failed.json["error"].as_str().unwrap().contains("history"));
+    std::fs::remove_dir(&blocker).unwrap();
+    let history = history_entries(&e, &admin, 1).await;
+    assert_eq!(history["entries"][0]["label"], "retry-summary");
+    assert_eq!(history_entries(&e, &admin, 1).await["entries"], history["entries"]);
+    e.state.queue.shutdown();
+    e.agent.shutdown();
+}
+
+#[tokio::test]
+async fn history_records_cancelled_pending_jobs_and_keeps_new_jobs_after_clear() {
+    let e = env().await;
+    let bob = login(&e, "bob", "bobs-password").await;
+    e.state.queue.pause();
+    let id = history_job(&e, &bob, "cancelled-before-start").await;
+    assert_eq!(send(&e, "DELETE", "/api/history", Some(&bob), None).await.status, StatusCode::NO_CONTENT);
+    assert_eq!(send(&e, "DELETE", &format!("/api/transfers/{id}"), Some(&bob), None).await.status, StatusCode::NO_CONTENT);
+    let history = history_entries(&e, &bob, 1).await;
+    assert_eq!(history["entries"][0]["outcome"], "cancelled");
+    assert_eq!(history["entries"][0]["files_copied"], 0);
+    assert_eq!(history["entries"][0]["label"], "cancelled-before-start");
+    e.state.queue.shutdown();
+    e.agent.shutdown();
+}
+
+#[tokio::test]
+async fn history_without_a_state_directory_is_explicitly_memory_only() {
+    let mut e = env().await;
+    e.state.queue.shutdown();
+    let (queue, events) = Queue::start(QueueConfig::default());
+    let state = build(queue, events, Config {
+        roots: vec![e.root.path().into()],
+        cookie_secure: false,
+        hash_cost: HashCost { m_kib: 256, t: 1, p: 1 },
+        ..Default::default()
+    }).unwrap();
+    state.users.add("bob", "bobs-password", Role::User).unwrap();
+    e.router = router(state.clone());
+    e.state = state;
+    let bob = login(&e, "bob", "bobs-password").await;
+    history_job(&e, &bob, "memory-summary").await;
+    let history = history_entries(&e, &bob, 1).await;
+    assert_eq!(history["persistent"], false);
+    e.state.queue.shutdown();
+    e.agent.shutdown();
+}
+
 fn pair_body(e: &Env, expected: Option<&str>, password: &str) -> Value {
     let mut b = json!({ "name": "nas", "target": target(e), "password": password });
     if let Some(fp) = expected {
@@ -425,6 +564,69 @@ async fn wait_for_state(e: &Env, cookie: &str, state: &str) -> Value {
     panic!("job never reached {state}");
 }
 
+async fn wait_for_conflict(e: &Env, cookie: &str, previous: Option<u64>) -> Value {
+    for _ in 0..200 {
+        let jobs = send(e, "GET", "/api/transfers", Some(cookie), None).await.json;
+        if let Some(conflict) = jobs.as_array().unwrap().iter().map(|j| &j["conflict"])
+            .find(|c| c.is_object() && c["id"].as_u64() != previous) {
+            return conflict.clone();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("conflict not published");
+}
+
+#[tokio::test]
+async fn conflicts_default_to_ask_and_require_owner_csrf_and_current_nonce() {
+    let e = env().await;
+    e.state.users.add("carol", "carols-password", Role::User).unwrap();
+    let bob = login(&e, "bob", "bobs-password").await;
+    let carol = login(&e, "carol", "carols-password").await;
+    let admin = login(&e, "admin", "admin-password").await;
+    let src = e.root.path().join("note.txt");
+    let out = e.root.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    std::fs::write(&src, b"new").unwrap();
+    std::fs::write(out.join("note.txt"), b"old").unwrap();
+    let body = json!({ "sources": [src], "dest": out });
+    let mut invalid = body.clone();
+    invalid["conflict"] = json!("invalid");
+    assert_eq!(send(&e, "POST", "/api/transfers", Some(&bob), Some(invalid)).await.status, StatusCode::BAD_REQUEST);
+    let created = send(&e, "POST", "/api/transfers", Some(&bob), Some(body)).await;
+    assert_eq!(created.status, StatusCode::ACCEPTED);
+    let id = created.json["id"].as_u64().unwrap();
+    let conflict = wait_for_conflict(&e, &bob, None).await;
+    assert_eq!(conflict["different"], false);
+    let uri = format!("/api/transfers/{id}/conflict");
+    let reply = json!({ "conflict_id": conflict["id"], "action": "compare", "apply_to_all": true });
+    assert_eq!(send(&e, "POST", &uri, Some(&carol), Some(reply.clone())).await.status, StatusCode::NOT_FOUND);
+    let mut no_csrf = Request::builder().method("POST").uri(&uri)
+        .header(COOKIE, &bob).header(CONTENT_TYPE, "application/json")
+        .body(Body::from(reply.to_string())).unwrap();
+    no_csrf.extensions_mut().insert(ConnectInfo(fc_web::https::PeerAddr(SocketAddr::from(([127, 0, 0, 1], 40_000)))));
+    assert_eq!(e.router.clone().oneshot(no_csrf).await.unwrap().status(), StatusCode::FORBIDDEN);
+    let mut invalid = reply.clone();
+    invalid["action"] = json!("invalid");
+    assert_eq!(send(&e, "POST", &uri, Some(&bob), Some(invalid)).await.status, StatusCode::BAD_REQUEST);
+    let mut stale = reply.clone();
+    stale["conflict_id"] = json!(0);
+    assert_eq!(send(&e, "POST", &uri, Some(&bob), Some(stale)).await.status, StatusCode::CONFLICT);
+    assert_eq!(send(&e, "POST", &uri, Some(&bob), Some(reply.clone())).await.status, StatusCode::NO_CONTENT);
+    let second = wait_for_conflict(&e, &bob, conflict["id"].as_u64()).await;
+    assert_eq!(second["different"], true);
+    assert_eq!(send(&e, "POST", &uri, Some(&bob), Some(reply)).await.status, StatusCode::CONFLICT);
+    let mut reply = json!({ "conflict_id": second["id"], "action": "compare", "apply_to_all": false });
+    assert_eq!(send(&e, "POST", &uri, Some(&bob), Some(reply.clone())).await.status, StatusCode::CONFLICT);
+    reply["action"] = json!("keep_both");
+    assert_eq!(send(&e, "POST", &uri, Some(&admin), Some(reply)).await.status, StatusCode::NO_CONTENT);
+    let job = wait_for_state(&e, &bob, "completed").await;
+    assert!(job["conflict"].is_null());
+    assert_eq!(std::fs::read(out.join("note.txt")).unwrap(), b"old");
+    assert_eq!(std::fs::read(out.join("note (copy 1).txt")).unwrap(), b"new");
+    e.state.queue.shutdown();
+    e.agent.shutdown();
+}
+
 #[tokio::test]
 async fn add_task_to_a_paired_pc_lands_the_files_there() {
     let e = env().await;
@@ -450,6 +652,12 @@ async fn the_password_is_never_returned_by_the_api() {
     wait_for_state(&e, &admin, "completed").await;
     let list = send(&e, "GET", "/api/transfers", Some(&admin), None).await;
     assert!(!list.json.to_string().contains("agent-pass-1"));
+    let history = history_entries(&e, &admin, 1).await;
+    assert_eq!(history["entries"][0]["remote"], true);
+    assert_eq!(history["entries"][0]["outcome"], "completed");
+    assert!(!history.to_string().contains("agent-pass-1"));
+    let saved = std::fs::read_to_string(e.state_dir.path().join("transfer-history.toml")).unwrap();
+    assert!(!saved.contains("agent-pass-1") && !saved.contains("password") && !saved.contains("fingerprint"));
     e.agent.shutdown();
 }
 

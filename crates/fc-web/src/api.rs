@@ -120,6 +120,19 @@ pub struct CreateTransfer {
     pub label: Option<String>,
     /// Send to a paired PC instead of this machine. Admins only.
     pub remote: Option<RemoteTarget>,
+    #[serde(default = "default_conflict")]
+    pub conflict: String,
+}
+
+fn default_conflict() -> String { "ask".into() }
+
+fn conflict_policy(value: &str) -> Result<fc_engine::conflict::ConflictPolicy, ApiError> {
+    use fc_engine::conflict::ConflictPolicy as P;
+    match value {
+        "ask" => Ok(P::Ask), "replace" => Ok(P::Replace), "skip" => Ok(P::Skip),
+        "keep_both" => Ok(P::KeepBoth), "compare" => Ok(P::Compare),
+        _ => Err(ApiError::BadRequest("conflict must be ask, replace, skip, keep_both or compare".into())),
+    }
 }
 
 #[derive(Deserialize)]
@@ -158,6 +171,7 @@ pub async fn create_transfer(
     p: Principal,
     Json(req): Json<CreateTransfer>,
 ) -> Result<(StatusCode, Json<Created>), ApiError> {
+    let policy = conflict_policy(&req.conflict)?;
     if req.sources.is_empty() || req.sources.len() > MAX_SOURCES {
         return Err(ApiError::BadRequest(format!("give between 1 and {MAX_SOURCES} sources")));
     }
@@ -208,8 +222,20 @@ pub async fn create_transfer(
     if let Some(label) = req.label.filter(|l| !l.trim().is_empty()) {
         request = request.with_label(label);
     }
-    let id = s.queue.add(request);
-    s.owners.write().unwrap_or_else(|e| e.into_inner()).insert(id, p.name);
+    let id = {
+        let mut owners = s.owners.write().unwrap_or_else(|e| e.into_inner());
+        let id = s.history.enqueue(&s.queue, request.with_conflict_policy(policy), p.name.clone());
+        owners.insert(id, p.name.clone());
+        id
+    };
+    // A worker can already be waiting before ownership is registered.
+    if let Some(info) = s.queue.job(id) {
+        let frame = crate::telemetry::Frame {
+            jobs: vec![crate::telemetry::JobDto::from_info(&info, Some(&p.name))],
+            ..Default::default()
+        };
+        let _ = s.telemetry.send(Arc::new(frame));
+    }
     Ok((StatusCode::ACCEPTED, Json(Created { id })))
 }
 
@@ -268,6 +294,29 @@ pub async fn cancel_transfer(State(s): State<Arc<AppState>>, p: Principal, Path(
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::Conflict("job cannot be cancelled or removed right now".into()))
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ConflictReply {
+    pub conflict_id: u64,
+    pub action: String,
+    #[serde(default)]
+    pub apply_to_all: bool,
+}
+
+pub async fn resolve_conflict(State(s): State<Arc<AppState>>, p: Principal, Path(id): Path<JobId>, Json(reply): Json<ConflictReply>) -> Result<StatusCode, ApiError> {
+    owned_job(&s, &p, id)?;
+    use fc_engine::conflict::{ConflictAction as A, ConflictChoice};
+    let action = match reply.action.as_str() {
+        "replace" => A::Replace, "skip" => A::Skip, "keep_both" => A::KeepBoth,
+        "compare" => A::Compare, "cancel" => A::Cancel,
+        _ => return Err(ApiError::BadRequest("unknown conflict action".into())),
+    };
+    if s.queue.resolve_conflict(id, reply.conflict_id, ConflictChoice { action, apply_to_all: reply.apply_to_all }) {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::Conflict("conflict is stale, cancelled, or already compared".into()))
     }
 }
 

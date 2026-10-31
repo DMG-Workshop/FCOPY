@@ -113,6 +113,10 @@ struct CopyArgs {
     #[arg(long)]
     overwrite: bool,
 
+    /// Existing files: ask, replace, skip, keep-both, or compare (ask if different).
+    #[arg(long, value_enum, conflicts_with = "overwrite")]
+    conflict: Option<ConflictMode>,
+
     /// Flush every file to disk before committing it.
     #[arg(long)]
     fsync: bool,
@@ -209,6 +213,51 @@ fn build_request(paths: &[PathBuf]) -> TransferRequest {
     }
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ConflictMode { Ask, Replace, Skip, KeepBoth, Compare }
+
+fn conflicts(args: &CopyArgs) -> Option<Arc<fc_engine::conflict::ConflictResolver>> {
+    use fc_engine::conflict::{ConflictPolicy as P, ConflictResolver};
+    if args.overwrite { return None; }
+    let mode = args.conflict.or_else(|| io::stdin().is_terminal().then_some(ConflictMode::Ask))?;
+    let policy = match mode {
+        ConflictMode::Ask => P::Ask, ConflictMode::Replace => P::Replace, ConflictMode::Skip => P::Skip,
+        ConflictMode::KeepBoth => P::KeepBoth, ConflictMode::Compare => P::Compare,
+    };
+    let resolver = ConflictResolver::new(policy);
+    Some(Arc::new(if io::stdin().is_terminal() {
+        resolver.with_handler(Arc::new(|details, _| prompt_conflict(details)))
+    } else { resolver }))
+}
+
+fn prompt_conflict(details: &fc_engine::conflict::Conflict) -> fc_engine::conflict::ConflictChoice {
+    use fc_engine::conflict::{ConflictAction as A, ConflictChoice};
+    let cancel = ConflictChoice { action: A::Cancel, apply_to_all: false };
+    if !io::stdin().is_terminal() {
+        eprintln!("{}: conflict needs a terminal; use --conflict replace, skip or keep-both", details.destination.display());
+        return cancel;
+    }
+    eprintln!("\n{}: {} -> {}", if details.different { "Contents differ" } else { "Destination exists" }, details.source.display(), details.destination.display());
+    loop {
+        eprint!("[r]eplace [s]kip [k]eep both {}[c]ancel (uppercase = apply to remaining conflicts in this job) > ",
+            if details.different { "" } else { "[m]compare " });
+        if let Err(e) = io::stderr().flush() { eprintln!("cannot display conflict prompt: {e}"); return cancel; }
+        let mut input = String::new();
+        match io::stdin().read_line(&mut input) {
+            Ok(0) => { eprintln!("input closed; cancelling"); return cancel; }
+            Err(e) => { eprintln!("cannot read conflict choice: {e}"); return cancel; }
+            Ok(_) => {}
+        }
+        let letter = input.trim().chars().next().unwrap_or(' ');
+        let action = match letter.to_ascii_lowercase() {
+            'r' => A::Replace, 's' => A::Skip, 'k' => A::KeepBoth, 'c' => A::Cancel,
+            'm' if !details.different => A::Compare,
+            _ => { eprintln!("choose one of the listed actions"); continue; }
+        };
+        return ConflictChoice { action, apply_to_all: letter.is_ascii_uppercase() };
+    }
+}
+
 fn copy(args: CopyArgs) -> ExitCode {
     match remote_sources(&args) {
         Ok(Some(specs)) => return pull(&args, specs),
@@ -246,6 +295,7 @@ fn copy(args: CopyArgs) -> ExitCode {
         verify,
         algorithm: args.algo.into(),
         overwrite: args.overwrite,
+        conflicts: conflicts(&args),
         fsync: args.fsync,
         preserve_mtime: preserve,
         preserve_permissions: preserve,
@@ -335,6 +385,15 @@ fn copy(args: CopyArgs) -> ExitCode {
                     }
                 };
                 d.respond(action);
+            }
+            Event::Conflict { job: id } => {
+                if let Some(conflict) = queue.job(id).and_then(|j| j.conflict) {
+                    ui.clear_status();
+                    let reply = prompt_conflict(&conflict.details);
+                    if !queue.resolve_conflict(id, conflict.id, reply) {
+                        ui.line("Conflict is no longer waiting for an answer.");
+                    }
+                }
             }
             Event::Finished { job: j, state, summary: s } if j == job => {
                 final_state = state;
@@ -655,6 +714,7 @@ fn pull(args: &CopyArgs, specs: Vec<fc_remote::client::RemoteSpec>) -> ExitCode 
             _ => HashAlgo::Xxh3, // MD5 isn't offered remotely
         },
         overwrite: args.overwrite,
+        conflicts: conflicts(args),
         preserve: !args.no_preserve,
     };
     let line = PullLine::new(!args.quiet && io::stderr().is_terminal());

@@ -48,6 +48,42 @@ fn backend(a: &Agent, fingerprint: &str) -> Arc<RemoteBackend> {
     Arc::new(RemoteBackend::new(connector).unwrap())
 }
 
+#[test]
+fn upload_conflict_policies_and_compare_different_keep_both() {
+    use fc_engine::conflict::{ConflictPolicy as P, ConflictAction as A, ConflictChoice};
+    let a = agent();
+    let src_dir = tempfile::tempdir().unwrap();
+    let src = src_dir.path().join("note.txt");
+    let dest_dir = a.share.path().join("dest");
+    std::fs::create_dir(&dest_dir).unwrap();
+    std::fs::write(&src, b"new").unwrap();
+    for (policy, identical) in [(P::Skip, false), (P::Replace, false), (P::KeepBoth, false), (P::Compare, true), (P::Compare, false)] {
+        std::fs::write(dest_dir.join("note.txt"), if identical { b"new" } else { b"old" }).unwrap();
+        let (q, rx) = queue();
+        let job = q.add(TransferRequest::to_backend(vec![src.clone()], backend(&a, &a.fingerprint)).with_conflict_policy(policy));
+        if policy == P::Compare && !identical {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(conflict) = q.job(job).unwrap().conflict {
+                    assert!(conflict.details.different);
+                    assert!(q.resolve_conflict(job, conflict.id, ConflictChoice { action: A::KeepBoth, apply_to_all: true }));
+                    break;
+                }
+                let event = rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
+                assert!(!matches!(event, Event::Finished { .. }), "{event:?}");
+            }
+        }
+        assert_eq!(finished(&rx, job), if policy == P::Skip || identical { JobState::CompletedWithErrors } else { JobState::Completed });
+        assert_eq!(std::fs::read(dest_dir.join("note.txt")).unwrap(), if policy == P::Replace || identical { b"new" } else { b"old" });
+        if policy == P::KeepBoth || (policy == P::Compare && !identical) {
+            let n = if policy == P::KeepBoth { 1 } else { 2 };
+            assert_eq!(std::fs::read(dest_dir.join(format!("note (copy {n}).txt"))).unwrap(), b"new");
+        }
+        q.shutdown();
+    }
+    a.handle.shutdown();
+}
+
 fn queue() -> (Queue, std::sync::mpsc::Receiver<Event>) {
     Queue::start(QueueConfig {
         telemetry_interval: Duration::from_millis(20),
