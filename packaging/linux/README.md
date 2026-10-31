@@ -122,9 +122,10 @@ branch and pull-request builds do not need an already-published release tag.
    hosted and Unraid assets with checksums to a GitHub
    release. Rerunning the workflow updates assets on an existing release.
 
-Branch/PR/manual runs upload workflow artifacts for 14 days; they never create a
-public release. Publishing is a separate job with `contents: write`; build and
-PR jobs have read-only repository permissions. No personal access token is needed.
+Branch/PR/manual runs retain downloadable package artifacts for 14 days and the
+intermediate tested container image for 3 days; they never publish a release.
+Publication jobs alone have `contents: write` or `packages: write`; build and PR
+jobs have read-only repository permissions. No personal access token is needed.
 
 To release, update `[workspace.package].version` in the root Cargo manifest and
 `pkgver` in the Arch recipe together, regenerate `Cargo.lock`, and commit. The

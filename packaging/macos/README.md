@@ -59,3 +59,7 @@ Shell Script action with input passed **as arguments**:
 Save it as "Copy with fcopy". macOS installs a user-created action in Services.
 Access to protected folders may require user consent or Full Disk Access in
 System Settings > Privacy & Security; the app cannot grant itself access.
+
+Downloads permit macOS's standard `/var`, `/tmp` and `/etc` aliases only when
+they point to their corresponding `/private` directories. User-created links
+or junctions in a download destination are still refused.

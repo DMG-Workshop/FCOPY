@@ -569,6 +569,21 @@ fn validate_download_path(path: &Path) -> Result<(), ClientError> {
                 #[cfg(not(windows))]
                 let link = meta.file_type().is_symlink();
                 if link {
+                    #[cfg(target_os = "macos")]
+                    {
+                        // Darwin's standard root aliases are not user-created download-tree links.
+                        let expected = match ancestor.to_str() {
+                            Some("/var") => Some("/private/var"),
+                            Some("/tmp") => Some("/private/tmp"),
+                            Some("/etc") => Some("/private/etc"),
+                            _ => None,
+                        };
+                        if let Some(expected) = expected {
+                            let target = std::fs::read_link(ancestor)
+                                .map_err(|source| ClientError::Local { path: ancestor.into(), source })?;
+                            if Path::new("/").join(target) == Path::new(expected) { continue; }
+                        }
+                    }
                     return Err(ClientError::Local { path: ancestor.into(), source: std::io::Error::other("download paths cannot traverse links or junctions") });
                 }
             }
@@ -1017,6 +1032,19 @@ impl Drop for RemoteBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_root_aliases_work_without_permitting_user_symlinks() {
+        for alias in ["/var", "/tmp", "/etc"] {
+            validate_download_path(&Path::new(alias).join("fcopy-nonexistent-probe")).unwrap();
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let link = directory.path().join("user-link");
+        std::os::unix::fs::symlink(directory.path(), &link).unwrap();
+        let error = validate_download_path(&link.join("file")).unwrap_err();
+        assert!(matches!(error, ClientError::Local { path, .. } if path == link));
+    }
 
     #[test]
     fn server_supplied_names_cannot_leave_the_download_folder() {

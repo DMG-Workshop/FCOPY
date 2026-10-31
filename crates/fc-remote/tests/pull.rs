@@ -345,6 +345,22 @@ fn a_changed_remote_file_is_not_resumed_from_a_stale_partial() {
 
 #[test]
 fn retry_discards_compatible_partial_but_keeps_real_identity_for_reconnect() {
+    fn leave_partial(a: &Agent, req: &PullRequest<'_>, resume: bool) {
+        struct StopAfterPrefix<'a>(&'a JobControl);
+        impl fc_remote::client::PullObserver for StopAfterPrefix<'_> {
+            fn received(&self, bytes: u64) {
+                if bytes >= (2 * MIB) as u64 { self.0.cancel(); }
+            }
+        }
+        // A QUIC close may discard even acknowledged data before the reader sees
+        // it. Cancel after application progress to create a deterministic fixture.
+        let control = JobControl::new();
+        let ctl = PushControl { control: &control, limiter: None };
+        let s = a.login(None);
+        let result = a.rt.block_on(s.pull_file_with_resume(req, &ctl, &StopAfterPrefix(&control), resume));
+        assert!(matches!(result, Err(ClientError::Cancelled)), "{result:?}");
+    }
+
     let a = agent();
     let bytes = data(6 * MIB, 7);
     fs::write(a.share.path().join("retry.bin"), &bytes).unwrap();
@@ -354,9 +370,7 @@ fn retry_discards_compatible_partial_but_keeps_real_identity_for_reconnect() {
     let ctl = PushControl { control: &control, limiter: None };
     let req = request("backup/retry.bin", &local, false);
     for resume in [true, false] {
-        a.handle.hooks().drop_pull_after_bytes.store((2 * MIB) as u64, Ordering::SeqCst);
-        let s = a.login(None);
-        assert!(a.rt.block_on(s.pull_file_with_resume(&req, &ctl, &(), resume)).unwrap_err().is_retryable());
+        leave_partial(&a, &req, resume);
         assert!(fs::metadata(out.path().join("retry.bin.fcpart")).unwrap().len() > 0);
     }
     let s = a.login(None);
@@ -368,9 +382,7 @@ fn retry_discards_compatible_partial_but_keeps_real_identity_for_reconnect() {
     // A compatible partial must be ignored when Retry is explicitly chosen.
     let local = out.path().join("retry-again.bin");
     let req = request("backup/retry.bin", &local, false);
-    a.handle.hooks().drop_pull_after_bytes.store((2 * MIB) as u64, Ordering::SeqCst);
-    let s = a.login(None);
-    assert!(a.rt.block_on(s.pull_file(&req, &ctl, &())).is_err());
+    leave_partial(&a, &req, true);
     let s = a.login(None);
     let done = a.rt.block_on(s.pull_file_with_resume(&req, &ctl, &(), false)).unwrap();
     assert_eq!(done.resumed_from, 0);
