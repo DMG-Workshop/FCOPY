@@ -56,7 +56,7 @@ pub struct SessionInfo {
 pub struct TestHooks {
     /// Abruptly close the connection once this many file bytes have arrived (once).
     pub drop_after_bytes: AtomicU64,
-    /// Same, for bytes sent to a downloading client.
+    /// Close the next sufficiently large download at this file offset, once.
     pub drop_pull_after_bytes: AtomicU64,
 }
 
@@ -807,6 +807,14 @@ async fn handle_pull(
         other => return Err(ProtoError::Unexpected { expected: "PullStart", got: Box::new(other) }),
     };
 
+    // Claim the fault before streaming: an earlier cancelled stream must not
+    // consume a hook installed for the next download.
+    let candidate = state.hooks.drop_pull_after_bytes.load(Ordering::Relaxed);
+    let drop_at = if candidate > 0 && size >= candidate
+        && state.hooks.drop_pull_after_bytes.compare_exchange(candidate, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+    {
+        candidate
+    } else { 0 };
     let mut file = tokio::fs::File::from_std(pf.file);
     let mut hasher = Hasher::new(to_engine(algo));
     let mut chunk = vec![0u8; CHUNK];
@@ -845,9 +853,7 @@ async fn handle_pull(
         write_data(&mut send, offset, &chunk[..n]).await?;
         offset += n as u64;
 
-        let drop_at = state.hooks.drop_pull_after_bytes.load(Ordering::Relaxed);
         if drop_at > 0 && offset >= drop_at {
-            state.hooks.drop_pull_after_bytes.store(0, Ordering::Relaxed);
             conn.close(0u32.into(), b"test: simulated network drop");
             return Ok(());
         }
