@@ -305,13 +305,14 @@ mod tests {
         fs::write(src.join("CON"), b"2").unwrap();
         fs::write(src.join("README"), b"3").unwrap();
         fs::write(src.join("readme"), b"4").unwrap();
+        let case_sensitive = fs::read(src.join("README")).unwrap() == b"3";
         let opts = PlanOptions { windows_safe_names: true, warn_case_collisions: true };
         let plan = plan_copy_with(&[src], &dir.path().join("dst"), &opts).unwrap();
         let names: Vec<_> = plan.items.iter().map(|i| i.dst.file_name().unwrap().to_string_lossy().into_owned()).collect();
         assert!(names.contains(&"a_b.txt".to_string()), "{names:?}");
         assert!(names.contains(&"CON_".to_string()), "{names:?}");
         assert_eq!(plan.warnings.iter().filter(|w| w.starts_with("renamed")).count(), 2);
-        assert!(plan.warnings.iter().any(|w| w.contains("README, readme")), "{:?}", plan.warnings);
+        assert_eq!(plan.warnings.iter().any(|w| w.contains("README, readme")), case_sensitive, "{:?}", plan.warnings);
     }
 
     #[test]

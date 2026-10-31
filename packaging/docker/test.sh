@@ -22,9 +22,10 @@ docker run --detach --name "$container" --user "$(id -u):$(id -g)" \
     --mount "type=bind,src=$work/data,dst=/data" \
     --mount "type=bind,src=$work/password,dst=/run/bootstrap-password,readonly" \
     "$image" --admin-password-file /run/bootstrap-password --no-torrents > /dev/null
-port=$(docker port "$container" 8443/tcp | cut -d: -f2)
-url="https://127.0.0.1:$port"
 wait_ready() {
+    # Docker can assign a different ephemeral host port after a restart.
+    port=$(docker port "$container" 8443/tcp | cut -d: -f2)
+    url="https://127.0.0.1:$port"
     for ((attempt=0; attempt<100; attempt++)); do
         if curl --insecure --fail --silent --max-time 2 "$url/api/info" > "$work/info"; then return; fi
         [[ $(docker inspect --format '{{.State.Running}}' "$container") = true ]] || return 1
