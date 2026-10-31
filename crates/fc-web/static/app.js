@@ -125,7 +125,7 @@ function fcopy() {
     conflictAllId: null,
     conflictBusy: false,
     conflictNotice: '',
-    addForm: { sources: '', dest: '', label: '', mode: 'local', clientId: '', password: '' },
+    addForm: { sources: '', dest: '', label: '', mode: 'local', clientId: '', password: '', moveSource: false },
     addNotice: '',
     remoteBrowser: { path: '', entries: [], busy: false, error: '' },
     settingsForm: { limitMiB: 0, policy: 'retry' },
@@ -712,7 +712,7 @@ function fcopy() {
       this.addNotice = '';
       const sources = this.addForm.sources.split('\n').map((s) => s.trim()).filter(Boolean);
       const body = { sources, dest: this.addForm.dest.trim(), label: this.addForm.label.trim() || null,
-        conflict: this.conflictPolicy };
+        conflict: this.conflictPolicy, move_source: this.addForm.moveSource && this.addForm.mode !== 'download' };
       if (this.addForm.mode === 'remote' || this.addForm.mode === 'download') {
         if (!this.addForm.clientId) {
           this.addNotice = 'Choose a paired PC.';
@@ -731,7 +731,8 @@ function fcopy() {
         this.addForm.password = '';
       }
       if (r.status === 202) {
-        this.addForm = { sources: '', dest: this.addForm.dest, label: '', mode: this.addForm.mode, clientId: this.addForm.clientId, password: '' };
+        // Move is cleared after each job: deleting sources should never carry over unnoticed.
+        this.addForm = { sources: '', dest: this.addForm.dest, label: '', mode: this.addForm.mode, clientId: this.addForm.clientId, password: '', moveSource: false };
         this.closeModal();
       } else {
         this.addNotice = await errorText(r);

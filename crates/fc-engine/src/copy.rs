@@ -110,6 +110,11 @@ pub struct CopyOptions {
     pub preserve_acls: bool,
     /// Shared bandwidth cap. Share one `Arc` between jobs to cap them together.
     pub rate_limit: Option<Arc<RateLimiter>>,
+    /// Move instead of copy: delete each source once its copy is committed. A
+    /// move always syncs the copy to disk and reads it back before deleting the
+    /// source, whatever `fsync` and `verify` say, so a crash or a bad write can
+    /// never lose both.
+    pub move_source: bool,
 }
 
 impl Default for CopyOptions {
@@ -131,6 +136,7 @@ impl Default for CopyOptions {
             preserve_xattrs: true,
             preserve_acls: false,
             rate_limit: None,
+            move_source: false,
         }
     }
 }
@@ -176,6 +182,11 @@ pub struct Copier {
 
 impl Copier {
     pub fn new(mut options: CopyOptions, handler: Arc<dyn ErrorHandler>) -> Self {
+        if options.move_source {
+            // The source is about to be deleted: the copy must be durable and proven first.
+            options.fsync = true;
+            options.verify = VerifyMode::ReadBack;
+        }
         options.chunk_size = normalize_chunk_size(options.chunk_size);
         options.pipeline_depth = options.pipeline_depth.clamp(1, 16);
         let depth = options.pipeline_depth;

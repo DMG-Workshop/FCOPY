@@ -49,6 +49,9 @@ pub struct SavedOptions {
     preallocate: bool,
     chunk_size: usize,
     pipeline_depth: usize,
+    /// Absent in jobs saved before move mode existed, which were copies.
+    #[serde(default)]
+    move_source: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +129,7 @@ impl Job {
                 preallocate: options.preallocate,
                 chunk_size: options.chunk_size,
                 pipeline_depth: options.pipeline_depth,
+                move_source: options.move_source,
             },
         };
         job.validate()?;
@@ -190,6 +194,7 @@ impl Job {
             preallocate: o.preallocate,
             chunk_size: o.chunk_size,
             pipeline_depth: o.pipeline_depth,
+            move_source: o.move_source,
             ..Default::default()
         })
     }
@@ -551,6 +556,24 @@ mod tests {
                 .policy,
             ConflictPolicy::Compare
         );
+    }
+
+    #[test]
+    fn a_saved_move_comes_back_as_a_move_and_older_jobs_stay_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut job = local(dir.path());
+        assert!(!job.request(Action::Retry, String::new()).unwrap().options.unwrap().move_source);
+
+        job.options.move_source = true;
+        let saved = toml::to_string(&job).unwrap();
+        let back: Job = toml::from_str(&saved).unwrap();
+        assert!(back.request(Action::Retry, String::new()).unwrap().options.unwrap().move_source);
+
+        // A job saved before move mode existed has no such field, and was a copy.
+        let older = saved.replace("move_source = true\n", "");
+        assert_ne!(older, saved, "the field was present to remove");
+        let back: Job = toml::from_str(&older).unwrap();
+        assert!(!back.request(Action::Retry, String::new()).unwrap().options.unwrap().move_source);
     }
 
     #[test]

@@ -182,6 +182,49 @@ async fn users_see_only_their_own_transfers() {
 }
 
 #[tokio::test]
+async fn a_move_over_http_removes_the_source_after_copying() {
+    let app = setup().await;
+    let src = app.root.path().join("moving.txt");
+    std::fs::write(&src, b"move me").unwrap();
+    let alice = login(&app, "alice", "password1").await;
+
+    let created = send(
+        &app,
+        "POST",
+        "/api/transfers",
+        &[(COOKIE.as_str(), alice.as_str()), CSRF],
+        Some(json!({ "sources": [&src], "dest": app.root.path().join("out"), "move_source": true })),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{}", created.json);
+    let queue = app.state.queue.clone();
+    tokio::task::spawn_blocking(move || queue.wait_idle()).await.unwrap();
+
+    assert_eq!(std::fs::read(app.root.path().join("out/moving.txt")).unwrap(), b"move me");
+    assert!(!src.exists(), "the source was deleted after the verified copy");
+}
+
+#[tokio::test]
+async fn a_move_from_another_pc_is_refused() {
+    let app = setup().await;
+    let alice = login(&app, "alice", "password1").await;
+    let r = send(
+        &app,
+        "POST",
+        "/api/transfers",
+        &[(COOKIE.as_str(), alice.as_str()), CSRF],
+        Some(json!({
+            "sources": ["/backup/a.txt"],
+            "dest": app.root.path().join("out"),
+            "remote": { "client_id": 1, "password": "x", "direction": "download" },
+            "move_source": true,
+        })),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.json);
+}
+
+#[tokio::test]
 async fn pause_resume_and_cancel_a_job_over_http() {
     let app = setup().await;
     std::fs::write(app.root.path().join("a.txt"), b"hello").unwrap();

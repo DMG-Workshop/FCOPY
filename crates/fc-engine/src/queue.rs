@@ -81,6 +81,13 @@ pub trait TransferBackend: Send + Sync {
     }
 
     fn run(&self, plan: &Plan, ctx: &BackendContext<'_>, on_file: &mut dyn FnMut(FileEvent<'_>)) -> Result<BatchReport, CopyError>;
+
+    /// True when the plan's sources are paths on this machine. A backend that
+    /// downloads from elsewhere returns false, so a move never treats a remote
+    /// path as a local file to delete.
+    fn sources_are_local(&self) -> bool {
+        true
+    }
 }
 
 /// Where a transfer goes.
@@ -804,6 +811,12 @@ fn run_job(
     request: &TransferRequest,
     control: &JobControl,
 ) -> (JobState, JobSummary) {
+    if let Target::Backend(backend) = &request.target {
+        if copier.options().move_source && !backend.sources_are_local() {
+            let why = "moving files off another PC is not supported; copy them instead";
+            return (JobState::Failed(why.into()), JobSummary::default());
+        }
+    }
     let plan = match &request.target {
         Target::IntoDir(dir) => plan_copy_with(&request.sources, dir, plan_opts).map_err(|e| CopyError::Backend(e.to_string())),
         Target::FileTo(dst) if request.sources.len() == 1 => plan_file_to(&request.sources[0], dst).map_err(|e| CopyError::Backend(e.to_string())),
@@ -831,12 +844,21 @@ fn run_job(
         })
     };
 
+    // A local plan run deletes moved sources itself. A backend only reports what
+    // reached the other side, so the queue deletes those sources here.
+    let backend_move = copier.options().move_source && matches!(request.target, Target::Backend(_));
     let mut on_file = |ev: FileEvent<'_>| match ev {
         FileEvent::Copied(r) => {
             inner.update(id, |j| {
                 j.files_copied += 1;
                 j.bytes_copied += r.bytes;
             });
+            let mut warnings = r.warnings.clone();
+            if backend_move {
+                if let Err(why) = crate::batch::remove_sent_source(r) {
+                    warnings.push(why);
+                }
+            }
             inner.emit(Event::FileCopied {
                 job: id,
                 src: r.src.clone(),
@@ -844,7 +866,7 @@ fn run_job(
                 bytes: r.bytes,
                 digest: r.source_digest.as_ref().map(|d| d.to_hex()),
                 verified: r.verified,
-                warnings: r.warnings.clone(),
+                warnings,
             });
         }
         FileEvent::Skipped(item, e) => {
@@ -864,6 +886,9 @@ fn run_job(
         }
         _ => copier.run_plan_observed(&plan, &plan.dest_root, &progress, control, &mut on_file),
     };
+    if backend_move && result.as_ref().is_ok_and(|r| !r.cancelled) && !control.is_cancelled() {
+        crate::batch::remove_empty_source_dirs(&plan);
+    }
     inner.update(id, |j| j.telemetry = Some(progress.snapshot()));
 
     match result {

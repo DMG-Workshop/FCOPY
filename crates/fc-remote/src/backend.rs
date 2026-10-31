@@ -611,6 +611,10 @@ impl TransferBackend for PullBackend {
         format!("{} (from {})", self.destination.display(), self.remote.connector.spec().host_port())
     }
 
+    fn sources_are_local(&self) -> bool {
+        false
+    }
+
     fn plan(&self, sources: &[PathBuf], _options: &PlanOptions, control: &JobControl) -> Result<Plan, CopyError> {
         self.remote.runtime.as_ref().expect("runtime lives until drop").block_on(async {
             let cancel = async {

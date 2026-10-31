@@ -480,6 +480,10 @@
           <option value="compare">Compare; ask if different</option>
         </select>
       </label>
+      <label x-show="addForm.mode !== 'download'" class="flex items-center gap-2 px-4 py-2 text-body"
+             title="Each copy is synced and read back first. Files that are not copied keep their source.">
+        <input type="checkbox" x-model="addForm.moveSource" class="accent-brand"> Move: delete each source after its copy is verified
+      </label>
       <footer class="modal-foot"><button type="button" class="btn-ghost h-8 px-3" @click="closeModal()">Cancel</button><button class="btn-primary h-8 px-4">Queue transfer</button></footer>
     </form>
 

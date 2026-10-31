@@ -121,6 +121,11 @@ struct CopyArgs {
     #[arg(long)]
     fsync: bool,
 
+    /// Move: delete each source once its copy is synced and read back
+    /// (implies --fsync and --verify readback). Files that are not copied stay.
+    #[arg(long = "move")]
+    move_files: bool,
+
     /// I/O chunk size (64KiB..4MiB).
     #[arg(long, value_parser = parse_size, default_value = "1MiB")]
     chunk: u64,
@@ -260,6 +265,10 @@ fn prompt_conflict(details: &fc_engine::conflict::Conflict) -> fc_engine::confli
 
 fn copy(args: CopyArgs) -> ExitCode {
     match remote_sources(&args) {
+        Ok(Some(_)) if args.move_files => {
+            eprintln!("error: --move is not supported when copying from another PC; copy instead");
+            return ExitCode::from(2);
+        }
         Ok(Some(specs)) => return pull(&args, specs),
         Ok(None) => {}
         Err(e) => {
@@ -301,6 +310,7 @@ fn copy(args: CopyArgs) -> ExitCode {
         preserve_permissions: preserve,
         preserve_xattrs: preserve,
         preserve_acls: args.acls,
+        move_source: args.move_files,
         ..Default::default()
     };
     let plan = PlanOptions {

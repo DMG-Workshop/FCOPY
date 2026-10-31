@@ -122,6 +122,10 @@ pub struct CreateTransfer {
     pub remote: Option<RemoteTarget>,
     #[serde(default = "default_conflict")]
     pub conflict: String,
+    /// Delete each source once its copy is synced and read back. Not allowed
+    /// when downloading from another PC.
+    #[serde(default)]
+    pub move_source: bool,
 }
 
 fn default_conflict() -> String { "ask".into() }
@@ -179,6 +183,10 @@ pub async fn create_transfer(
     if req.remote.is_some() {
         require_admin(&p)?;
     }
+    if download && req.move_source {
+        return Err(ApiError::BadRequest("files on another PC can be copied, not moved".into()));
+    }
+    let move_source = req.move_source;
     if !download {
         for src in &req.sources {
             if !within_roots(&s.roots, src) || !src.exists() {
@@ -223,6 +231,9 @@ pub async fn create_transfer(
     };
     if let Some(label) = req.label.filter(|l| !l.trim().is_empty()) {
         request = request.with_label(label);
+    }
+    if move_source {
+        request = request.with_options(fc_engine::CopyOptions { move_source: true, ..s.queue.copy_options() });
     }
     let request = request.with_conflict_policy(policy);
     let job = crate::recovery::saved_job(&request, destination, p.name.clone(), &s.queue.copy_options())?;

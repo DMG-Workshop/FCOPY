@@ -103,6 +103,26 @@ fn existing_destination_fails_without_overwrite() {
 }
 
 #[test]
+fn move_deletes_sources_but_keeps_one_that_was_not_copied() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("album");
+    let dst = dir.path().join("out");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(dst.join("album")).unwrap();
+    fs::write(src.join("one.bin"), data(40_000)).unwrap();
+    fs::write(src.join("two.bin"), b"two").unwrap();
+    // two.bin already exists at the destination, so without --overwrite it is not copied.
+    fs::write(dst.join("album/two.bin"), b"kept").unwrap();
+
+    let out = fcopy().args(["copy", "--move", "--conflict", "skip"]).arg(&src).arg(&dst).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(fs::read(dst.join("album/one.bin")).unwrap(), data(40_000), "{stderr}");
+    assert!(!src.join("one.bin").exists(), "one.bin moved");
+    assert!(src.join("two.bin").exists(), "two.bin was skipped, so its source stays");
+    assert_eq!(fs::read(dst.join("album/two.bin")).unwrap(), b"kept");
+}
+
+#[test]
 fn ask_mode_reads_answers_from_stdin() {
     // Parent of the destination is a file, so directory creation fails and asks.
     let dir = tempfile::tempdir().unwrap();

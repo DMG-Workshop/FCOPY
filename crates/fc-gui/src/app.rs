@@ -103,6 +103,8 @@ struct NewTransfer {
     verify: VerifyMode,
     conflict_policy: ConflictPolicy,
     remote: RemoteForm,
+    /// Delete each source once its copy is synced and read back.
+    move_files: bool,
 }
 
 impl NewTransfer {
@@ -114,7 +116,13 @@ impl NewTransfer {
             verify: if startup.verify { VerifyMode::ReadBack } else { VerifyMode::Off },
             conflict_policy: ConflictPolicy::Ask,
             remote: RemoteForm::default(),
+            move_files: false,
         }
+    }
+
+    /// A move deletes local sources, so it is not offered when downloading from another PC.
+    fn moving(&self) -> bool {
+        self.move_files && !(self.remote.enabled && self.remote.download)
     }
 }
 
@@ -299,6 +307,7 @@ impl FcApp {
         let options = CopyOptions {
             verify: self.form.verify,
             algorithm: Algorithm::Xxh3,
+            move_source: self.form.moving(),
             ..Default::default()
         };
         self.notice = None;
@@ -1111,6 +1120,14 @@ impl FcApp {
                     ] { ui.selectable_value(&mut self.form.conflict_policy, policy, label); }
                 });
         });
+        let downloading = self.form.remote.enabled && self.form.remote.download;
+        ui.add_enabled_ui(!downloading, |ui| {
+            ui.checkbox(&mut self.form.move_files, "Move: delete each source after its copy is verified")
+                .on_disabled_hover_text("Files on another PC are copied, never moved.");
+        });
+        if self.form.moving() {
+            ui.weak("Each copy is synced and read back first. Files that are not copied keep their source.");
+        }
         if let Some(msg) = &self.notice {
             ui.colored_label(warn(ui), msg);
         }
@@ -1581,5 +1598,23 @@ impl eframe::App for FcApp {
         self.recovery.shutdown();
         self.history.shutdown();
         self.torrents.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_download_from_another_pc_is_never_a_move() {
+        let startup = Startup { sources: vec![], dest: None, limit: None, verify: false, torrent_dht: false, torrent_trackers: false };
+        let mut form = NewTransfer::from_startup(&startup);
+        assert!(!form.moving(), "copy is the default");
+        form.move_files = true;
+        assert!(form.moving());
+        form.remote.enabled = true;
+        assert!(form.moving(), "sending to another PC can move");
+        form.remote.download = true;
+        assert!(!form.moving(), "downloading from another PC never deletes");
     }
 }

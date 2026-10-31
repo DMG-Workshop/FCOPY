@@ -59,6 +59,9 @@ pub struct Plan {
     pub warnings: Vec<String>,
     /// Directory the free-space check probes.
     pub dest_root: PathBuf,
+    /// Source folders walked, parents before children. A move removes the ones
+    /// left empty, deepest first.
+    pub source_dirs: Vec<PathBuf>,
 }
 
 /// Plan copying each of `sources` *into* `dest_dir` (`cp -r src dest_dir/`
@@ -145,6 +148,7 @@ fn walk(plan: &mut Plan, opts: &PlanOptions, src_root: &Path, dst_root: &Path) {
     while let Some((src_dir, dst_dir)) = stack.pop() {
         plan.stats.dirs += 1;
         plan.dirs.push(dst_dir.clone());
+        plan.source_dirs.push(src_dir.clone());
         let mut entries: Vec<_> = match fs::read_dir(&src_dir) {
             Ok(rd) => rd.flatten().collect(),
             Err(e) => {
@@ -203,6 +207,8 @@ pub struct BatchReport {
     pub cancelled: bool,
     pub bytes_copied: u64,
     pub elapsed: Duration,
+    /// On a move, sources deleted after their copy was committed.
+    pub sources_removed: u64,
 }
 
 impl BatchReport {
@@ -263,7 +269,13 @@ impl Copier {
             }
             // Space was verified for the whole plan, so skip the per-file probe.
             match self.copy_file_impl(&item.src, &item.dst, progress, control, false, Some(item.size)) {
-                Ok(CopyOutcome::Copied(r)) => {
+                Ok(CopyOutcome::Copied(mut r)) => {
+                    if opts.move_source {
+                        match remove_moved_source(&r) {
+                            Ok(()) => report.sources_removed += 1,
+                            Err(why) => r.warnings.push(why),
+                        }
+                    }
                     on_file(FileEvent::Copied(&r));
                     report.bytes_copied += r.bytes;
                     report.copied.push(r);
@@ -284,8 +296,84 @@ impl Copier {
                 }
             }
         }
+        if opts.move_source && !report.cancelled {
+            remove_empty_source_dirs(plan);
+        }
         report.elapsed = started.elapsed();
         Ok(report)
+    }
+}
+
+/// After a move, delete the source of one committed copy. Refuses, and keeps the
+/// source, unless both files exist with the copied size and are not the same
+/// file. Returns the reason as a warning for the file's log line.
+pub fn remove_moved_source(report: &CopyReport) -> std::result::Result<(), String> {
+    let dst_len = match fs::metadata(&report.dst) {
+        Ok(m) => m.len(),
+        Err(e) => return keep(format!("cannot read the copy: {e}")),
+    };
+    if dst_len != report.bytes {
+        return keep("the copy has a different size".into());
+    }
+    if same_file(&report.src, &report.dst) {
+        return keep("the copy is the same file".into());
+    }
+    delete_source(report)
+}
+
+/// After a move to another PC, delete the source of one file the other side
+/// has confirmed. `dst` names a path over there, so only the source is checked
+/// here; the remote side has already compared digests.
+pub fn remove_sent_source(report: &CopyReport) -> std::result::Result<(), String> {
+    delete_source(report)
+}
+
+fn keep(why: String) -> std::result::Result<(), String> {
+    Err(format!("copied, but the source was kept: {why}"))
+}
+
+/// Delete `report.src` if it still has the size that was copied.
+fn delete_source(report: &CopyReport) -> std::result::Result<(), String> {
+    match fs::metadata(&report.src) {
+        Ok(m) if m.len() == report.bytes => {}
+        Ok(_) => return keep("it changed size during the copy".into()),
+        Err(e) => return keep(format!("cannot read it: {e}")),
+    }
+    match fs::remove_file(&report.src) {
+        Ok(()) => Ok(()),
+        // Windows refuses to delete read-only files; the copy already carries the
+        // flag. On Unix the file's own bits do not govern deletion, so no retry.
+        Err(e) if cfg!(windows) && e.kind() == io::ErrorKind::PermissionDenied => {
+            let cleared = fs::metadata(&report.src).map(|m| m.permissions()).and_then(|mut p| {
+                #[allow(clippy::permissions_set_readonly_false)]
+                p.set_readonly(false);
+                fs::set_permissions(&report.src, p)
+            });
+            match cleared.and_then(|()| fs::remove_file(&report.src)) {
+                Ok(()) => Ok(()),
+                Err(_) => keep(format!("cannot delete it: {e}")),
+            }
+        }
+        Err(e) => keep(format!("cannot delete it: {e}")),
+    }
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// After a move, remove the walked source folders that are now empty, deepest
+/// first. Folders that still hold anything (skipped files, links) stay.
+pub fn remove_empty_source_dirs(plan: &Plan) {
+    for dir in plan.source_dirs.iter().rev() {
+        let empty = fs::read_dir(dir).map(|mut d| d.next().is_none()).unwrap_or(false);
+        if empty {
+            // Losing a race with something writing into it just leaves the folder.
+            let _ = fs::remove_dir(dir);
+        }
     }
 }
 

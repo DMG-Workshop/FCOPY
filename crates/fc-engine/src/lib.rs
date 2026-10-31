@@ -52,7 +52,10 @@ pub mod space;
 pub mod throttle;
 pub mod units;
 
-pub use batch::{plan_copy, plan_copy_with, plan_file_to, BatchReport, CopyItem, FileEvent, Plan, PlanOptions};
+pub use batch::{
+    plan_copy, plan_copy_with, plan_file_to, remove_empty_source_dirs, remove_moved_source, remove_sent_source, BatchReport, CopyItem,
+    FileEvent, Plan, PlanOptions,
+};
 pub use buffer::{AlignedBuf, BufferPool, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 pub use checksum::{hash_file, Algorithm, Digest, Hasher};
 pub use control::{Cancelled, JobControl};
