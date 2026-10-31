@@ -105,6 +105,8 @@ The recipe fetches the real upstream Git repository at `v$pkgver`, builds using
 downloaded release archive. No live `main` branch is used for a versioned package.
 CI uses a private Git mirror to run this same recipe against its exact checkout;
 branch and pull-request builds do not need an already-published release tag.
+The optional split-debug archive produced by makepkg is not a release download;
+CI uploads the main `fcopy` package only.
 
 ## CI and publishing
 

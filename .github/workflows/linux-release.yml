@@ -186,7 +186,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: arch-package
-          path: dist/*.pkg.tar.zst
+          path: |
+            dist/*.pkg.tar.zst
+            !dist/*-debug-*.pkg.tar.zst
           if-no-files-found: error
           retention-days: 14
 
