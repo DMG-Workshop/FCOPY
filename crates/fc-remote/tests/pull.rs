@@ -89,6 +89,22 @@ fn request<'a>(remote: &'a str, local: &'a Path, overwrite: bool) -> PullRequest
     PullRequest { remote, local, algo: HashAlgo::Sha256, overwrite, preserve: true }
 }
 
+fn leave_partial(a: &Agent, req: &PullRequest<'_>, resume: bool) {
+    struct StopAfterPrefix<'a>(&'a JobControl);
+    impl fc_remote::client::PullObserver for StopAfterPrefix<'_> {
+        fn received(&self, bytes: u64) {
+            if bytes >= (2 * MIB) as u64 { self.0.cancel(); }
+        }
+    }
+    // A QUIC close may discard even acknowledged data before the reader sees
+    // it. Cancel after application progress to create a deterministic fixture.
+    let control = JobControl::new();
+    let ctl = PushControl { control: &control, limiter: None };
+    let s = a.login(None);
+    let result = a.rt.block_on(s.pull_file_with_resume(req, &ctl, &StopAfterPrefix(&control), resume));
+    assert!(matches!(result, Err(ClientError::Cancelled)), "{result:?}");
+}
+
 fn no_leftovers(dir: &Path) {
     for e in walk(dir) {
         let name = e.file_name().unwrap().to_string_lossy().to_string();
@@ -297,6 +313,9 @@ fn a_dropped_connection_resumes_the_download_from_the_partial_file() {
     fs::write(a.share.path().join("big.bin"), &bytes).unwrap();
     let out = tempfile::tempdir().unwrap();
     let local = out.path().join("big.bin");
+    leave_partial(&a, &request("backup/big.bin", &local, false), true);
+    let before_drop = fs::metadata(out.path().join("big.bin.fcpart")).unwrap().len();
+    assert!(before_drop > 0);
     let control = JobControl::new();
     let ctl = PushControl { control: &control, limiter: None };
 
@@ -307,7 +326,7 @@ fn a_dropped_connection_resumes_the_download_from_the_partial_file() {
     assert!(err.is_retryable(), "{err:?}");
     assert!(!local.exists(), "nothing is committed before the file is complete");
     let partial = fs::metadata(out.path().join("big.bin.fcpart")).unwrap().len();
-    assert!(partial > 0, "the partial file is kept for resume");
+    assert!(partial >= before_drop, "the confirmed prefix is kept after the network drop");
 
     let s = a.login(Some(token));
     let done = a.rt.block_on(s.pull_file(&request("backup/big.bin", &local, false), &ctl, &())).unwrap();
@@ -345,22 +364,6 @@ fn a_changed_remote_file_is_not_resumed_from_a_stale_partial() {
 
 #[test]
 fn retry_discards_compatible_partial_but_keeps_real_identity_for_reconnect() {
-    fn leave_partial(a: &Agent, req: &PullRequest<'_>, resume: bool) {
-        struct StopAfterPrefix<'a>(&'a JobControl);
-        impl fc_remote::client::PullObserver for StopAfterPrefix<'_> {
-            fn received(&self, bytes: u64) {
-                if bytes >= (2 * MIB) as u64 { self.0.cancel(); }
-            }
-        }
-        // A QUIC close may discard even acknowledged data before the reader sees
-        // it. Cancel after application progress to create a deterministic fixture.
-        let control = JobControl::new();
-        let ctl = PushControl { control: &control, limiter: None };
-        let s = a.login(None);
-        let result = a.rt.block_on(s.pull_file_with_resume(req, &ctl, &StopAfterPrefix(&control), resume));
-        assert!(matches!(result, Err(ClientError::Cancelled)), "{result:?}");
-    }
-
     let a = agent();
     let bytes = data(6 * MIB, 7);
     fs::write(a.share.path().join("retry.bin"), &bytes).unwrap();
