@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>fcopy-web</Name>
+  <Repository>ghcr.io/dmg-workshop/fcopy-web:latest</Repository>
+  <Registry>https://ghcr.io/dmg-workshop/fcopy-web</Registry>
+  <Network>bridge</Network>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/DMG-Workshop/FCOPY/issues</Support>
+  <Project>https://github.com/DMG-Workshop/FCOPY</Project>
+  <Overview>HTTPS file transfer console with local copies, remote uploads/downloads, saved PCs, history and paused recovery. Persist /config and map only the data folders you want exposed. On first initialization, read the random admin password in the container log or mount a bootstrap password file. No default password. Do not expose directly to the Internet.</Overview>
+  <Category>Tools:Utilities Network:Other</Category>
+  <WebUI>https://[IP]:[PORT:8443]/</WebUI>
+  <Icon>https://raw.githubusercontent.com/DMG-Workshop/FCOPY/main/packaging/icons/io.github.fcopy.svg</Icon>
+  <ExtraParams>--user=99:100 --security-opt=no-new-privileges --cap-drop=ALL</ExtraParams>
+  <Shell>sh</Shell>
+  <Config Name="HTTPS console" Target="8443" Default="8443" Mode="tcp" Description="HTTPS only; accept the self-signed certificate after comparing its fingerprint." Type="Port" Display="always" Required="true" Mask="false">8443</Config>
+  <Config Name="Persistent configuration" Target="/config" Default="/mnt/user/appdata/fcopy" Mode="rw" Description="Accounts, TLS identity, profiles, history, recovery and torrent state. Must be writable by UID 99 / GID 100." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/fcopy</Config>
+  <Config Name="Transfer data" Target="/data" Default="/mnt/user/fcopy" Mode="rw" Description="Only this mapped directory is available to transfers. Must have suitable nobody/users permissions." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/fcopy</Config>
+</Container>

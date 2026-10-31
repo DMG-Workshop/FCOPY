@@ -1,4 +1,4 @@
-name: Linux packages
+name: FCOPY releases
 
 on:
   push:
@@ -19,6 +19,8 @@ jobs:
     name: Build DEB, RPM and AppImage
     runs-on: ubuntu-22.04
     timeout-minutes: 90
+    outputs:
+      version: ${{ steps.version.outputs.value }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,9 +40,10 @@ jobs:
           rustup default stable
           rustup component add clippy
       - name: Check release version and packaging syntax
+        id: version
         run: |
-          bash packaging/linux/check-version.sh
-          shellcheck packaging/linux/*.sh packaging/arch/PKGBUILD
+          echo "value=$(bash packaging/linux/check-version.sh)" >> "$GITHUB_OUTPUT"
+          shellcheck packaging/linux/*.sh packaging/hosted/*.sh packaging/docker/*.sh packaging/macos/*.sh packaging/arch/PKGBUILD
           desktop-file-validate packaging/linux/io.github.fcopy.desktop
           appstreamcli validate --no-net packaging/linux/io.github.fcopy.metainfo.xml
       - name: Test workspace
@@ -50,9 +53,11 @@ jobs:
       - name: Lint workspace
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Build release applications
-        run: cargo build --locked --release -p fc-cli -p fc-gui
+        run: cargo build --locked --release -p fc-cli -p fc-gui -p fc-web
       - name: Build packages
-        run: bash packaging/linux/build.sh all
+        run: |
+          bash packaging/linux/build.sh all
+          bash packaging/hosted/build.sh
       - name: Smoke-test AppImage on baseline Linux
         run: bash packaging/linux/smoke-test.sh dist/*.AppImage
       - uses: actions/upload-artifact@v4
@@ -106,7 +111,7 @@ jobs:
       - name: Install test dependencies
         run: |
           dnf install -y git ca-certificates xorg-x11-server-Xvfb xorg-x11-xauth \
-            mesa-dri-drivers mesa-libGL desktop-file-utils
+            mesa-dri-drivers mesa-libGL desktop-file-utils diffutils
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -185,10 +190,139 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  publish:
-    name: Publish tagged Linux release
+  macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install icon renderer and Rust
+        run: |
+          brew install librsvg
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add clippy
+          test "$(uname -m)" = "${{ matrix.arch }}"
+      - name: Test native macOS branches
+        run: |
+          cargo test --locked --workspace
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Build and test DMG
+        run: |
+          cargo build --locked --release -p fc-cli -p fc-gui
+          bash packaging/macos/build.sh
+          bash packaging/macos/smoke-test.sh dist/*.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-package-${{ matrix.arch }}
+          path: dist/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+  docker-test:
+    name: Test hosted Docker image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build and test production container
+        run: |
+          version=$(bash packaging/linux/check-version.sh)
+          docker build --file packaging/docker/Dockerfile --tag fcopy-web:test \
+            --build-arg "VERSION=$version" --build-arg "REVISION=$GITHUB_SHA" .
+          docker compose --file packaging/docker/compose.yml config --quiet
+          bash packaging/docker/test.sh
+          docker save fcopy-web:test | gzip -1 > tested-container.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tested-container
+          path: tested-container.tar.gz
+          if-no-files-found: error
+          retention-days: 3
+
+  lxc-test:
+    name: Native hosted package on Debian ${{ matrix.debian }}
+    needs: build
+    runs-on: ubuntu-24.04
+    container: debian:${{ matrix.debian }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        debian: ['12', '13']
+    steps:
+      - name: Install test dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-packages
+          path: dist
+      - name: Verify the LXC service payload without modifying a hypervisor
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        shell: bash
+        run: |
+          tar -xzf dist/fcopy-web-*-linux-x86_64.tar.gz -C /tmp
+          bash "/tmp/fcopy-web-$VERSION/install-lxc.sh" --no-start
+          systemd-analyze verify /etc/systemd/system/fcopy-web.service
+          /usr/local/bin/fcopy-web --help
+          test "$(stat -c '%U' /var/lib/fcopy-web)" = fcopy-web
+          bash packaging/hosted/smoke-test.sh
+
+  image-publish:
+    name: Publish tested GHCR image
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [build, deb-test, rpm-test, arch]
+    needs: [build, deb-test, rpm-test, arch, macos, docker-test, lxc-test]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tested-container
+          path: container
+      - name: Push the exact image that passed restart and recovery tests
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gunzip -c container/tested-container.tar.gz | docker load
+          image="ghcr.io/${GITHUB_REPOSITORY,,}-web"
+          version="${RELEASE_TAG#v}"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker tag fcopy-web:test "$image:$version"
+          docker tag fcopy-web:test "$image:latest"
+          docker push "$image:$version"
+          docker push "$image:latest"
+          # GHCR can initially create private packages. The owner must make the
+          # package public once before an anonymous deployment can pull it.
+          anonymous=$(mktemp -d)
+          DOCKER_CONFIG="$anonymous" docker manifest inspect "$image:$version" > /dev/null
+
+  publish:
+    name: Publish tagged release downloads
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [build, deb-test, rpm-test, arch, macos, docker-test, lxc-test, image-publish]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -210,7 +344,10 @@ jobs:
           test "$(find . -maxdepth 1 -name '*.rpm' | wc -l)" -eq 1
           test "$(find . -maxdepth 1 -name '*.AppImage' | wc -l)" -eq 1
           test "$(find . -maxdepth 1 -name '*.pkg.tar.zst' | wc -l)" -eq 1
-          sha256sum ./*.deb ./*.rpm ./*.AppImage ./*.pkg.tar.zst > SHA256SUMS
+          test "$(find . -maxdepth 1 -name '*.dmg' | wc -l)" -eq 2
+          test "$(find . -maxdepth 1 -name '*linux-x86_64.tar.gz' | wc -l)" -eq 1
+          test -f fcopy-unraid.xml
+          sha256sum ./*.deb ./*.rpm ./*.AppImage ./*.pkg.tar.zst ./*.dmg ./*.tar.gz ./*.xml > SHA256SUMS
           existing=$(gh release list --limit 100 --json tagName --jq \
             ".[] | select(.tagName == \"$RELEASE_TAG\") | .tagName")
           if [[ -z $existing ]]; then

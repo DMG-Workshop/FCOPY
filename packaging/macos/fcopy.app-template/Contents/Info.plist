@@ -13,17 +13,5 @@
   <key>LSMinimumSystemVersion</key>    <string>11.0</string>
   <key>NSHighResolutionCapable</key>   <true/>
   <key>LSApplicationCategoryType</key> <string>public.app-category.utilities</string>
-  <!-- Accept anything dropped on the Dock icon / offered via "Open With".
-       LSHandlerRank=Alternate: never steal default handling of any file type. -->
-  <key>CFBundleDocumentTypes</key>
-  <array>
-    <dict>
-      <key>CFBundleTypeName</key>     <string>Files and Folders</string>
-      <key>CFBundleTypeRole</key>     <string>Viewer</string>
-      <key>LSHandlerRank</key>        <string>Alternate</string>
-      <key>LSItemContentTypes</key>
-      <array><string>public.item</string><string>public.folder</string></array>
-    </dict>
-  </array>
 </dict>
 </plist>

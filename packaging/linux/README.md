@@ -117,7 +117,9 @@ branch and pull-request builds do not need an already-published release tag.
 4. Build the Arch package as an unprivileged user, then install/uninstall it.
 5. Test actual CLI read-back copies, per-user desktop integration and GUI startup
    under Xvfb/Mesa. The AppImage is exercised without FUSE on Ubuntu and Fedora.
-6. On a version-tag push only, publish all four assets and checksums to a GitHub
+6. Also test native macOS DMGs, the Docker image, and the hosted Debian service.
+   On a version-tag push only, publish the tested GHCR image and all desktop,
+   hosted and Unraid assets with checksums to a GitHub
    release. Rerunning the workflow updates assets on an existing release.
 
 Branch/PR/manual runs upload workflow artifacts for 14 days; they never create a

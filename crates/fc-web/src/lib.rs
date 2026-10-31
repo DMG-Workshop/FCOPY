@@ -74,7 +74,7 @@ pub struct Config {
     pub cookie_secure: bool,
     pub session_ttl: Duration,
     pub hash_cost: HashCost,
-    /// Where paired clients and transfer history are saved. `None` keeps them in memory.
+    /// Where accounts, paired clients, history and recovery are saved. `None` is memory-only.
     pub state_dir: Option<PathBuf>,
     pub certificate_fingerprint: Option<String>,
     pub torrents: Option<TorrentEngine>,
@@ -119,7 +119,7 @@ pub fn build(queue: Queue, events: std::sync::mpsc::Receiver<Event>, config: Con
     let (telemetry, _) = broadcast::channel(64);
     let state = Arc::new(AppState {
         queue,
-        users: UserStore::new(config.hash_cost)?,
+        users: UserStore::open(config.hash_cost, config.state_dir.as_ref().map(|dir| dir.join("users.json")))?,
         sessions: SessionStore::new(config.session_ttl),
         api_keys: ApiKeys::default(),
         limiter: LoginLimiter::new(Limits::default()),

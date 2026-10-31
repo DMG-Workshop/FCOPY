@@ -1,0 +1,9 @@
+.git
+.github
+target
+dist
+.env*
+**/*.pem
+**/*.key
+**/*.fcpart
+**/*.fcpart.id

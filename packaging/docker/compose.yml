@@ -1,0 +1,16 @@
+services:
+  fcopy:
+    image: ghcr.io/dmg-workshop/fcopy-web:latest
+    container_name: fcopy-web
+    user: "${FCOPY_UID:-1000}:${FCOPY_GID:-1000}"
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./config:/config
+      - ./data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    stop_grace_period: 30s

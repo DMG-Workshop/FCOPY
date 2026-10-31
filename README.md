@@ -27,6 +27,20 @@ Packages include the CLI and desktop app, not an automatically enabled agent or
 web server. See the [Linux packaging guide](packaging/linux/README.md) for
 installation, compatibility, local builds, checksums and the release process.
 
+## macOS and hosted deployments
+
+Native Apple Silicon and Intel DMGs include the desktop app and CLI.
+They are ad-hoc signed, **not notarized**; see the
+[macOS guide](packaging/macos/README.md) for installation and Gatekeeper details.
+
+The standalone `fcopy-web` HTTPS server supports a non-root
+`ghcr.io/dmg-workshop/fcopy-web` Docker image, an Unraid user template, and a
+native systemd service inside an unprivileged Debian Proxmox LXC.
+Accounts, TLS identity and paused recovery persist, with no plaintext passwords
+in account files. See the [hosted deployment guide](packaging/hosted/README.md)
+for volumes, initial login, TLS and installation. LXC support is an installer
+and native archive, not a prebuilt OS image.
+
 ## Download from a PC
 
 The remote PC must run a current `fcopy-agent` with an account and a share.

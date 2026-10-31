@@ -561,6 +561,7 @@ pub async fn create_user(
     match s.users.add(&req.name, &req.password, req.role) {
         Ok(()) => Ok((StatusCode::CREATED, Json(UserDto { name: req.name, role: req.role }))),
         Err(AuthError::Exists) => Err(ApiError::Conflict("an account with that name exists".into())),
+        Err(e @ (AuthError::Storage(_) | AuthError::Hash(_))) => Err(ApiError::Internal(e.to_string())),
         Err(e) => Err(ApiError::BadRequest(e.to_string())),
     }
 }
@@ -570,7 +571,7 @@ pub async fn delete_user(State(s): State<Arc<AppState>>, p: Principal, Path(name
     if name == p.name {
         return Err(ApiError::Conflict("you cannot delete the account you are signed in with".into()));
     }
-    if !s.users.remove(&name) {
+    if !s.users.remove(&name).map_err(|error| ApiError::Internal(error.to_string()))? {
         return Err(ApiError::NotFound);
     }
     s.sessions.revoke_user(&name);

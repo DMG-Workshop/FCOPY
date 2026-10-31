@@ -142,8 +142,8 @@ async fn restart_recovery(e: &mut Env) {
         hash_cost: HashCost { m_kib: 256, t: 1, p: 1 },
         state_dir: Some(e.state_dir.path().into()), ..Default::default()
     }).unwrap();
-    state.users.add("admin", "admin-password", Role::Admin).unwrap();
-    state.users.add("bob", "bobs-password", Role::User).unwrap();
+    assert!(state.users.authenticate("admin", "admin-password").is_some());
+    assert!(state.users.authenticate("bob", "bobs-password").is_some());
     e.router = router(state.clone());
     e.state = state;
     // Let any old event-reader references finish and release advisory claims.
@@ -368,8 +368,8 @@ async fn history_survives_restart_filters_owners_and_clears_without_touching_fil
         state_dir: Some(e.state_dir.path().into()),
         ..Default::default()
     }).unwrap();
-    state.users.add("admin", "admin-password", Role::Admin).unwrap();
-    state.users.add("bob", "bobs-password", Role::User).unwrap();
+    assert!(state.users.authenticate("admin", "admin-password").is_some());
+    assert!(state.users.authenticate("bob", "bobs-password").is_some());
     e.router = router(state.clone());
     e.state = state;
     let bob = login(&e, "bob", "bobs-password").await;

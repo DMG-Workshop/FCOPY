@@ -11,6 +11,7 @@
 //!   would add nothing.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
@@ -74,6 +75,8 @@ pub enum AuthError {
     Exists,
     #[error("password hashing failed: {0}")]
     Hash(String),
+    #[error("account storage failed: {0}")]
+    Storage(#[from] std::io::Error),
 }
 
 fn derive(password: &[u8], salt: &[u8], cost: HashCost) -> Result<[u8; 32], AuthError> {
@@ -98,16 +101,24 @@ pub fn hash_password(password: &str, cost: HashCost) -> Result<String, AuthError
     ))
 }
 
+fn decode_hash(stored: &str) -> Option<(HashCost, Vec<u8>, Vec<u8>)> {
+    let parts: Vec<&str> = stored.split('$').collect();
+    let ["", scheme, version, m, t, p, salt, hash] = parts[..] else { return None };
+    if scheme != "fc-argon2id" || version != "v1" {
+        return None;
+    }
+    let (Ok(m), Ok(t), Ok(p)) = (m.parse::<u32>(), t.parse::<u32>(), p.parse::<u32>()) else { return None };
+    if !(1..=8).contains(&p) || !(1..=10).contains(&t) || !(8 * p..=1024 * 1024).contains(&m) {
+        return None;
+    }
+    let (Ok(salt), Ok(expected)) = (STANDARD_NO_PAD.decode(salt), STANDARD_NO_PAD.decode(hash)) else { return None };
+    if salt.len() != 16 || expected.len() != 32 { return None; }
+    Some((HashCost { m_kib: m, t, p }, salt, expected))
+}
+
 /// Check a password against a stored hash. Malformed hashes never match.
 pub fn verify_password(password: &str, stored: &str) -> bool {
-    let parts: Vec<&str> = stored.split('$').collect();
-    let [_, scheme, version, m, t, p, salt, hash] = parts[..] else { return false };
-    if scheme != "fc-argon2id" || version != "v1" {
-        return false;
-    }
-    let (Ok(m), Ok(t), Ok(p)) = (m.parse(), t.parse(), p.parse()) else { return false };
-    let (Ok(salt), Ok(expected)) = (STANDARD_NO_PAD.decode(salt), STANDARD_NO_PAD.decode(hash)) else { return false };
-    let cost = HashCost { m_kib: m, t, p };
+    let Some((cost, salt, expected)) = decode_hash(stored) else { return false; };
     match derive(password.as_bytes(), &salt, cost) {
         Ok(got) => got.ct_eq(expected.as_slice()).into(),
         Err(_) => false,
@@ -121,7 +132,8 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 }
 
 /// A stored account.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Account {
     pub name: String,
     pub role: Role,
@@ -134,16 +146,59 @@ pub struct UserStore {
     cost: HashCost,
     /// Verified against when the user is unknown, so timing is the same.
     decoy: String,
+    path: Option<PathBuf>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountsFile {
+    version: u8,
+    accounts: HashMap<String, Account>,
+}
+
+fn valid_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 64
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
 }
 
 impl UserStore {
     pub fn new(cost: HashCost) -> Result<Self, AuthError> {
+        Self::open(cost, None)
+    }
+
+    pub fn open(cost: HashCost, path: Option<PathBuf>) -> Result<Self, AuthError> {
         let decoy = hash_password("decoy-password", cost)?;
-        Ok(Self { accounts: RwLock::new(HashMap::new()), cost, decoy })
+        let accounts = if let Some(path) = &path {
+            match std::fs::read(path) {
+                Ok(bytes) => {
+                    let file: AccountsFile = serde_json::from_slice(&bytes)
+                        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+                    if file.version != 1 || file.accounts.iter().any(|(name, account)| {
+                        !valid_name(name) || name != &account.name || decode_hash(&account.hash).is_none()
+                    }) {
+                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid saved account data").into());
+                    }
+                    file.accounts
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+                Err(error) => return Err(error.into()),
+            }
+        } else { HashMap::new() };
+        Ok(Self { accounts: RwLock::new(accounts), cost, decoy, path })
+    }
+
+    fn save(&self, accounts: &HashMap<String, Account>) -> Result<(), AuthError> {
+        if let Some(path) = &self.path {
+            if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+            let bytes = serde_json::to_vec_pretty(&AccountsFile { version: 1, accounts: accounts.clone() })
+                .map_err(std::io::Error::other)?;
+            fc_remote::config::write_private(path, &bytes)?;
+        }
+        Ok(())
     }
 
     pub fn add(&self, name: &str, password: &str, role: Role) -> Result<(), AuthError> {
-        if name.is_empty() || name.len() > 64 || !name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) {
+        if !valid_name(name) {
             return Err(AuthError::BadName);
         }
         if password.chars().count() < 8 {
@@ -154,7 +209,10 @@ impl UserStore {
         if accounts.contains_key(name) {
             return Err(AuthError::Exists);
         }
-        accounts.insert(name.to_string(), Account { name: name.to_string(), role, hash });
+        let mut next = accounts.clone();
+        next.insert(name.to_string(), Account { name: name.to_string(), role, hash });
+        self.save(&next)?;
+        *accounts = next;
         Ok(())
     }
 
@@ -180,8 +238,13 @@ impl UserStore {
         out
     }
 
-    pub fn remove(&self, name: &str) -> bool {
-        self.accounts.write().unwrap_or_else(|e| e.into_inner()).remove(name).is_some()
+    pub fn remove(&self, name: &str) -> Result<bool, AuthError> {
+        let mut accounts = self.accounts.write().unwrap_or_else(|e| e.into_inner());
+        let mut next = accounts.clone();
+        if next.remove(name).is_none() { return Ok(false); }
+        self.save(&next)?;
+        *accounts = next;
+        Ok(true)
     }
 
     pub fn len(&self) -> usize {
@@ -294,6 +357,40 @@ mod tests {
     use super::*;
 
     const CHEAP: HashCost = HashCost { m_kib: 256, t: 1, p: 1 };
+
+    #[test]
+    fn account_hashes_and_deletions_persist_without_plaintext() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("users.json");
+        let users = UserStore::open(CHEAP, Some(path.clone())).unwrap();
+        users.add("alice", "long-password", Role::Admin).unwrap();
+        users.add("bob", "another-password", Role::User).unwrap();
+        assert!(users.remove("bob").unwrap());
+        drop(users);
+        let users = UserStore::open(CHEAP, Some(path.clone())).unwrap();
+        assert!(users.authenticate("alice", "long-password").is_some());
+        assert!(users.authenticate("bob", "another-password").is_none());
+        let bytes = std::fs::read_to_string(path).unwrap();
+        assert!(!bytes.contains("long-password"));
+        assert!(!bytes.contains("another-password"));
+    }
+
+    #[test]
+    fn damaged_account_files_and_failed_saves_never_become_empty_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("users.json");
+        std::fs::write(&path, "broken").unwrap();
+        assert!(UserStore::open(CHEAP, Some(path.clone())).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "broken");
+        std::fs::remove_file(&path).unwrap();
+        let users = UserStore::open(CHEAP, Some(path.clone())).unwrap();
+        users.add("alice", "long-password", Role::Admin).unwrap();
+        std::fs::create_dir(path.with_extension("tmp")).unwrap();
+        assert!(users.add("bob", "another-password", Role::User).is_err());
+        assert!(users.authenticate("bob", "another-password").is_none());
+        assert!(users.remove("alice").is_err());
+        assert!(users.authenticate("alice", "long-password").is_some());
+    }
 
     #[test]
     fn password_hash_round_trips_and_never_stores_the_password() {

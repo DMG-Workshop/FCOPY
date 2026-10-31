@@ -1,0 +1,23 @@
+[Unit]
+Description=FCOPY persistent HTTPS file transfer console
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fcopy-web
+Group=fcopy-web
+StateDirectory=fcopy-web
+WorkingDirectory=/var/lib/fcopy-web
+ExecStart=/usr/local/bin/fcopy-web --config /var/lib/fcopy-web --root /srv/fcopy
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/srv/fcopy
+
+[Install]
+WantedBy=multi-user.target
