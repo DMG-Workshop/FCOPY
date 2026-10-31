@@ -56,6 +56,8 @@ pub struct AppState {
     pub roots: Vec<PathBuf>,
     /// Which account created each job.
     pub owners: RwLock<HashMap<JobId, String>>,
+    /// Each job's hashed files, for `GET /api/transfers/{id}/checksums`.
+    pub checksums: RwLock<HashMap<JobId, Vec<fc_engine::manifest::ManifestEntry>>>,
     pub telemetry: broadcast::Sender<Arc<telemetry::Frame>>,
     pub clients: clients::ClientStore,
     pub history: Arc<history::History>,
@@ -125,6 +127,7 @@ pub fn build(queue: Queue, events: std::sync::mpsc::Receiver<Event>, config: Con
         limiter: LoginLimiter::new(Limits::default()),
         roots,
         owners: RwLock::new(HashMap::new()),
+        checksums: RwLock::new(HashMap::new()),
         telemetry,
         clients: clients::ClientStore::open(config.state_dir.as_ref().map(|d| d.join("clients.json")))?,
         history: Arc::new(history::History::open(config.state_dir.as_ref().map(|d| d.join("transfer-history.toml")))?),
@@ -182,6 +185,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/recovery/{id}", post(recovery::act))
         .route("/api/transfers/{id}", delete(api::cancel_transfer))
         .route("/api/transfers/{id}/pause", post(api::pause_transfer))
+        .route("/api/transfers/{id}/checksums", get(api::transfer_checksums))
         .route("/api/transfers/{id}/resume", post(api::resume_transfer))
         .route("/api/transfers/{id}/conflict", post(api::resolve_conflict))
         .route("/api/queue", get(api::queue_state))

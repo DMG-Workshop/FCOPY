@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime};
 
+use fc_engine::manifest::ManifestEntry;
 use fc_engine::{DecisionRequest, Event, JobId, JobState, JobSummary, Snapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +67,9 @@ pub struct AppState {
     pub decisions: VecDeque<DecisionRequest>,
     /// Display info for jobs (sources / target), filled when they are queued by the UI.
     pub details: std::collections::HashMap<JobId, (Vec<PathBuf>, String)>,
+    /// Each job's copied files and their digests, for saving a checksum list.
+    /// Only jobs that hashed (any verify mode but Off) have entries.
+    pub checksums: std::collections::HashMap<JobId, Vec<ManifestEntry>>,
 }
 
 impl AppState {
@@ -140,9 +144,12 @@ impl AppState {
                 a.received = Instant::now();
             }
             Event::FileCopied {
-                job, dst, warnings, ..
+                job, dst, digest, warnings, ..
             } => {
                 self.active_mut(job).files_copied += 1;
+                if let Some(digest) = digest {
+                    self.checksums.entry(job).or_default().push(ManifestEntry { path: dst.clone(), digest });
+                }
                 for w in warnings {
                     self.push_log(job, LogKind::Warning, Some(dst.clone()), w);
                 }
@@ -194,6 +201,7 @@ impl AppState {
             Event::Removed { job } => {
                 self.jobs.retain(|r| r.id != job);
                 self.details.remove(&job);
+                self.checksums.remove(&job);
             }
             Event::Idle => self.active = None,
         }
@@ -285,6 +293,28 @@ mod tests {
         });
         s.apply(Event::Removed { job: 7 });
         assert!(s.jobs.is_empty());
+    }
+
+    #[test]
+    fn hashed_files_are_kept_for_a_checksum_list_until_the_job_is_removed() {
+        let mut s = AppState::default();
+        s.apply(Event::Queued { job: 3, label: "photos".into() });
+        let copied = |dst: &str, digest: Option<&str>| Event::FileCopied {
+            job: 3,
+            src: "/src/a".into(),
+            dst: dst.into(),
+            bytes: 1,
+            digest: digest.map(str::to_string),
+            verified: false,
+            warnings: vec![],
+        };
+        s.apply(copied("/out/a", Some("aa")));
+        s.apply(copied("/out/b", None)); // not hashed: nothing to list
+        s.apply(copied("/out/c", Some("cc")));
+        let kept: Vec<_> = s.checksums[&3].iter().map(|e| (e.path.clone(), e.digest.clone())).collect();
+        assert_eq!(kept, vec![(PathBuf::from("/out/a"), "aa".to_string()), (PathBuf::from("/out/c"), "cc".to_string())]);
+        s.apply(Event::Removed { job: 3 });
+        assert!(!s.checksums.contains_key(&3));
     }
 
     #[test]

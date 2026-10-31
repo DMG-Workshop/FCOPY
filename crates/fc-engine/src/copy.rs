@@ -115,7 +115,14 @@ pub struct CopyOptions {
     /// source, whatever `fsync` and `verify` say, so a crash or a bad write can
     /// never lose both.
     pub move_source: bool,
+    /// Files smaller than [`SMALL_FILE`] are copied on up to this many threads
+    /// at once in a plan run. 1 copies every file in turn.
+    pub small_file_workers: usize,
 }
+
+/// Below this size a file's time goes into opening, creating and closing, not
+/// moving bytes, so several are copied at once.
+pub const SMALL_FILE: u64 = 1024 * 1024;
 
 impl Default for CopyOptions {
     fn default() -> Self {
@@ -137,6 +144,10 @@ impl Default for CopyOptions {
             preserve_acls: false,
             rate_limit: None,
             move_source: false,
+            // Measured on Windows, 20 000 × 128 B: 1 worker 22.3 s, 4 workers
+            // 17.0 s, 6 workers 15.6 s (medians of 5). Four keeps most of the gain
+            // without piling many writers onto a spinning disk.
+            small_file_workers: 4,
         }
     }
 }
@@ -339,7 +350,11 @@ impl Copier {
         let tmp = temp_path(dst);
         // Declared first so it is dropped last: handles close, then the temp file is removed.
         let mut guard = TempGuard::new(tmp.clone());
-        let mut lease = Lease { pool: &self.pool, bufs: self.pool.take(opts.pipeline_depth) };
+        // A file of one chunk or less is copied inline with a single buffer. Leasing
+        // only that keeps parallel small-file workers within the pool's cached
+        // buffers instead of freeing and re-zeroing 1 MiB buffers per file.
+        let wanted = if size <= self.pool.chunk_size() as u64 { 1 } else { opts.pipeline_depth };
+        let mut lease = Lease { pool: &self.pool, bufs: self.pool.take(wanted) };
         let mut warnings = Vec::new();
 
         let mut src_file = rec.run(src, Operation::OpenSource, None, |_| File::open(src))?;

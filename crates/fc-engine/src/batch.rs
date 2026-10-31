@@ -1,19 +1,25 @@
 //! Job level: turn "copy these sources into that folder" into a [`Plan`], check
 //! the *whole* plan fits before touching the destination, then run it.
 //!
-//! Files are processed one at a time; each file is already a two-stage
-//! pipeline (read ‖ write). Running several files concurrently needs per-worker
-//! progress slots and a storage-aware planner (one stream for HDD, several for
-//! NVMe), which belongs in the scheduler layer above this crate.
+//! Large files are processed one at a time; each is already a two-stage
+//! pipeline (read ‖ write). Files under [`SMALL_FILE`] can run on several threads
+//! ([`CopyOptions::small_file_workers`](crate::CopyOptions::small_file_workers)),
+//! because their time goes into opening, creating and closing rather than moving
+//! bytes. A storage-aware choice of worker count (one for HDD, several for NVMe)
+//! would belong in the scheduler layer above this crate.
 
 use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::control::JobControl;
-use crate::copy::{Copier, CopyOutcome, CopyReport, VerifyMode};
+use crate::conflict::ConflictPolicy;
+use crate::copy::{Copier, CopyOutcome, CopyReport, VerifyMode, SMALL_FILE};
 use crate::error::{CopyError, Result};
 use crate::platform::names;
 use crate::progress::Progress;
@@ -262,38 +268,33 @@ impl Copier {
             }
         }
 
-        for item in &plan.items {
-            if control.is_cancelled() {
+        // Small files spend their time opening, creating and closing, which several
+        // threads can overlap. Questions about conflicts must come one at a time,
+        // so a policy that asks keeps every file in turn.
+        let asks = opts.conflicts.as_ref().is_some_and(|c| matches!(c.policy, ConflictPolicy::Ask | ConflictPolicy::Compare));
+        let workers = if asks { 1 } else { opts.small_file_workers.max(1) };
+        let (small, large): (Vec<&CopyItem>, Vec<&CopyItem>) = if workers > 1 {
+            plan.items.iter().partition(|i| i.size < SMALL_FILE)
+        } else {
+            (Vec::new(), plan.items.iter().collect())
+        };
+
+        if small.len() > 1 {
+            self.run_parallel(&small, workers, progress, control, &mut report, on_file);
+        } else if let Some(item) = small.first() {
+            // Space was verified for the whole plan, so skip the per-file probe.
+            let result = self.copy_file_impl(&item.src, &item.dst, progress, control, false, Some(item.size));
+            record(opts.move_source, item, result, control, &mut report, on_file);
+        }
+
+        for item in large {
+            if report.cancelled || control.is_cancelled() {
                 report.cancelled = true;
                 break;
             }
-            // Space was verified for the whole plan, so skip the per-file probe.
-            match self.copy_file_impl(&item.src, &item.dst, progress, control, false, Some(item.size)) {
-                Ok(CopyOutcome::Copied(mut r)) => {
-                    if opts.move_source {
-                        match remove_moved_source(&r) {
-                            Ok(()) => report.sources_removed += 1,
-                            Err(why) => r.warnings.push(why),
-                        }
-                    }
-                    on_file(FileEvent::Copied(&r));
-                    report.bytes_copied += r.bytes;
-                    report.copied.push(r);
-                }
-                Ok(CopyOutcome::Skipped { error, .. }) => {
-                    on_file(FileEvent::Skipped(item, &error));
-                    report.skipped.push((item.clone(), error));
-                }
-                Err(CopyError::Cancelled) => {
-                    // Make a handler-initiated cancel visible to everyone sharing `control`.
-                    control.cancel();
-                    report.cancelled = true;
-                    break;
-                }
-                Err(e) => {
-                    on_file(FileEvent::Failed(item, &e));
-                    report.failed.push((item.clone(), e));
-                }
+            let result = self.copy_file_impl(&item.src, &item.dst, progress, control, false, Some(item.size));
+            if !record(opts.move_source, item, result, control, &mut report, on_file) {
+                break;
             }
         }
         if opts.move_source && !report.cancelled {
@@ -301,6 +302,103 @@ impl Copier {
         }
         report.elapsed = started.elapsed();
         Ok(report)
+    }
+
+    /// Copy `items` on up to `workers` threads. Results come back to this thread,
+    /// which owns the report and `on_file`, in the order files finish.
+    fn run_parallel(
+        &self,
+        items: &[&CopyItem],
+        workers: usize,
+        progress: &Progress,
+        control: &JobControl,
+        report: &mut BatchReport,
+        on_file: &mut dyn FnMut(FileEvent<'_>),
+    ) {
+        let next = AtomicUsize::new(0);
+        let (tx, rx) = mpsc::channel::<(usize, Result<CopyOutcome>)>();
+        thread::scope(|s| {
+            for _ in 0..workers.min(items.len()) {
+                let tx = tx.clone();
+                let next = &next;
+                s.spawn(move || {
+                    // The job's tracker shows one file at a time, so each worker
+                    // copies against its own and the totals are added below.
+                    let mine = Progress::new();
+                    while !control.is_cancelled() {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(i) else { break };
+                        let result = self.copy_file_impl(&item.src, &item.dst, &mine, control, false, Some(item.size));
+                        if tx.send((i, result)).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(tx);
+            for (i, result) in rx {
+                let item = items[i];
+                match &result {
+                    Ok(CopyOutcome::Copied(r)) => {
+                        progress.add_copied(r.bytes);
+                        if r.verified {
+                            progress.add_verified(r.bytes);
+                        }
+                        progress.count_file(false, 0);
+                    }
+                    Ok(CopyOutcome::Skipped { .. }) => progress.count_file(true, item.size),
+                    Err(CopyError::Cancelled) => {}
+                    Err(_) => progress.count_file(true, item.size),
+                }
+                // A cancel stops the workers at their next file; results already
+                // in flight are still recorded so nothing copied goes unreported.
+                record(self.options().move_source, item, result, control, report, on_file);
+            }
+        });
+        if control.is_cancelled() {
+            report.cancelled = true;
+        }
+    }
+}
+
+/// Fold one file's outcome into the report. Returns false when the job must stop.
+fn record(
+    move_source: bool,
+    item: &CopyItem,
+    result: Result<CopyOutcome>,
+    control: &JobControl,
+    report: &mut BatchReport,
+    on_file: &mut dyn FnMut(FileEvent<'_>),
+) -> bool {
+    match result {
+        Ok(CopyOutcome::Copied(mut r)) => {
+            if move_source {
+                match remove_moved_source(&r) {
+                    Ok(()) => report.sources_removed += 1,
+                    Err(why) => r.warnings.push(why),
+                }
+            }
+            on_file(FileEvent::Copied(&r));
+            report.bytes_copied += r.bytes;
+            report.copied.push(r);
+            true
+        }
+        Ok(CopyOutcome::Skipped { error, .. }) => {
+            on_file(FileEvent::Skipped(item, &error));
+            report.skipped.push((item.clone(), error));
+            true
+        }
+        Err(CopyError::Cancelled) => {
+            // Make a handler-initiated cancel visible to everyone sharing `control`.
+            control.cancel();
+            report.cancelled = true;
+            false
+        }
+        Err(e) => {
+            on_file(FileEvent::Failed(item, &e));
+            report.failed.push((item.clone(), e));
+            true
+        }
     }
 }
 

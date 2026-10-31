@@ -126,6 +126,22 @@ pub struct CreateTransfer {
     /// when downloading from another PC.
     #[serde(default)]
     pub move_source: bool,
+    /// `off`, `source` (hash while reading, for a checksum list) or `readback`
+    /// (also re-read the copy and compare). A move always reads back.
+    #[serde(default = "default_verify")]
+    pub verify: String,
+}
+
+fn default_verify() -> String { "off".into() }
+
+fn verify_mode(value: &str) -> Result<fc_engine::VerifyMode, ApiError> {
+    use fc_engine::VerifyMode as V;
+    match value {
+        "off" => Ok(V::Off),
+        "source" => Ok(V::SourceHash),
+        "readback" => Ok(V::ReadBack),
+        _ => Err(ApiError::BadRequest("verify must be off, source or readback".into())),
+    }
 }
 
 fn default_conflict() -> String { "ask".into() }
@@ -176,6 +192,7 @@ pub async fn create_transfer(
     Json(req): Json<CreateTransfer>,
 ) -> Result<(StatusCode, Json<Created>), ApiError> {
     let policy = conflict_policy(&req.conflict)?;
+    let verify = verify_mode(&req.verify)?;
     if req.sources.is_empty() || req.sources.len() > MAX_SOURCES {
         return Err(ApiError::BadRequest(format!("give between 1 and {MAX_SOURCES} sources")));
     }
@@ -232,8 +249,8 @@ pub async fn create_transfer(
     if let Some(label) = req.label.filter(|l| !l.trim().is_empty()) {
         request = request.with_label(label);
     }
-    if move_source {
-        request = request.with_options(fc_engine::CopyOptions { move_source: true, ..s.queue.copy_options() });
+    if move_source || verify != fc_engine::VerifyMode::Off {
+        request = request.with_options(fc_engine::CopyOptions { move_source, verify, ..s.queue.copy_options() });
     }
     let request = request.with_conflict_policy(policy);
     let job = crate::recovery::saved_job(&request, destination, p.name.clone(), &s.queue.copy_options())?;
@@ -336,6 +353,46 @@ pub async fn resolve_conflict(State(s): State<Arc<AppState>>, p: Principal, Path
     } else {
         Err(ApiError::Conflict("conflict is stale, cancelled, or already compared".into()))
     }
+}
+
+/// Download a finished job's checksum list, `sha256sum`-style. Paths are
+/// relative to the job's destination folder, so saved there the list checks
+/// the copy: `fcopy check --algo <ext> <list>`. Only jobs queued with verify
+/// set to `source` or `readback` have one.
+pub async fn transfer_checksums(State(s): State<Arc<AppState>>, p: Principal, Path(id): Path<JobId>) -> Result<Response, ApiError> {
+    use fc_engine::manifest;
+    let info = owned_job(&s, &p, id)?;
+    if !info.state.is_finished() {
+        return Err(ApiError::Conflict("the job has not finished yet".into()));
+    }
+    let entries = s.checksums.read().unwrap_or_else(|e| e.into_inner()).get(&id).cloned().unwrap_or_default();
+    if entries.is_empty() {
+        return Err(ApiError::Conflict("this job has no checksums; queue it with verify set to source or readback".into()));
+    }
+    let root = match &info.target {
+        fc_engine::Target::IntoDir(dir) => dir.clone(),
+        fc_engine::Target::FileTo(file) => file.parent().map(std::path::Path::to_path_buf).unwrap_or_default(),
+        // A send to another PC reports paths relative to its folder already.
+        fc_engine::Target::Backend(_) => PathBuf::new(),
+    };
+    // The console never sets a per-job algorithm, so jobs hash with the queue's.
+    let ext = manifest::extension(s.queue.copy_options().algorithm);
+    let mut body = manifest::lines(&entries, &root).join("\n");
+    body.push('\n');
+    // Header values must be plain ASCII; the name is only a suggestion to the browser.
+    let name: String = format!("{}.{ext}", manifest::safe_stem(&info.label))
+        .chars()
+        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '_' })
+        .collect();
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8".to_string()),
+            (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\"")),
+            (axum::http::header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        body,
+    )
+        .into_response())
 }
 
 pub async fn pause_transfer(State(s): State<Arc<AppState>>, p: Principal, Path(id): Path<JobId>) -> Result<StatusCode, ApiError> {

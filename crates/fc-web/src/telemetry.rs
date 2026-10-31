@@ -220,6 +220,7 @@ pub fn spawn_producer(state: Arc<AppState>, events: std::sync::mpsc::Receiver<Ev
                                 logs.push(LogLine { job: *job, kind: "recovery_error", message: error });
                             }
                         }
+                        record_checksum(&state, &ev);
                         collect(ev, &mut dirty, &mut removed, &mut logs);
                     },
                     None => break,
@@ -241,6 +242,21 @@ pub fn spawn_producer(state: Arc<AppState>, events: std::sync::mpsc::Receiver<Ev
             }
         }
     });
+}
+
+/// Keep each hashed file's digest for the job's checksum list, and forget a
+/// job's list when the job leaves the queue.
+fn record_checksum(state: &AppState, ev: &Event) {
+    match ev {
+        Event::FileCopied { job, dst, digest: Some(digest), .. } => {
+            let entry = fc_engine::manifest::ManifestEntry { path: dst.clone(), digest: digest.clone() };
+            state.checksums.write().unwrap_or_else(|e| e.into_inner()).entry(*job).or_default().push(entry);
+        }
+        Event::Removed { job } => {
+            state.checksums.write().unwrap_or_else(|e| e.into_inner()).remove(job);
+        }
+        _ => {}
+    }
 }
 
 /// Fold one queue event into the pending tick.

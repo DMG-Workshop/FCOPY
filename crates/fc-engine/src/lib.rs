@@ -44,6 +44,7 @@ pub mod control;
 pub mod conflict;
 pub mod copy;
 pub mod error;
+pub mod manifest;
 pub mod platform;
 pub mod progress;
 pub mod queue;
@@ -59,7 +60,7 @@ pub use batch::{
 pub use buffer::{AlignedBuf, BufferPool, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 pub use checksum::{hash_file, Algorithm, Digest, Hasher};
 pub use control::{Cancelled, JobControl};
-pub use copy::{Copier, CopyOptions, CopyOutcome, CopyReport, VerifyMode, TEMP_SUFFIX};
+pub use copy::{Copier, CopyOptions, CopyOutcome, CopyReport, VerifyMode, SMALL_FILE, TEMP_SUFFIX};
 pub use error::{classify, CopyError, ErrorClass, Operation, Result};
 pub use progress::{LinkStats, Phase, Progress, Snapshot};
 pub use recovery::{

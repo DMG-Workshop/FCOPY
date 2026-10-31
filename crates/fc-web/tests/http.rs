@@ -204,6 +204,63 @@ async fn a_move_over_http_removes_the_source_after_copying() {
     assert!(!src.exists(), "the source was deleted after the verified copy");
 }
 
+/// GET a path and return its status and body as text.
+async fn get_text(app: &App, uri: &str, cookie: &str) -> (StatusCode, String) {
+    let mut req = Request::builder().method("GET").uri(uri).header(COOKIE, cookie).body(Body::empty()).unwrap();
+    req.extensions_mut().insert(ConnectInfo(fc_web::https::PeerAddr(SocketAddr::from(([127, 0, 0, 1], 40_000)))));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[tokio::test]
+async fn a_verified_job_downloads_a_checksum_list_that_matches_the_copy() {
+    let app = setup().await;
+    let src = app.root.path().join("sums");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("a.txt"), b"alpha").unwrap();
+    std::fs::write(src.join("sub").join("b.txt"), b"bravo").unwrap();
+    let out = app.root.path().join("out");
+    let alice = login(&app, "alice", "password1").await;
+
+    let headers = [(COOKIE.as_str(), alice.as_str()), CSRF];
+    let queue_job = |verify: &'static str| {
+        let body = json!({ "sources": [&src], "dest": &out, "verify": verify, "conflict": "replace" });
+        send(&app, "POST", "/api/transfers", &headers, Some(body))
+    };
+    let hashed = queue_job("source").await;
+    assert_eq!(hashed.status, StatusCode::ACCEPTED, "{}", hashed.json);
+    let id = hashed.json["id"].as_u64().unwrap();
+    let queue = app.state.queue.clone();
+    tokio::task::spawn_blocking(move || queue.wait_idle()).await.unwrap();
+
+    // The console records digests from the event stream, a moment after the job ends.
+    let mut list = String::new();
+    for _ in 0..50 {
+        let (status, body) = get_text(&app, &format!("/api/transfers/{id}/checksums"), &alice).await;
+        if status == StatusCode::OK && body.lines().count() == 2 {
+            list = body;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let algorithm = app.state.queue.copy_options().algorithm;
+    for rel in [std::path::Path::new("sums").join("a.txt"), std::path::Path::new("sums").join("sub").join("b.txt")] {
+        let expected = fc_engine::hash_file(&out.join(&rel), algorithm).unwrap().to_hex();
+        let line = format!("{expected}  {}", rel.display());
+        assert!(list.lines().any(|l| l == line), "missing {line:?} in:\n{list}");
+    }
+
+    let plain = queue_job("off").await;
+    let plain_id = plain.json["id"].as_u64().unwrap();
+    let queue = app.state.queue.clone();
+    tokio::task::spawn_blocking(move || queue.wait_idle()).await.unwrap();
+    let (status, body) = get_text(&app, &format!("/api/transfers/{plain_id}/checksums"), &alice).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("verify"), "{body}");
+}
+
 #[tokio::test]
 async fn a_move_from_another_pc_is_refused() {
     let app = setup().await;

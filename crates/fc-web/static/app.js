@@ -125,7 +125,7 @@ function fcopy() {
     conflictAllId: null,
     conflictBusy: false,
     conflictNotice: '',
-    addForm: { sources: '', dest: '', label: '', mode: 'local', clientId: '', password: '', moveSource: false },
+    addForm: { sources: '', dest: '', label: '', mode: 'local', clientId: '', password: '', moveSource: false, verify: 'off' },
     addNotice: '',
     remoteBrowser: { path: '', entries: [], busy: false, error: '' },
     settingsForm: { limitMiB: 0, policy: 'retry' },
@@ -580,6 +580,25 @@ function fcopy() {
       if (!r.ok) this.notify(await errorText(r));
     },
 
+    // Fetch first, so a job without checksums shows the server's reason instead
+    // of navigating to an error page.
+    async downloadChecksums(job) {
+      const r = await this.api('GET', `/api/transfers/${job.id}/checksums`);
+      if (!r.ok) {
+        this.notify(await errorText(r));
+        return;
+      }
+      const match = (r.headers.get('Content-Disposition') || '').match(/filename="([^"]+)"/);
+      const url = URL.createObjectURL(await r.blob());
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = match ? match[1] : 'checksums.txt';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    },
+
     async cancel(job) {
       const r = await this.api('DELETE', `/api/transfers/${job.id}`);
       if (r.ok) delete this.jobs[job.id];
@@ -712,7 +731,8 @@ function fcopy() {
       this.addNotice = '';
       const sources = this.addForm.sources.split('\n').map((s) => s.trim()).filter(Boolean);
       const body = { sources, dest: this.addForm.dest.trim(), label: this.addForm.label.trim() || null,
-        conflict: this.conflictPolicy, move_source: this.addForm.moveSource && this.addForm.mode !== 'download' };
+        conflict: this.conflictPolicy, move_source: this.addForm.moveSource && this.addForm.mode !== 'download',
+        verify: this.addForm.verify };
       if (this.addForm.mode === 'remote' || this.addForm.mode === 'download') {
         if (!this.addForm.clientId) {
           this.addNotice = 'Choose a paired PC.';
@@ -732,7 +752,7 @@ function fcopy() {
       }
       if (r.status === 202) {
         // Move is cleared after each job: deleting sources should never carry over unnoticed.
-        this.addForm = { sources: '', dest: this.addForm.dest, label: '', mode: this.addForm.mode, clientId: this.addForm.clientId, password: '', moveSource: false };
+        this.addForm = { sources: '', dest: this.addForm.dest, label: '', mode: this.addForm.mode, clientId: this.addForm.clientId, password: '', moveSource: false, verify: this.addForm.verify };
         this.closeModal();
       } else {
         this.addNotice = await errorText(r);

@@ -6,7 +6,7 @@
 //! entered in an "Add task" window.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
@@ -14,7 +14,7 @@ use std::time::Duration;
 use eframe::egui::{self, Color32, RichText};
 use fc_engine::units::{human_bytes, human_duration, human_rate};
 use fc_engine::{
-    Algorithm, CopyOptions, ErrorAction, ErrorClass, ErrorPolicy, Event, JobState, Phase, Queue,
+    Algorithm, CopyOptions, ErrorAction, ErrorClass, ErrorPolicy, Event, JobId, JobState, Phase, Queue,
     QueueConfig, TransferRequest, VerifyMode,
 };
 
@@ -23,6 +23,7 @@ use crate::remote::{self, PeerSearch, RemoteBrowser, RemoteForm};
 use crate::state::{AppState, JobRow, LogKind};
 use crate::torrent::{self, Torrents};
 use fc_engine::conflict::{ConflictPolicy, ConflictAction, ConflictChoice};
+use fc_engine::manifest;
 
 pub(crate) fn ok(ui: &egui::Ui) -> Color32 {
     if ui.visuals().dark_mode { Color32::from_rgb(105, 225, 160) } else { Color32::from_rgb(16, 110, 65) }
@@ -837,6 +838,16 @@ impl FcApp {
                                 {
                                     self.queue.pause_job(row.id);
                                 }
+                                let hashed = self.state.checksums.get(&row.id).is_some_and(|c| !c.is_empty());
+                                if row.state.is_finished()
+                                    && hashed
+                                    && ui
+                                        .small_button("#")
+                                        .on_hover_text("Save a checksum list of the copied files in the destination folder")
+                                        .clicked()
+                                {
+                                    self.save_checksums(row.id);
+                                }
                                 if matches!(row.state, JobState::Pending | JobState::Running) {
                                     if ui.small_button("✖").on_hover_text("Cancel").clicked() {
                                         self.queue.cancel(row.id);
@@ -853,6 +864,31 @@ impl FcApp {
                         }
                     });
             });
+    }
+
+    /// Write the job's checksum list into its destination folder, where
+    /// `fcopy check` finds the files by their relative paths.
+    fn save_checksums(&mut self, id: JobId) {
+        let Some(entries) = self.state.checksums.get(&id).filter(|e| !e.is_empty()) else { return };
+        let target = self.state.details.get(&id).map(|(_, t)| PathBuf::from(t));
+        // A single-file job names the file itself; its folder holds the list.
+        let dir = target.and_then(|t| if t.is_dir() { Some(t) } else { t.parent().filter(|p| p.is_dir()).map(Path::to_path_buf) });
+        let Some(dir) = dir else {
+            self.notice = Some("A checksum list can only be saved for a destination on this PC.".into());
+            return;
+        };
+        let label = self.state.jobs.iter().find(|r| r.id == id).map(|r| r.label.clone()).unwrap_or_default();
+        let ext = manifest::extension(Algorithm::Xxh3);
+        let path = manifest::free_name(&dir, &label, ext);
+        self.notice = Some(match manifest::write(&path, &manifest::lines(entries, &dir)) {
+            Ok(()) => format!(
+                "Saved {} checksums to {}. Check them later with: fcopy check --algo {ext} \"{}\"",
+                entries.len(),
+                path.display(),
+                path.display()
+            ),
+            Err(e) => format!("Could not save the checksum list to {}: {e}", path.display()),
+        });
     }
 
     fn queue_view(&mut self, ui: &mut egui::Ui) {

@@ -70,11 +70,23 @@ and take screenshots with `import -window root`.
 | 20k small files + readback | n/a | 7.1 s (**fsync per file dominates**) |
 
 Known performance to-dos: batch read-back durability work (`syncfs`/batched
-fsync), parallel small files, kernel fast paths
-(reflink/`copy_file_range`/`CopyFileExW`/`clonefile`). A Windows 20k × 128 B
+fsync), kernel fast paths (reflink/`copy_file_range`/`clonefile`). A Windows 20k × 128 B
 before/after experiment of reducing the buffer-pool lease for inline copies was
 noisy and showed no improvement (median 29.9 s baseline vs 31.2 s modified); that
 change was dropped. Avoid retaining the optimization without a reproducible win.
+
+Small files on Windows (2026-10-31, `cargo run --release -p fc-engine --example
+small_files -- 20000 128 5 <workers>`, medians of 5, every run shown in the commit):
+- Parallel small files (< 1 MiB, `CopyOptions::small_file_workers`): 1 worker
+  22.3 s, 4 workers 17.0 s, 6 workers 15.6 s; every parallel run beat every
+  sequential one. Default is 4. Plans whose conflict policy may ask stay sequential.
+- `CopyFileExW` (`std::fs::copy`) alone: 14.1 s. As an engine fast path it was
+  slower (1 worker 28.2 s, 4 workers 17.2 s): matching the normal path still
+  needs the temp name, a second open to restore the creation time, and the
+  rename. Dropped. The `--os-copy` benchmark flag keeps the raw floor measurable.
+- Leasing one buffer for files of one chunk or less is kept for memory, not
+  speed: with parallel workers it stops the pool freeing and re-zeroing 1 MiB
+  buffers. Alone it changed nothing (22.8 s vs 23.3 s baseline).
 
 ## fc-remote status
 

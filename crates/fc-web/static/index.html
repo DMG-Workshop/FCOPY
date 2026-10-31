@@ -168,6 +168,7 @@
                     <button x-show="job.state === 'running'" class="btn-mini" @click="act(job, 'pause')">Pause</button>
                     <button x-show="job.state === 'paused'" class="btn-mini" @click="act(job, 'resume')">Resume</button>
                     <button x-show="isActive(job.state)" class="btn-mini hover:text-bad" @click="cancel(job)">Cancel</button>
+                    <button x-show="!isActive(job.state)" class="btn-mini" title="Download a checksum list (for jobs queued with verification)" @click="downloadChecksums(job)">Checksums</button>
                     <button x-show="!isActive(job.state)" class="btn-mini" @click="cancel(job)">Remove</button>
                   </div>
                 </td>
@@ -478,6 +479,13 @@
           <option value="ask">Ask for each conflict</option><option value="replace">Replace</option>
           <option value="skip">Skip</option><option value="keep_both">Keep both (rename incoming)</option>
           <option value="compare">Compare; ask if different</option>
+        </select>
+      </label>
+      <label class="grid gap-1 px-4 py-2"><span class="text-[11px] text-dim">Verify</span>
+        <select x-model="addForm.verify" class="field">
+          <option value="off">Off</option>
+          <option value="source">Hash the source (gives a checksum list)</option>
+          <option value="readback">Read back and compare (gives a checksum list)</option>
         </select>
       </label>
       <label x-show="addForm.mode !== 'download'" class="flex items-center gap-2 px-4 py-2 text-body"
