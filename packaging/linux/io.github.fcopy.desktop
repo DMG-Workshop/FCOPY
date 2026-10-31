@@ -13,8 +13,8 @@ Categories=Utility;FileTools;System;
 MimeType=inode/directory;application/octet-stream;
 StartupWMClass=io.github.fcopy
 Keywords=copy;teracopy;verify;checksum;transfer;
-Actions=new-window;
+Actions=open-queue;
 
-[Desktop Action new-window]
-Name=New Transfer Window
+[Desktop Action open-queue]
+Name=Open Transfer Queue
 Exec=fcopy-gui

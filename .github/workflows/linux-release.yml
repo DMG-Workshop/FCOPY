@@ -1,0 +1,219 @@
+name: Linux packages
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-packages-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    name: Build DEB, RPM and AppImage
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install build and package tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config libssl-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libwayland-dev libx11-dev libxcursor-dev \
+            libxi-dev libxrandr-dev libgl1-mesa-dev libegl1-mesa-dev \
+            dpkg-dev rpm patchelf desktop-file-utils appstream shellcheck \
+            curl file xz-utils xvfb xauth libgl1-mesa-dri
+      - name: Select current stable Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add clippy
+      - name: Check release version and packaging syntax
+        run: |
+          bash packaging/linux/check-version.sh
+          shellcheck packaging/linux/*.sh packaging/arch/PKGBUILD
+          desktop-file-validate packaging/linux/io.github.fcopy.desktop
+          appstreamcli validate --no-net packaging/linux/io.github.fcopy.metainfo.xml
+      - name: Test workspace
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: cargo test --locked --workspace
+      - name: Lint workspace
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Build release applications
+        run: cargo build --locked --release -p fc-cli -p fc-gui
+      - name: Build packages
+        run: bash packaging/linux/build.sh all
+      - name: Smoke-test AppImage on baseline Linux
+        run: bash packaging/linux/smoke-test.sh dist/*.AppImage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  deb-test:
+    name: Install DEB on Ubuntu ${{ matrix.ubuntu }}
+    needs: build
+    runs-on: ubuntu-24.04
+    container: ubuntu:${{ matrix.ubuntu }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: ['22.04', '24.04']
+    steps:
+      - name: Install test dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates git xvfb xauth libgl1-mesa-dri desktop-file-utils
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-packages
+          path: dist
+      - name: Install and test package and AppImage
+        shell: bash
+        run: |
+          apt-get install -y ./dist/*.deb
+          bash packaging/linux/smoke-test.sh
+          chmod +x dist/*.AppImage
+          bash packaging/linux/smoke-test.sh dist/*.AppImage
+          apt-get remove -y fcopy
+          test ! -e /usr/bin/fcopy
+          test ! -e /usr/bin/fcopy-gui
+
+  rpm-test:
+    name: Install RPM on Fedora 44
+    needs: build
+    runs-on: ubuntu-24.04
+    container: fedora:44
+    timeout-minutes: 20
+    steps:
+      - name: Install test dependencies
+        run: |
+          dnf install -y git ca-certificates xorg-x11-server-Xvfb xorg-x11-xauth \
+            mesa-dri-drivers mesa-libGL desktop-file-utils
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-packages
+          path: dist
+      - name: Install and test package and AppImage
+        shell: bash
+        run: |
+          dnf install -y ./dist/*.rpm
+          # Fedora does not ship Debian's xvfb-run wrapper.
+          Xvfb :99 -screen 0 1280x720x24 -ac &
+          xvfb_pid=$!
+          trap 'kill "$xvfb_pid"; wait "$xvfb_pid" || true' EXIT
+          export DISPLAY=:99
+          for ((attempt=0; attempt<100; attempt++)); do
+            test ! -S /tmp/.X11-unix/X99 || break
+            kill -0 "$xvfb_pid"
+            sleep 0.1
+          done
+          test -S /tmp/.X11-unix/X99
+          bash packaging/linux/smoke-test.sh --existing-display
+          chmod +x dist/*.AppImage
+          bash packaging/linux/smoke-test.sh --existing-display dist/*.AppImage
+          dnf remove -y fcopy
+          test ! -e /usr/bin/fcopy
+          test ! -e /usr/bin/fcopy-gui
+
+  arch:
+    name: Build and install Arch package
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    timeout-minutes: 90
+    steps:
+      - name: Install build and runtime dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            rust git cmake pkgconf openssl ca-certificates libxkbcommon \
+            libxkbcommon-x11 libglvnd libx11 libxcursor libxi libxrandr \
+            wayland hicolor-icon-theme mesa xorg-server-xvfb xorg-xauth \
+            desktop-file-utils appstream
+          useradd --create-home builder
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build actual PKGBUILD against this checkout
+        shell: bash
+        run: |
+          version=$(bash packaging/linux/check-version.sh)
+          # Branch/PR builds may not have a release tag yet. A private mirror
+          # maps the unchanged recipe's tagged URL to this exact tested commit.
+          git clone --bare . /tmp/fcopy-source.git
+          git --git-dir=/tmp/fcopy-source.git tag --force "v$version" "$GITHUB_SHA"
+          chown -R builder /tmp/fcopy-source.git "$GITHUB_WORKSPACE"
+          runuser -u builder -- git config --global \
+            url.file:///tmp/fcopy-source.git.insteadOf https://github.com/DMG-Workshop/FCOPY.git
+          runuser -u builder -- git config --global protocol.file.allow always
+          runuser -u builder -- bash -c 'cd packaging/arch && makepkg --cleanbuild --force --noconfirm'
+          mkdir -p dist
+          cp packaging/arch/fcopy-*.pkg.tar.zst dist/
+      - name: Install and smoke-test Arch package
+        shell: bash
+        run: |
+          pacman -U --noconfirm dist/*.pkg.tar.zst
+          bash packaging/linux/smoke-test.sh
+          pacman -R --noconfirm fcopy
+          test ! -e /usr/bin/fcopy
+          test ! -e /usr/bin/fcopy-gui
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch-package
+          path: dist/*.pkg.tar.zst
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish tagged Linux release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [build, deb-test, rpm-test, arch]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*package*'
+          merge-multiple: true
+          path: dist
+      - name: Generate checksums and publish downloads
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          cd dist
+          test "$(find . -maxdepth 1 -name '*.deb' | wc -l)" -eq 1
+          test "$(find . -maxdepth 1 -name '*.rpm' | wc -l)" -eq 1
+          test "$(find . -maxdepth 1 -name '*.AppImage' | wc -l)" -eq 1
+          test "$(find . -maxdepth 1 -name '*.pkg.tar.zst' | wc -l)" -eq 1
+          sha256sum ./*.deb ./*.rpm ./*.AppImage ./*.pkg.tar.zst > SHA256SUMS
+          existing=$(gh release list --limit 100 --json tagName --jq \
+            ".[] | select(.tagName == \"$RELEASE_TAG\") | .tagName")
+          if [[ -z $existing ]]; then
+            gh release create "$RELEASE_TAG" --verify-tag \
+              --title "FCOPY $RELEASE_TAG" --generate-notes ./*
+          else
+            gh release upload "$RELEASE_TAG" ./* --clobber
+          fi

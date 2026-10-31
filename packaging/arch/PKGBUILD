@@ -1,42 +1,38 @@
-# Maintainer: you <you@example.com>
-# Builds from a release tarball. For a -git package, use source=("git+$url") and pkgver().
+# shellcheck shell=bash
+# shellcheck disable=SC2034,SC2154
+# Tagged upstream sources; VCS sources intentionally use SKIP rather than an archive checksum.
 pkgname=fcopy
 pkgver=0.1.0
 pkgrel=1
 pkgdesc="Fast, verified file copying (CLI + GUI)"
 arch=('x86_64' 'aarch64')
-url="https://github.com/your-org/filecopy"
+url="https://github.com/DMG-Workshop/FCOPY"
 license=('MIT' 'Apache-2.0')
-depends=('gcc-libs' 'glibc' 'libxkbcommon' 'libglvnd' 'hicolor-icon-theme')
-optdepends=('wayland: Wayland session support' 'libx11: X11 session support')
-makedepends=('cargo')
-source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+depends=('gcc-libs' 'glibc' 'openssl' 'ca-certificates' 'libxkbcommon'
+         'libxkbcommon-x11' 'libglvnd' 'libx11' 'libxcursor' 'libxi'
+         'libxrandr' 'wayland' 'hicolor-icon-theme')
+optdepends=('mesa: Mesa graphics drivers')
+makedepends=('cargo' 'git' 'cmake' 'pkgconf')
+source=("fcopy::git+$url.git#tag=v$pkgver")
 sha256sums=('SKIP')
 
 prepare() {
-  cd "filecopy-$pkgver"
-  export RUSTUP_TOOLCHAIN=stable
+  cd fcopy || return
   cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
 build() {
-  cd "filecopy-$pkgver"
-  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cd fcopy || return
+  export CARGO_TARGET_DIR=target
   cargo build --frozen --release -p fc-cli -p fc-gui
 }
 
 check() {
-  cd "filecopy-$pkgver"
-  cargo test --frozen -p fc-engine
+  cd fcopy || return
+  cargo test --frozen -p fc-engine -p fc-gui
 }
 
 package() {
-  cd "filecopy-$pkgver"
-  install -Dm755 target/release/fcopy        "$pkgdir/usr/bin/fcopy"
-  install -Dm755 target/release/fcopy-gui    "$pkgdir/usr/bin/fcopy-gui"
-  install -Dm644 packaging/linux/io.github.fcopy.desktop      "$pkgdir/usr/share/applications/io.github.fcopy.desktop"
-  install -Dm644 packaging/linux/io.github.fcopy.metainfo.xml "$pkgdir/usr/share/metainfo/io.github.fcopy.metainfo.xml"
-  install -Dm755 packaging/linux/fcopy-servicemenu.desktop    "$pkgdir/usr/share/kio/servicemenus/fcopy.desktop"
-  install -Dm644 packaging/linux/fcopy.nemo_action            "$pkgdir/usr/share/nemo/actions/fcopy.nemo_action"
-  install -Dm644 packaging/icons/io.github.fcopy.svg          "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.fcopy.svg"
+  cd fcopy || return
+  bash packaging/linux/install.sh "$pkgdir"
 }

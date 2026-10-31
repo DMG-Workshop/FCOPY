@@ -18,6 +18,15 @@ cargo run --release -p fc-gui
 * Live speed limit, throttled telemetry (speed, ETA, percent), job queue
 * Metadata, long paths and Windows-safe names: see [docs/PLATFORM.md](docs/PLATFORM.md)
 
+## Linux downloads
+
+Linux release packaging covers Ubuntu/Debian `.deb`, Fedora `.rpm`, Arch
+`.pkg.tar.zst`, and AppImage (x86-64). Version-tag CI builds and tests the packages
+before publishing them to [GitHub Releases](https://github.com/DMG-Workshop/FCOPY/releases).
+Packages include the CLI and desktop app, not an automatically enabled agent or
+web server. See the [Linux packaging guide](packaging/linux/README.md) for
+installation, compatibility, local builds, checksums and the release process.
+
 ## Download from a PC
 
 The remote PC must run a current `fcopy-agent` with an account and a share.

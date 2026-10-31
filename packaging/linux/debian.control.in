@@ -1,0 +1,12 @@
+Package: fcopy
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: DMG Workshop <noreply@github.com>
+Homepage: https://github.com/DMG-Workshop/FCOPY
+Installed-Size: @SIZE@
+Depends: @DEPENDS@, ca-certificates, libx11-6, libxcursor1, libxi6, libxrandr2, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libegl1, libgl1, hicolor-icon-theme
+Description: Verified file copying with a desktop queue and CLI
+ Copy files locally or between paired PCs with checksums, pause/resume,
+ bandwidth limits, transfer history and explicit recovery of unfinished jobs.

@@ -23,8 +23,20 @@ use std::path::{Path, PathBuf};
 pub const APP_ID: &str = "io.github.fcopy";
 
 pub fn install() -> io::Result<Vec<PathBuf>> {
-    let exe = std::env::current_exe()?;
+    let exe = integration_executable(
+        std::env::current_exe()?,
+        if cfg!(target_os = "linux") { std::env::var_os("APPIMAGE").map(PathBuf::from) } else { None },
+    )?;
     imp::install(&exe)
+}
+
+fn integration_executable(current: PathBuf, appimage: Option<PathBuf>) -> io::Result<PathBuf> {
+    let Some(image) = appimage else { return Ok(current); };
+    if !image.is_absolute() || !image.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            "APPIMAGE must point to an existing absolute AppImage path"));
+    }
+    Ok(image)
 }
 
 pub fn uninstall() -> io::Result<Vec<PathBuf>> {
@@ -111,6 +123,11 @@ mod imp {
                     "[Nemo Action]\nName=Copy with fcopy…\nComment=Copy the selection with fcopy\n\
                      Exec={exec} --sources %F\nIcon-Name=io.github.fcopy\nSelection=notnone\nExtensions=any;\n"
                 ),
+                executable: false,
+            },
+            Item {
+                rel: "icons/hicolor/scalable/apps/io.github.fcopy.svg",
+                body: include_str!("../../../packaging/icons/io.github.fcopy.svg").into(),
                 executable: false,
             },
         ]
@@ -270,6 +287,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn appimage_integration_keeps_the_persistent_image_not_the_extracted_binary() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("FCOPY portable.AppImage");
+        std::fs::write(&image, b"test image").unwrap();
+        let extracted = directory.path().join("squashfs-root/usr/bin/fcopy-gui");
+        assert_eq!(integration_executable(extracted.clone(), Some(image.clone())).unwrap(), image);
+        assert_eq!(integration_executable(extracted.clone(), None).unwrap(), extracted);
+        assert!(integration_executable(extracted.clone(), Some("relative.AppImage".into())).is_err());
+        assert!(integration_executable(extracted, Some(directory.path().join("missing.AppImage"))).is_err());
+    }
+
+    #[test]
     fn exec_quoting_follows_the_desktop_spec() {
         assert_eq!(
             desktop_exec_quote(Path::new("/opt/fcopy/fcopy-gui")),
@@ -288,7 +317,7 @@ mod tests {
         // SAFETY: single-threaded test section; no other test reads XDG_DATA_HOME.
         unsafe { std::env::set_var("XDG_DATA_HOME", dir.path()) };
         let written = imp::install(Path::new("/opt/fcopy/fcopy-gui")).unwrap();
-        assert_eq!(written.len(), 4);
+        assert_eq!(written.len(), 5);
         let desktop =
             std::fs::read_to_string(dir.path().join("applications/io.github.fcopy.desktop"))
                 .unwrap();
@@ -303,7 +332,8 @@ mod tests {
             0o111,
             "Dolphin service menus must be executable"
         );
-        assert_eq!(imp::uninstall().unwrap().len(), 4);
+        assert!(dir.path().join("icons/hicolor/scalable/apps/io.github.fcopy.svg").is_file());
+        assert_eq!(imp::uninstall().unwrap().len(), 5);
         assert!(
             !dir.path()
                 .join("applications/io.github.fcopy.desktop")
