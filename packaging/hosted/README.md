@@ -41,7 +41,7 @@ may not cross Docker bridges or LXC networks; manually enter PC addresses.
 
 ## Docker / Compose
 
-Published image: `ghcr.io/dmg-workshop/fcopy-web:0.1.0` (`latest` is also tagged).
+Published image: `ghcr.io/dmg-workshop/fcopy-web:0.1.1` (`latest` is also tagged).
 Release CI builds and tests the image, including an authenticated restart and
 paused recovery, before pushing that exact image to GHCR. A newly created GHCR
 package must be made public by its owner before anonymous pulls can work.
@@ -56,7 +56,7 @@ docker run -d --name fcopy-web --restart unless-stopped \
   --user 1000:1000 --cap-drop=ALL --security-opt=no-new-privileges \
   --stop-timeout 30 -p 8443:8443 \
   -v "$PWD/config:/config" -v "$PWD/data:/data" \
-  ghcr.io/dmg-workshop/fcopy-web:0.1.0
+  ghcr.io/dmg-workshop/fcopy-web:0.1.1
 docker logs fcopy-web
 ```
 
@@ -110,14 +110,14 @@ pct create 120 local:vztmpl/<TEMPLATE-NAME>.tar.zst \
 pct start 120
 ```
 
-Download `fcopy-web-0.1.0-linux-x86_64.tar.gz` and `SHA256SUMS` from the same
+Download `fcopy-web-0.1.1-linux-x86_64.tar.gz` and `SHA256SUMS` from the same
 GitHub release. Check its checksum on the download machine, then:
 
 ```sh
 sha256sum --ignore-missing -c SHA256SUMS
-pct push 120 fcopy-web-0.1.0-linux-x86_64.tar.gz /tmp/fcopy-web.tar.gz
+pct push 120 fcopy-web-0.1.1-linux-x86_64.tar.gz /tmp/fcopy-web.tar.gz
 pct exec 120 -- tar -xzf /tmp/fcopy-web.tar.gz -C /tmp
-pct exec 120 -- bash /tmp/fcopy-web-0.1.0/install-lxc.sh
+pct exec 120 -- bash /tmp/fcopy-web-0.1.1/install-lxc.sh
 pct exec 120 -- journalctl -u fcopy-web --no-pager
 ```
 

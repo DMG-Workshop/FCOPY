@@ -1,0 +1,14 @@
+FCOPY - UNSIGNED WINDOWS BUILD
+
+The installer, desktop app and CLI are not Authenticode code-signed.
+Windows SmartScreen may show "Unknown publisher" or block the download.
+This is not a signed/trusted-publisher release.
+
+Download only from https://github.com/DMG-Workshop/FCOPY/releases and verify
+the release SHA256SUMS before running. Approve an individual download only
+if you trust its source. Do not disable SmartScreen or antivirus globally.
+
+The installer is per-user and does not request administrator access.
+Explorer integration is optional. No agent or web service is installed.
+Uninstall removes program files and owned integration, not copied data,
+saved profiles, settings, history or recovery state.

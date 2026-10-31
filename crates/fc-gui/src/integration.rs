@@ -12,10 +12,10 @@
 //! | Linux | `.desktop` launcher + Dolphin service menu + Nautilus script + Nemo action | `$XDG_DATA_HOME` (`~/.local/share`) |
 //! | macOS | Finder Quick Action (Services) wrapping the bundle binary | `~/Library/Services` |
 //!
-//! System packages (deb/rpm/PKGBUILD/MSI) install the same files system-wide;
-//! see `packaging/`.
+//! Linux system packages install equivalent files system-wide; the Windows
+//! installer uses these per-user commands. See `packaging/`.
 //!
-//! **Only the Linux branch is compiled and tested in this repo's CI.**
+//! Native Linux, Windows and macOS branches are compiled and tested in CI.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -167,7 +167,7 @@ mod imp {
 }
 
 // ---------------------------------------------------------------------------
-// Windows (unverified here: built on Windows CI only)
+// Windows
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
@@ -176,7 +176,7 @@ mod imp {
     use winreg::RegKey;
     use winreg::enums::HKEY_CURRENT_USER;
 
-    /// Verb locations: any file, folders, and the folder background (paste-into).
+    /// Verb locations: any file and folders.
     const ROOTS: [&str; 2] = [
         r"Software\Classes\*\shell\fcopy",
         r"Software\Classes\Directory\shell\fcopy",
@@ -205,9 +205,20 @@ mod imp {
 
     pub fn uninstall() -> io::Result<Vec<PathBuf>> {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let expected = format!("\"{}\" --sources %*", std::env::current_exe()?.display());
         let mut removed = vec![];
         for root in ROOTS {
-            if hkcu.delete_subkey_all(root).is_ok() {
+            let command = match hkcu.open_subkey(format!(r"{root}\command")) {
+                Ok(key) => match key.get_value::<String, _>("") {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                },
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if command.eq_ignore_ascii_case(&expected) {
+                hkcu.delete_subkey_all(root)?;
                 removed.push(PathBuf::from(format!(r"HKCU\{root}")));
             }
         }

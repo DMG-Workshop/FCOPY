@@ -18,6 +18,16 @@ cargo run --release -p fc-gui
 * Live speed limit, throttled telemetry (speed, ETA, percent), job queue
 * Metadata, long paths and Windows-safe names: see [docs/PLATFORM.md](docs/PLATFORM.md)
 
+## Windows downloads
+
+Windows x86-64 release packaging includes a per-user installer and portable ZIP
+with the desktop app and CLI. Explorer **Copy with FCOPY** integration is optional;
+uninstall preserves user configuration and transfer data. Both packages are
+clearly labeled **unsigned** until Authenticode signing is available.
+See the [Windows guide](packaging/windows/README.md) for installation, checksum
+verification, SmartScreen warnings and package validation. Version-tag CI tests
+both packages before publication; branch builds upload workflow artifacts only.
+
 ## Linux downloads
 
 Linux release packaging covers Ubuntu/Debian `.deb`, Fedora `.rpm`, Arch

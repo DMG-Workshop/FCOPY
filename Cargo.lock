@@ -1459,7 +1459,7 @@ checksum = "caf1079563223d5d59d83c85886a56e586cfd5c1a26292e971a0fa266531ac5a"
 
 [[package]]
 name = "fc-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "ctrlc",
@@ -1472,7 +1472,7 @@ dependencies = [
 
 [[package]]
 name = "fc-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "ctrlc",
@@ -1500,7 +1500,7 @@ dependencies = [
 
 [[package]]
 name = "fc-gui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "eframe",
@@ -1521,7 +1521,7 @@ dependencies = [
 
 [[package]]
 name = "fc-remote"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "argon2",
  "base64 0.23.1",
@@ -1548,7 +1548,7 @@ dependencies = [
 
 [[package]]
 name = "fc-torrent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "librqbit",
@@ -1561,7 +1561,7 @@ dependencies = [
 
 [[package]]
 name = "fc-web"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "argon2",
  "axum",

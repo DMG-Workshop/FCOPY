@@ -233,6 +233,57 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  windows:
+    name: Windows x86-64 unsigned packages
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Select native MSVC Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable-x86_64-pc-windows-msvc
+          rustup component add clippy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test workspace
+        run: cargo test --locked --workspace
+      - name: Lint workspace
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Build unsigned desktop and CLI
+        run: cargo build --locked --release -p fc-cli -p fc-gui
+      - name: Locate installer compiler
+        run: |
+          $compiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path -LiteralPath $compiler)) {
+            $setup = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'
+            Invoke-WebRequest 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe' -OutFile $setup
+            if ((Get-FileHash -LiteralPath $setup).Hash -ne '9C73C3BAE7ED48D44112A0F48E66742C00090BDB5BEF71D9D3C056C66E97B732') {
+              throw 'Inno Setup download checksum mismatch'
+            }
+            $tools = Join-Path $env:RUNNER_TEMP 'inno'
+            $process = Start-Process $setup -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER /NOICONS /DIR=`"$tools`"" -Wait -PassThru
+            if ($process.ExitCode -ne 0) { throw "Compiler installation failed: $($process.ExitCode)" }
+            $compiler = Join-Path $tools 'ISCC.exe'
+          }
+          "FCOPY_ISCC=$compiler" >> $env:GITHUB_ENV
+      - name: Build and test Windows packages
+        run: |
+          .\packaging\windows\build.ps1 -Compiler $env:FCOPY_ISCC
+          .\packaging\windows\test-packages.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-packages
+          path: |
+            dist/*-windows-x86_64-unsigned-setup.exe
+            dist/*-windows-x86_64-unsigned-portable.zip
+          if-no-files-found: error
+          retention-days: 14
+
   docker-test:
     name: Test hosted Docker image
     runs-on: ubuntu-24.04
@@ -293,7 +344,7 @@ jobs:
   image-publish:
     name: Publish tested GHCR image
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [build, deb-test, rpm-test, arch, macos, docker-test, lxc-test]
+    needs: [build, deb-test, rpm-test, arch, macos, windows, docker-test, lxc-test]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -324,7 +375,7 @@ jobs:
   publish:
     name: Publish tagged release downloads
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [build, deb-test, rpm-test, arch, macos, docker-test, lxc-test, image-publish]
+    needs: [build, deb-test, rpm-test, arch, macos, windows, docker-test, lxc-test, image-publish]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -349,7 +400,9 @@ jobs:
           test "$(find . -maxdepth 1 -name '*.dmg' | wc -l)" -eq 2
           test "$(find . -maxdepth 1 -name '*linux-x86_64.tar.gz' | wc -l)" -eq 1
           test -f fcopy-unraid.xml
-          sha256sum ./*.deb ./*.rpm ./*.AppImage ./*.pkg.tar.zst ./*.dmg ./*.tar.gz ./*.xml > SHA256SUMS
+          test "$(find . -maxdepth 1 -name '*-windows-x86_64-unsigned-setup.exe' | wc -l)" -eq 1
+          test "$(find . -maxdepth 1 -name '*-windows-x86_64-unsigned-portable.zip' | wc -l)" -eq 1
+          sha256sum ./*.deb ./*.rpm ./*.AppImage ./*.pkg.tar.zst ./*.dmg ./*.tar.gz ./*.xml ./*.exe ./*.zip > SHA256SUMS
           existing=$(gh release list --limit 100 --json tagName --jq \
             ".[] | select(.tagName == \"$RELEASE_TAG\") | .tagName")
           if [[ -z $existing ]]; then

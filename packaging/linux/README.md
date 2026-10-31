@@ -119,7 +119,8 @@ CI uploads the main `fcopy` package only.
 4. Build the Arch package as an unprivileged user, then install/uninstall it.
 5. Test actual CLI read-back copies, per-user desktop integration and GUI startup
    under Xvfb/Mesa. The AppImage is exercised without FUSE on Ubuntu and Fedora.
-6. Also test native macOS DMGs, the Docker image, and the hosted Debian service.
+6. Also test native macOS DMGs, unsigned Windows installer/portable packages,
+   the Docker image, and the hosted Debian service.
    On a version-tag push only, publish the tested GHCR image and all desktop,
    hosted and Unraid assets with checksums to a GitHub
    release. Rerunning the workflow updates assets on an existing release.

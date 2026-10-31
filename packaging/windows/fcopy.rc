@@ -3,8 +3,8 @@
 1 RT_MANIFEST "fcopy.exe.manifest"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,1,0,0
- PRODUCTVERSION 0,1,0,0
+ FILEVERSION 0,1,1,0
+ PRODUCTVERSION 0,1,1,0
 BEGIN
   BLOCK "StringFileInfo"
   BEGIN
@@ -12,7 +12,7 @@ BEGIN
     BEGIN
       VALUE "FileDescription", "fcopy - fast verified file copy"
       VALUE "ProductName", "fcopy"
-      VALUE "FileVersion", "0.1.0"
+      VALUE "FileVersion", "0.1.1"
       VALUE "OriginalFilename", "fcopy-gui.exe"
     END
   END
