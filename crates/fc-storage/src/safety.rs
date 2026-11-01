@@ -4,9 +4,11 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 use crate::model::{Disk, DiskId};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Refusal {
     /// We cannot prove which physical device this is.
     NoSerial,
@@ -33,7 +35,7 @@ pub enum Verdict {
     Destructive(Confirmation),
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Policy {
     /// Off by default. Internal disks stay excluded until Phase 5 policy support.
     pub allow_internal: bool,
