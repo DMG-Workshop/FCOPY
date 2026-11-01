@@ -3,15 +3,17 @@
 //! in-memory buffer in tests.
 //!
 //! Direct-I/O rules: buffers are aligned to 4096 bytes, chunks are whole
-//! multiples of the logical block, and the device size must be a multiple of
-//! the logical block. Anything else is refused before the first write.
+//! multiples of the logical block, and every range must start and end on a
+//! logical-block boundary. Anything else is refused before the first write.
 
 use std::alloc::{Layout, alloc, dealloc};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
+use serde::{Deserialize, Serialize};
 
 /// Multiple of every supported logical block size (512 and 4096).
 pub const CHUNK: usize = 8 << 20;
@@ -28,7 +30,7 @@ pub trait RawIo: Read + Write + Seek + Send {
 }
 
 /// One overwrite pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Pass {
     Fixed(u8),
     /// Cryptographically seeded stream. Verification regenerates it from the seed.
@@ -36,7 +38,7 @@ pub enum Pass {
 }
 
 /// Wipe methods the product offers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WipeMethod {
     /// NIST SP 800-88 Rev.1 *Clear*: one overwrite with zeros. The default.
     Clear,
@@ -57,13 +59,13 @@ impl WipeMethod {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
     Write,
     Verify,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Progress {
     pub pass: u8,
     pub passes: u8,
@@ -159,48 +161,72 @@ fn check_cancel(cancel: &AtomicBool, pass: u8) -> Result<(), WipeError> {
     }
 }
 
-/// Runs the method end to end: each pass writes and flushes, then the final
-/// pass is read back and compared. The seed is supplied by the caller, so
-/// tests can reproduce a run exactly.
-pub fn run(
-    dev: &mut dyn RawIo,
+/// Runs the method over the whole device.
+// A single range is the whole-device case; the slice API is what the lint dislikes.
+#[allow(clippy::single_range_in_vec_init)]
+pub fn run<D: RawIo + ?Sized>(
+    dev: &mut D,
+    method: WipeMethod,
+    seed: [u8; 32],
+    cancel: &AtomicBool,
+    report: impl FnMut(Progress),
+) -> Result<(), WipeError> {
+    let total = dev.size();
+    run_ranges(dev, &[0..total], method, seed, cancel, report)
+}
+
+/// Runs the method over the given byte ranges, in order. Each pass writes and
+/// flushes, then the final pass is read back and compared. The seed is supplied
+/// by the caller, so tests can reproduce a run exactly.
+pub fn run_ranges<D: RawIo + ?Sized>(
+    dev: &mut D,
+    ranges: &[Range<u64>],
     method: WipeMethod,
     seed: [u8; 32],
     cancel: &AtomicBool,
     mut report: impl FnMut(Progress),
 ) -> Result<(), WipeError> {
-    let block = dev.block_size() as usize;
-    let total = dev.size();
-    if block == 0 || CHUNK % block != 0 || total % block as u64 != 0 {
+    let block = dev.block_size() as u64;
+    let size = dev.size();
+    let aligned = block != 0 && (CHUNK as u64) % block == 0 && size % block == 0;
+    let ranges_ok = ranges
+        .iter()
+        .all(|r| r.start <= r.end && r.end <= size && r.start % block == 0 && r.end % block == 0);
+    if !aligned || !ranges_ok {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "device size or block size is incompatible with direct I/O",
+            "device or range is incompatible with direct I/O",
         )
         .into());
     }
 
+    let total: u64 = ranges.iter().map(|r| r.end - r.start).sum();
     let passes = method.passes();
     let count = passes.len() as u8;
-    let mut buf = AlignedBuf::new(CHUNK, ALIGN.max(block))?;
+    let mut buf = AlignedBuf::new(CHUNK, ALIGN.max(block as usize))?;
 
     for (idx, &pass) in passes.iter().enumerate() {
         let n = idx as u8 + 1;
         let mut stream = PassStream::new(pass, seed, idx as u64);
-        dev.seek(SeekFrom::Start(0))?;
-        let mut off = 0u64;
-        while off < total {
-            check_cancel(cancel, n)?;
-            let len = (CHUNK as u64).min(total - off) as usize;
-            stream.fill(&mut buf.bytes_mut()[..len]);
-            dev.write_all(&buf.bytes()[..len])?;
-            off += len as u64;
-            report(Progress {
-                pass: n,
-                passes: count,
-                done: off,
-                total,
-                phase: Phase::Write,
-            });
+        let mut done = 0u64;
+        for range in ranges {
+            dev.seek(SeekFrom::Start(range.start))?;
+            let mut off = range.start;
+            while off < range.end {
+                check_cancel(cancel, n)?;
+                let len = (CHUNK as u64).min(range.end - off) as usize;
+                stream.fill(&mut buf.bytes_mut()[..len]);
+                dev.write_all(&buf.bytes()[..len])?;
+                off += len as u64;
+                done += len as u64;
+                report(Progress {
+                    pass: n,
+                    passes: count,
+                    done,
+                    total,
+                    phase: Phase::Write,
+                });
+            }
         }
         // A pass that did not reach the medium must not be followed by another.
         dev.flush_to_media()?;
@@ -208,8 +234,10 @@ pub fn run(
 
     // Only the final pass remains on the medium, so only it is verified.
     let last = passes.len() - 1;
-    verify(
+    verify_ranges(
         dev,
+        ranges,
+        total,
         passes[last],
         seed,
         last as u64,
@@ -221,8 +249,10 @@ pub fn run(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn verify(
-    dev: &mut dyn RawIo,
+fn verify_ranges<D: RawIo + ?Sized>(
+    dev: &mut D,
+    ranges: &[Range<u64>],
+    total: u64,
     pass: Pass,
     seed: [u8; 32],
     index: u64,
@@ -231,33 +261,36 @@ fn verify(
     cancel: &AtomicBool,
     report: &mut impl FnMut(Progress),
 ) -> Result<(), WipeError> {
-    let total = dev.size();
     let mut expected = PassStream::new(pass, seed, index);
     let mut want = vec![0u8; CHUNK];
-    dev.seek(SeekFrom::Start(0))?;
-    let mut off = 0u64;
-    while off < total {
-        check_cancel(cancel, count)?;
-        let len = (CHUNK as u64).min(total - off) as usize;
-        dev.read_exact(&mut buf.bytes_mut()[..len])?;
-        expected.fill(&mut want[..len]);
-        if let Some(i) = buf.bytes()[..len]
-            .iter()
-            .zip(&want[..len])
-            .position(|(a, b)| a != b)
-        {
-            return Err(WipeError::Verify {
-                offset: off + i as u64,
+    let mut done = 0u64;
+    for range in ranges {
+        dev.seek(SeekFrom::Start(range.start))?;
+        let mut off = range.start;
+        while off < range.end {
+            check_cancel(cancel, count)?;
+            let len = (CHUNK as u64).min(range.end - off) as usize;
+            dev.read_exact(&mut buf.bytes_mut()[..len])?;
+            expected.fill(&mut want[..len]);
+            if let Some(i) = buf.bytes()[..len]
+                .iter()
+                .zip(&want[..len])
+                .position(|(a, b)| a != b)
+            {
+                return Err(WipeError::Verify {
+                    offset: off + i as u64,
+                });
+            }
+            off += len as u64;
+            done += len as u64;
+            report(Progress {
+                pass: count,
+                passes: count,
+                done,
+                total,
+                phase: Phase::Verify,
             });
         }
-        off += len as u64;
-        report(Progress {
-            pass: count,
-            passes: count,
-            done: off,
-            total,
-            phase: Phase::Verify,
-        });
     }
     Ok(())
 }
@@ -349,6 +382,42 @@ mod tests {
         run(&mut dev, WipeMethod::Clear, SEED, &cancel, |_| {}).unwrap();
         assert!(dev.contents().iter().all(|&b| b == 0));
         assert_eq!(dev.flushes, 1);
+    }
+
+    #[test]
+    fn ranges_leave_the_rest_of_the_device_untouched() {
+        const MIB: u64 = 1 << 20;
+        let mut dev = MemDevice::new(DEV_LEN);
+        let size = dev.size();
+        let cancel = AtomicBool::new(false);
+        let ranges = [0..MIB, size - MIB..size];
+        run_ranges(&mut dev, &ranges, WipeMethod::Clear, SEED, &cancel, |_| {}).unwrap();
+        let mid = MIB as usize..(size - MIB) as usize;
+        assert!(dev.contents()[..MIB as usize].iter().all(|&b| b == 0));
+        assert!(dev.contents()[mid.clone()].iter().all(|&b| b == 0xAA));
+        assert!(
+            dev.contents()[(size - MIB) as usize..]
+                .iter()
+                .all(|&b| b == 0)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn unaligned_range_is_refused_before_any_write() {
+        let mut dev = MemDevice::new(DEV_LEN);
+        let cancel = AtomicBool::new(false);
+        let err = run_ranges(
+            &mut dev,
+            &[1..512],
+            WipeMethod::Clear,
+            SEED,
+            &cancel,
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(matches!(err, WipeError::Io(e) if e.kind() == io::ErrorKind::InvalidInput));
+        assert!(dev.contents().iter().all(|&b| b == 0xAA));
     }
 
     #[test]
@@ -445,5 +514,14 @@ mod tests {
         run(&mut a, WipeMethod::ClearRandom, SEED, &cancel, |_| {}).unwrap();
         run(&mut b, WipeMethod::ClearRandom, SEED, &cancel, |_| {}).unwrap();
         assert_eq!(a.contents(), b.contents());
+    }
+
+    #[test]
+    fn works_through_a_trait_object() {
+        let mut dev = MemDevice::new(DEV_LEN);
+        let cancel = AtomicBool::new(false);
+        let obj: &mut dyn RawIo = &mut dev;
+        run(obj, WipeMethod::Clear, SEED, &cancel, |_| {}).unwrap();
+        assert!(dev.contents().iter().all(|&b| b == 0));
     }
 }

@@ -3,8 +3,10 @@
 
 use std::ops::Range;
 
+use serde::{Deserialize, Serialize};
+
 /// The filesystems the product offers. Per-OS availability is a platform concern.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FsKind {
     ExFat,
     Fat32,
@@ -12,7 +14,7 @@ pub enum FsKind {
     Ext4,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TableStyle {
     /// Default. GPT allows up to 128 entries.
     Gpt,
@@ -20,21 +22,21 @@ pub enum TableStyle {
     Mbr,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SizeSpec {
     /// Uses all remaining space. Only the last partition may use it.
     Remaining,
     Bytes(u64),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartitionSpec {
     pub size: SizeSpec,
     pub fs: FsKind,
     pub label: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TablePlan {
     pub style: TableStyle,
     pub partitions: Vec<PartitionSpec>,

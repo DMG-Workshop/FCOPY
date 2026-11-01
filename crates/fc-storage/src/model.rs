@@ -3,6 +3,8 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 /// How the disk is attached. Drives the default policy (external only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Transport {
@@ -15,7 +17,7 @@ pub enum Transport {
 }
 
 /// The facts used to prove we are touching the same physical device.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DiskIdentity {
     /// `None` when the OS does not report one. Such disks are read-only.
     pub serial: Option<String>,
@@ -27,7 +29,7 @@ pub struct DiskIdentity {
 ///
 /// It is never derived from a device path or index, because those renumber
 /// when a drive is re-plugged.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct DiskId(String);
 
 impl DiskId {
