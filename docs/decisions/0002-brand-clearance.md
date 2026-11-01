@@ -56,7 +56,7 @@ Checked from the build environment with HTTP requests to each registry's public 
 | Windows package managers (Winget, Chocolatey, Scoop) | Not checked | Chocolatey endpoint unreachable. Winget path check inconclusive. |
 | Container registries beyond Docker Hub `library` (GHCR, other namespaces) | Not checked | Not attempted |
 | Command-name collision on Windows and macOS (`cmv` on PATH) | Not checked | Only Linux PATH checked, and only in this environment |
-| Domains: `coremove.*`, `velox-coremove.*` | Not checked | RDAP lookup service refused by egress proxy |
+| Domains: `coremove.*`, `velox-coremove.*` | Partly checked: `velox-coremove.com` reported available, about $15 a year. `vcm.dev` reported available, about $115.70 a year (premium). Reported by the product owner from a registrar lookup on 2026-11-01. Not verified from the build environment, which cannot reach RDAP. | `coremove.*` and `cmv.*` not yet checked. Registrar prices and availability can change, so re-check before buying. |
 | GitHub organisation `velox-coremove` | Not checked | GitHub user and org API returns 403 for these lookups |
 | Social handles | Not checked | Not attempted |
 | Common-law use: app stores, Product Hunt, further web search | Partly checked | Four US-only web searches run. App stores not searched. |
@@ -69,7 +69,7 @@ Checked from the build environment with HTTP requests to each registry's public 
 2. Counsel reviews the trademark results in the relevant classes, and decides whether the combined name is distinct enough.
 3. Linux distributions, Windows package managers and container registries checked for a package or binary named `cmv`.
 4. `cmv` command collision checked on Windows and macOS.
-5. Domains and the GitHub organisation secured or confirmed available.
+5. Domains and the GitHub organisation secured or confirmed available. Registrar reports on 2026-11-01: `velox-coremove.com` available (about $15 a year); `vcm.dev` available (about $115.70 a year). `vcm.dev` no longer matters, since `vcm` is rejected. Still to check: `cmv.dev`, `coremove.com`, and the GitHub organisation `velox-coremove`.
 6. App stores searched for "CoreMove" and "Velox CoreMove".
 7. Decision 5 in `0001-product-decisions.md` updated to reference this record.
 
