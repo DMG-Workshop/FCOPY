@@ -328,7 +328,6 @@ impl Platform for LinuxSysfs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::safety::{Policy, Refusal, SafetyInputs, Verdict, evaluate};
 
     fn disk(name: &str, transport: Transport, removable: bool) -> Disk {
         Disk::new(
@@ -499,6 +498,7 @@ mod tests {
     #[cfg(unix)]
     mod fixture {
         use super::*;
+        use crate::safety::{Policy, Refusal, SafetyInputs, Verdict, evaluate};
 
         /// Builds a sysfs/procfs tree with a removable USB disk and an internal SATA disk.
         fn tree() -> tempfile::TempDir {
