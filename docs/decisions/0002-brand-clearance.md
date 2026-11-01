@@ -10,6 +10,7 @@
 - **Product name:** Velox CoreMove. Always use the full name, never `Velox` alone.
 - **Binary (CLI) name:** `cmv`. Chosen by the product owner on 2026-11-01, subject to the open checks below.
 - **Package name:** `coremove` (crates.io, npm and PyPI all free at time of check).
+- **Product domain:** `velox-coremove.com`. Chosen by the product owner on 2026-11-01. Reported available at about $15 a year from a registrar lookup. Not yet registered. Registration is the owner's action, not done by this project.
 
 ## Candidates considered
 
