@@ -28,3 +28,8 @@ libc = "0.2.191"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[[bin]]
+name = "fcopy-storage-worker"
+path = "src/bin/fcopy-storage-worker.rs"
+required-features = ["storage-destructive"]

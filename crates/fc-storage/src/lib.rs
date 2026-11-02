@@ -41,3 +41,5 @@ pub mod linux_block;
 pub mod orchestrate;
 #[cfg(feature = "storage-destructive")]
 pub mod protocol;
+#[cfg(feature = "storage-destructive")]
+pub mod worker;
