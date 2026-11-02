@@ -26,16 +26,23 @@ use std::fs::File;
 use std::io::{self, BufRead, BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+
+mod disks;
 use fc_engine::units::{human_bytes, human_duration, human_rate, parse_size};
 use fc_engine::*;
 
 #[derive(Parser)]
-#[command(name = "fcopy", version, about = "Fast, verified file copying", propagate_version = true)]
+#[command(
+    name = "fcopy",
+    version,
+    about = "Fast, verified file copying",
+    propagate_version = true
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -46,6 +53,12 @@ enum Command {
     /// Copy files and folders.
     #[command(override_usage = "fcopy copy [OPTIONS] <SOURCE>... <DEST>")]
     Copy(CopyArgs),
+    /// List attached disks. Read-only: nothing is written to any device.
+    Disks {
+        /// Also read each disk's SMART health (uses smartctl when it is installed).
+        #[arg(long)]
+        health: bool,
+    },
     /// List PCs running fcopy-agent on this network.
     Peers {
         /// How long to listen, in seconds.
@@ -192,6 +205,7 @@ enum OnError {
 fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Copy(args) => copy(args),
+        Command::Disks { health } => disks::run(health),
         Command::Peers { timeout } => peers(timeout),
         Command::Hash { algo, files } => hash(algo.into(), &files),
         Command::Check { algo, manifest } => check(algo.into(), &manifest),
@@ -205,7 +219,8 @@ fn main() -> ExitCode {
 fn build_request(paths: &[PathBuf]) -> TransferRequest {
     let (dest, sources) = paths.split_last().expect("clap enforces >= 2 paths");
     let dest_str = dest.to_string_lossy();
-    let dest_is_dir_syntax = dest_str.ends_with('/') || dest_str.ends_with(std::path::MAIN_SEPARATOR);
+    let dest_is_dir_syntax =
+        dest_str.ends_with('/') || dest_str.ends_with(std::path::MAIN_SEPARATOR);
     if sources.len() == 1 && sources[0].is_file() && !dest.is_dir() && !dest_is_dir_syntax {
         TransferRequest::file_to(&sources[0], dest)
     } else {
@@ -214,47 +229,97 @@ fn build_request(paths: &[PathBuf]) -> TransferRequest {
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
-enum ConflictMode { Ask, Replace, Skip, KeepBoth, Compare }
+enum ConflictMode {
+    Ask,
+    Replace,
+    Skip,
+    KeepBoth,
+    Compare,
+}
 
 fn conflicts(args: &CopyArgs) -> Option<Arc<fc_engine::conflict::ConflictResolver>> {
     use fc_engine::conflict::{ConflictPolicy as P, ConflictResolver};
-    if args.overwrite { return None; }
-    let mode = args.conflict.or_else(|| io::stdin().is_terminal().then_some(ConflictMode::Ask))?;
+    if args.overwrite {
+        return None;
+    }
+    let mode = args
+        .conflict
+        .or_else(|| io::stdin().is_terminal().then_some(ConflictMode::Ask))?;
     let policy = match mode {
-        ConflictMode::Ask => P::Ask, ConflictMode::Replace => P::Replace, ConflictMode::Skip => P::Skip,
-        ConflictMode::KeepBoth => P::KeepBoth, ConflictMode::Compare => P::Compare,
+        ConflictMode::Ask => P::Ask,
+        ConflictMode::Replace => P::Replace,
+        ConflictMode::Skip => P::Skip,
+        ConflictMode::KeepBoth => P::KeepBoth,
+        ConflictMode::Compare => P::Compare,
     };
     let resolver = ConflictResolver::new(policy);
     Some(Arc::new(if io::stdin().is_terminal() {
         resolver.with_handler(Arc::new(|details, _| prompt_conflict(details)))
-    } else { resolver }))
+    } else {
+        resolver
+    }))
 }
 
 fn prompt_conflict(details: &fc_engine::conflict::Conflict) -> fc_engine::conflict::ConflictChoice {
     use fc_engine::conflict::{ConflictAction as A, ConflictChoice};
-    let cancel = ConflictChoice { action: A::Cancel, apply_to_all: false };
+    let cancel = ConflictChoice {
+        action: A::Cancel,
+        apply_to_all: false,
+    };
     if !io::stdin().is_terminal() {
-        eprintln!("{}: conflict needs a terminal; use --conflict replace, skip or keep-both", details.destination.display());
+        eprintln!(
+            "{}: conflict needs a terminal; use --conflict replace, skip or keep-both",
+            details.destination.display()
+        );
         return cancel;
     }
-    eprintln!("\n{}: {} -> {}", if details.different { "Contents differ" } else { "Destination exists" }, details.source.display(), details.destination.display());
+    eprintln!(
+        "\n{}: {} -> {}",
+        if details.different {
+            "Contents differ"
+        } else {
+            "Destination exists"
+        },
+        details.source.display(),
+        details.destination.display()
+    );
     loop {
-        eprint!("[r]eplace [s]kip [k]eep both {}[c]ancel (uppercase = apply to remaining conflicts in this job) > ",
-            if details.different { "" } else { "[m]compare " });
-        if let Err(e) = io::stderr().flush() { eprintln!("cannot display conflict prompt: {e}"); return cancel; }
+        eprint!(
+            "[r]eplace [s]kip [k]eep both {}[c]ancel (uppercase = apply to remaining conflicts in this job) > ",
+            if details.different { "" } else { "[m]compare " }
+        );
+        if let Err(e) = io::stderr().flush() {
+            eprintln!("cannot display conflict prompt: {e}");
+            return cancel;
+        }
         let mut input = String::new();
         match io::stdin().read_line(&mut input) {
-            Ok(0) => { eprintln!("input closed; cancelling"); return cancel; }
-            Err(e) => { eprintln!("cannot read conflict choice: {e}"); return cancel; }
+            Ok(0) => {
+                eprintln!("input closed; cancelling");
+                return cancel;
+            }
+            Err(e) => {
+                eprintln!("cannot read conflict choice: {e}");
+                return cancel;
+            }
             Ok(_) => {}
         }
         let letter = input.trim().chars().next().unwrap_or(' ');
         let action = match letter.to_ascii_lowercase() {
-            'r' => A::Replace, 's' => A::Skip, 'k' => A::KeepBoth, 'c' => A::Cancel,
+            'r' => A::Replace,
+            's' => A::Skip,
+            'k' => A::KeepBoth,
+            'c' => A::Cancel,
             'm' if !details.different => A::Compare,
-            _ => { eprintln!("choose one of the listed actions"); continue; }
+            _ => {
+                eprintln!("choose one of the listed actions");
+                continue;
+            }
         };
-        return ConflictChoice { action, apply_to_all: letter.is_ascii_uppercase() };
+        return ConflictChoice {
+            action,
+            apply_to_all: letter.is_ascii_uppercase(),
+        };
     }
 }
 
@@ -276,10 +341,17 @@ fn copy(args: CopyArgs) -> ExitCode {
         }
     };
     let show_progress = !args.quiet && io::stderr().is_terminal();
-    let on_error = args.on_error.unwrap_or(if interactive { OnError::Ask } else { OnError::Auto });
+    let on_error = args.on_error.unwrap_or(if interactive {
+        OnError::Ask
+    } else {
+        OnError::Auto
+    });
     let policy = match on_error {
         OnError::Ask => ErrorPolicy::Ask,
-        OnError::Auto => ErrorPolicy::Auto(RetryPolicy { max_retries: args.retries, ..Default::default() }),
+        OnError::Auto => ErrorPolicy::Auto(RetryPolicy {
+            max_retries: args.retries,
+            ..Default::default()
+        }),
         OnError::Skip => ErrorPolicy::Skip,
         OnError::Cancel => ErrorPolicy::Cancel,
     };
@@ -346,7 +418,10 @@ fn copy(args: CopyArgs) -> ExitCode {
     };
     let job = queue.add(request);
 
-    let mut ui = Terminal { status_shown: false, show_progress };
+    let mut ui = Terminal {
+        status_shown: false,
+        show_progress,
+    };
     let mut remembered: HashMap<ErrorClass, ErrorAction> = HashMap::new();
     let mut manifest_lines = Vec::new();
     let mut final_state = JobState::Pending;
@@ -354,15 +429,28 @@ fn copy(args: CopyArgs) -> ExitCode {
 
     for ev in events.iter() {
         match ev {
-            Event::Started { files, bytes, warnings, .. } => {
+            Event::Started {
+                files,
+                bytes,
+                warnings,
+                ..
+            } => {
                 for w in warnings {
                     ui.line(&format!("warning: {w}"));
                 }
-                let limit = queue.speed_limit().map(|l| format!(", limit {}", human_rate(l as f64))).unwrap_or_default();
+                let limit = queue
+                    .speed_limit()
+                    .map(|l| format!(", limit {}", human_rate(l as f64)))
+                    .unwrap_or_default();
                 ui.line(&format!("{files} file(s), {}{limit}", human_bytes(bytes)));
             }
             Event::Progress { telemetry: t, .. } => ui.status(&t, queue.is_paused()),
-            Event::FileCopied { dst, digest, warnings, .. } => {
+            Event::FileCopied {
+                dst,
+                digest,
+                warnings,
+                ..
+            } => {
                 for w in warnings {
                     ui.line(&format!("warning: {}: {w}", dst.display()));
                 }
@@ -371,8 +459,12 @@ fn copy(args: CopyArgs) -> ExitCode {
                     manifest_lines.push(format!("{d}  {}", rel.display()));
                 }
             }
-            Event::FileSkipped { src, reason, .. } => ui.line(&format!("SKIPPED {}: {reason}", src.display())),
-            Event::FileFailed { src, reason, .. } => ui.line(&format!("FAILED  {}: {reason}", src.display())),
+            Event::FileSkipped { src, reason, .. } => {
+                ui.line(&format!("SKIPPED {}: {reason}", src.display()))
+            }
+            Event::FileFailed { src, reason, .. } => {
+                ui.line(&format!("FAILED  {}: {reason}", src.display()))
+            }
             Event::Decision(d) => {
                 let action = match remembered.get(&d.class) {
                     Some(a) => *a,
@@ -395,7 +487,11 @@ fn copy(args: CopyArgs) -> ExitCode {
                     }
                 }
             }
-            Event::Finished { job: j, state, summary: s } if j == job => {
+            Event::Finished {
+                job: j,
+                state,
+                summary: s,
+            } if j == job => {
                 final_state = state;
                 summary = s;
                 break;
@@ -411,7 +507,11 @@ fn copy(args: CopyArgs) -> ExitCode {
             eprintln!("error writing manifest {}: {e}", path.display());
             return ExitCode::FAILURE;
         }
-        eprintln!("manifest: {} ({} entries)", path.display(), manifest_lines.len());
+        eprintln!(
+            "manifest: {} ({} entries)",
+            path.display(),
+            manifest_lines.len()
+        );
     }
 
     eprintln!(
@@ -420,10 +520,17 @@ fn copy(args: CopyArgs) -> ExitCode {
         human_bytes(summary.bytes_copied),
         human_duration(summary.elapsed),
         human_rate(summary.throughput_bps),
-        if verify == VerifyMode::ReadBack { ", verified" } else { "" }
+        if verify == VerifyMode::ReadBack {
+            ", verified"
+        } else {
+            ""
+        }
     );
     if summary.files_skipped + summary.files_failed > 0 {
-        eprintln!("{} skipped, {} failed", summary.files_skipped, summary.files_failed);
+        eprintln!(
+            "{} skipped, {} failed",
+            summary.files_skipped, summary.files_failed
+        );
     }
     match final_state {
         JobState::Completed => ExitCode::SUCCESS,
@@ -476,7 +583,11 @@ impl Terminal {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let eta = if paused { "paused".to_string() } else { t.eta.map(human_duration).unwrap_or_else(|| "--".into()) };
+        let eta = if paused {
+            "paused".to_string()
+        } else {
+            t.eta.map(human_duration).unwrap_or_else(|| "--".into())
+        };
         let bar_w = 24;
         let filled = ((t.fraction * bar_w as f64).round() as usize).min(bar_w);
         eprint!(
@@ -499,10 +610,19 @@ impl Terminal {
     fn prompt(&mut self, d: &DecisionRequest) -> (ErrorAction, bool) {
         self.clear_status();
         eprintln!("\n!! {} — {}", d.class, d.path.display());
-        let at = d.offset.map(|o| format!(" at byte {o}")).unwrap_or_default();
-        eprintln!("   while {}{at} (attempt {}): {}", d.operation, d.attempt, d.message);
+        let at = d
+            .offset
+            .map(|o| format!(" at byte {o}"))
+            .unwrap_or_default();
+        eprintln!(
+            "   while {}{at} (attempt {}): {}",
+            d.operation, d.attempt, d.message
+        );
         loop {
-            eprint!("   [r]etry  [s]kip  [c]ancel   (S/C = same answer for all '{}' errors) > ", d.class);
+            eprint!(
+                "   [r]etry  [s]kip  [c]ancel   (S/C = same answer for all '{}' errors) > ",
+                d.class
+            );
             let _ = io::stderr().flush();
             let mut input = String::new();
             if io::stdin().lock().read_line(&mut input).unwrap_or(0) == 0 {
@@ -516,7 +636,10 @@ impl Terminal {
                 _ => continue,
             };
             // "Retry all" would loop forever on a permanent error, so it is never remembered.
-            return (action, c.is_ascii_uppercase() && action != ErrorAction::Retry);
+            return (
+                action,
+                c.is_ascii_uppercase() && action != ErrorAction::Retry,
+            );
         }
     }
 }
@@ -536,7 +659,11 @@ fn hash(algo: Algorithm, files: &[PathBuf]) -> ExitCode {
             }
         }
     }
-    if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 fn check(algo: Algorithm, manifest: &Path) -> ExitCode {
@@ -582,7 +709,11 @@ fn check(algo: Algorithm, manifest: &Path) -> ExitCode {
         }
     }
     eprintln!("{good} OK, {bad} failed");
-    if bad == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+    if bad == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -594,15 +725,25 @@ fn check(algo: Algorithm, manifest: &Path) -> ExitCode {
 fn remote_destination(args: &CopyArgs) -> Result<Option<Arc<dyn TransferBackend>>, String> {
     use fc_remote::client::RemoteSpec;
 
-    let dest = args.paths.last().expect("clap enforces >= 2 paths").to_string_lossy().to_string();
+    let dest = args
+        .paths
+        .last()
+        .expect("clap enforces >= 2 paths")
+        .to_string_lossy()
+        .to_string();
     // A local path is never a valid `host:/share` target, so a parse failure means local.
-    let Ok(spec) = RemoteSpec::parse(&dest) else { return Ok(None) };
+    let Ok(spec) = RemoteSpec::parse(&dest) else {
+        return Ok(None);
+    };
     Ok(Some(Arc::new(connect_backend(args, spec)?)))
 }
 
 /// A connection to the agent named by `spec`: pinned from known_hosts, or
 /// trusted on first use after confirmation.
-fn connect_backend(args: &CopyArgs, spec: fc_remote::client::RemoteSpec) -> Result<fc_remote::backend::RemoteBackend, String> {
+fn connect_backend(
+    args: &CopyArgs,
+    spec: fc_remote::client::RemoteSpec,
+) -> Result<fc_remote::backend::RemoteBackend, String> {
     use fc_remote::backend::RemoteBackend;
     use fc_remote::client::Connector;
     use fc_remote::config::{KnownHosts, default_client_dir};
@@ -613,7 +754,9 @@ fn connect_backend(args: &CopyArgs, spec: fc_remote::client::RemoteSpec) -> Resu
     let pinned = known.get(&host_port).map(str::to_string);
 
     let password = read_password(args, &spec)?;
-    let mut connector = Connector::new(spec).password(password).pinned(pinned.clone());
+    let mut connector = Connector::new(spec)
+        .password(password)
+        .pinned(pinned.clone());
     if pinned.is_none() {
         // First contact. The callback runs after the certificate arrives and
         // before anything is sent. It trusts the fingerprint only if it matches
@@ -634,14 +777,17 @@ fn connect_backend(args: &CopyArgs, spec: fc_remote::client::RemoteSpec) -> Resu
             }
             eprint!("trust this PC? [y/N] ");
             let mut answer = String::new();
-            if io::stdin().lock().read_line(&mut answer).is_err() || !answer.trim().eq_ignore_ascii_case("y") {
+            if io::stdin().lock().read_line(&mut answer).is_err()
+                || !answer.trim().eq_ignore_ascii_case("y")
+            {
                 return false;
             }
             save_trust(&known_path, host, fp);
             true
         }));
     }
-    let backend = RemoteBackend::new(connector).map_err(|e| format!("cannot start the remote transfer engine: {e}"))?;
+    let backend = RemoteBackend::new(connector)
+        .map_err(|e| format!("cannot start the remote transfer engine: {e}"))?;
     Ok(backend)
 }
 
@@ -652,7 +798,10 @@ fn remote_sources(args: &CopyArgs) -> Result<Option<Vec<fc_remote::client::Remot
     use fc_remote::client::RemoteSpec;
 
     let (dest, sources) = args.paths.split_last().expect("clap enforces >= 2 paths");
-    let parsed: Vec<Option<RemoteSpec>> = sources.iter().map(|s| RemoteSpec::parse(&s.to_string_lossy()).ok()).collect();
+    let parsed: Vec<Option<RemoteSpec>> = sources
+        .iter()
+        .map(|s| RemoteSpec::parse(&s.to_string_lossy()).ok())
+        .collect();
     if parsed.iter().all(Option::is_none) {
         return Ok(None);
     }
@@ -663,7 +812,10 @@ fn remote_sources(args: &CopyArgs) -> Result<Option<Vec<fc_remote::client::Remot
         return Err("cannot mix remote and local sources in one copy".into());
     }
     let specs: Vec<RemoteSpec> = parsed.into_iter().flatten().collect();
-    if specs.iter().any(|s| s.host_port() != specs[0].host_port() || s.user != specs[0].user) {
+    if specs
+        .iter()
+        .any(|s| s.host_port() != specs[0].host_port() || s.user != specs[0].user)
+    {
         return Err("all remote sources must be on the same PC and account".into());
     }
     Ok(Some(specs))
@@ -699,7 +851,9 @@ fn pull(args: &CopyArgs, specs: Vec<fc_remote::client::RemoteSpec>) -> ExitCode 
         let (control, presses) = (control.clone(), presses.clone());
         let _ = ctrlc::set_handler(move || {
             if presses.fetch_add(1, Ordering::SeqCst) == 0 {
-                eprintln!("\n^C cancelling; partial files are kept for resume (press again to quit immediately)…");
+                eprintln!(
+                    "\n^C cancelling; partial files are kept for resume (press again to quit immediately)…"
+                );
                 control.cancel();
             } else {
                 std::process::exit(130);
@@ -763,7 +917,11 @@ fn pull(args: &CopyArgs, specs: Vec<fc_remote::client::RemoteSpec>) -> ExitCode 
         eprintln!("cancelled");
         return ExitCode::from(130);
     }
-    if skipped + failed > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+    if skipped + failed > 0 {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 /// One rewritable status line for a download.
@@ -787,7 +945,15 @@ impl PullLine {
         let now = std::time::Instant::now();
         Self {
             show,
-            state: std::sync::Mutex::new(PullLineState { started: now, last_draw: now, total: 0, file_bytes: 0, file_size: 0, name: String::new(), drawn: false }),
+            state: std::sync::Mutex::new(PullLineState {
+                started: now,
+                last_draw: now,
+                total: 0,
+                file_bytes: 0,
+                file_size: 0,
+                name: String::new(),
+                drawn: false,
+            }),
         }
     }
 
@@ -803,10 +969,26 @@ impl PullLine {
         if !self.show {
             return;
         }
-        let pct = if s.file_size == 0 { 100.0 } else { s.file_bytes as f64 * 100.0 / s.file_size as f64 };
+        let pct = if s.file_size == 0 {
+            100.0
+        } else {
+            s.file_bytes as f64 * 100.0 / s.file_size as f64
+        };
         let rate = s.total as f64 / s.started.elapsed().as_secs_f64().max(0.001);
-        let name: String = s.name.chars().rev().take(48).collect::<Vec<_>>().into_iter().rev().collect();
-        eprint!("\r\x1b[2K{pct:>5.1}%  {:>11}  {} total  {name}", human_rate(rate), human_bytes(s.total));
+        let name: String = s
+            .name
+            .chars()
+            .rev()
+            .take(48)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        eprint!(
+            "\r\x1b[2K{pct:>5.1}%  {:>11}  {} total  {name}",
+            human_rate(rate),
+            human_bytes(s.total)
+        );
         let _ = io::stderr().flush();
         s.drawn = true;
         s.last_draw = std::time::Instant::now();
@@ -839,14 +1021,16 @@ fn read_password(args: &CopyArgs, spec: &fc_remote::client::RemoteSpec) -> Resul
         return Ok(p.clone());
     }
     if let Some(path) = &args.password_file {
-        let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         return Ok(text.lines().next().unwrap_or_default().to_string());
     }
     if let Ok(p) = std::env::var("FCOPY_PASSWORD") {
         return Ok(p);
     }
     if io::stdin().is_terminal() {
-        return rpassword::prompt_password(format!("password for {spec}: ")).map_err(|e| e.to_string());
+        return rpassword::prompt_password(format!("password for {spec}: "))
+            .map_err(|e| e.to_string());
     }
     Err("no password: set FCOPY_PASSWORD, use --password-file, or run from a terminal".into())
 }
@@ -869,7 +1053,11 @@ fn peers(timeout: u64) -> ExitCode {
     }
     let known = KnownHosts::load(&default_client_dir().join("known_hosts"));
     for p in &found {
-        let addr = p.addresses.first().map(|a| a.to_string()).unwrap_or_else(|| p.host.clone());
+        let addr = p
+            .addresses
+            .first()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| p.host.clone());
         let trust = match known.get(&format!("{addr}:{}", p.port)) {
             Some(fp) if fp == p.fingerprint => "trusted",
             Some(_) => "FINGERPRINT CHANGED",
