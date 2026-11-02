@@ -20,3 +20,25 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+
+  storage-destructive:
+    # The destructive feature of fc-storage, linted and tested on a Linux kernel.
+    # The loop-device tests need root and the storage tools, and they run only when
+    # FCOPY_LOOP_TESTS is set. They use loop devices backed by files, never a real disk.
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install storage tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gdisk exfatprogs dosfstools ntfs-3g e2fsprogs smartmontools util-linux
+    - name: Lint the destructive feature
+      run: cargo clippy -p fc-storage --all-targets --features storage-destructive -- -D warnings
+    - name: Unit tests with the destructive feature
+      run: cargo test -p fc-storage --features storage-destructive --lib
+    - name: Loop-device tests (root)
+      # sudo strips most of the environment, so the toolchain location is passed through.
+      run: >
+        sudo env "PATH=$PATH" "RUSTUP_HOME=$RUSTUP_HOME" "CARGO_HOME=$CARGO_HOME" FCOPY_LOOP_TESTS=1
+        cargo test -p fc-storage --features storage-destructive --test loop_device -- --test-threads=1
