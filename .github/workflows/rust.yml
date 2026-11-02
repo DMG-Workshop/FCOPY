@@ -41,4 +41,4 @@ jobs:
       # sudo strips most of the environment, so the toolchain location is passed through.
       run: >
         sudo env "PATH=$PATH" "RUSTUP_HOME=$RUSTUP_HOME" "CARGO_HOME=$CARGO_HOME" FCOPY_LOOP_TESTS=1
-        cargo test -p fc-storage --features storage-destructive --test loop_device -- --test-threads=1
+        cargo test -p fc-storage --features storage-destructive --test loop_device --test worker_loop -- --test-threads=1
