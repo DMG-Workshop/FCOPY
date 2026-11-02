@@ -3,9 +3,13 @@
 
 use std::process::ExitCode;
 
+// These helpers are used by the Linux `disks` command and by the unit tests. Other
+// platforms build neither, so they are left out there rather than warned about.
+#[cfg(any(target_os = "linux", test))]
 use fc_storage::health::{Health, HealthSource};
 
 /// A size in binary units, such as `1.5 GiB`.
+#[cfg(any(target_os = "linux", test))]
 pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
     let mut value = bytes as f64;
@@ -23,6 +27,7 @@ pub fn human_size(bytes: u64) -> String {
 
 /// One line that says what the drive reported. Missing readings are left out,
 /// and a drive with no readings says so, rather than printing zeros.
+#[cfg(any(target_os = "linux", test))]
 pub fn summarize_health(h: &Health) -> String {
     if h.source == HealthSource::Unavailable {
         return "unavailable (this enclosure does not report SMART)".to_owned();
