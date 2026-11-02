@@ -43,7 +43,9 @@ impl TlsListener {
                 };
                 let (acceptor, tx) = (acceptor.clone(), tx.clone());
                 tokio::spawn(async move {
-                    if let Ok(Ok(stream)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(sock)).await {
+                    if let Ok(Ok(stream)) =
+                        tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(sock)).await
+                    {
                         let _ = tx.send((stream, peer)).await;
                     }
                 });
@@ -63,7 +65,10 @@ impl axum::serve::Listener for TlsListener {
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         // The accept task holds the sender until the listener is dropped, so this never ends early.
-        self.ready.recv().await.expect("accept task runs as long as the listener")
+        self.ready
+            .recv()
+            .await
+            .expect("accept task runs as long as the listener")
     }
 
     fn local_addr(&self) -> io::Result<Self::Addr> {
@@ -76,13 +81,17 @@ impl axum::serve::Listener for TlsListener {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PeerAddr(pub SocketAddr);
 
-impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TlsListener>> for PeerAddr {
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TlsListener>>
+    for PeerAddr
+{
     fn connect_info(stream: axum::serve::IncomingStream<'_, TlsListener>) -> Self {
         PeerAddr(*stream.remote_addr())
     }
 }
 
-impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TcpListener>> for PeerAddr {
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TcpListener>>
+    for PeerAddr
+{
     fn connect_info(stream: axum::serve::IncomingStream<'_, TcpListener>) -> Self {
         PeerAddr(*stream.remote_addr())
     }

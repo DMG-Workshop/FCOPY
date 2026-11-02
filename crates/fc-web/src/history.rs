@@ -12,8 +12,8 @@ use axum::response::{IntoResponse, Response};
 use fc_engine::{Event, JobId, Queue, TransferRequest};
 use fc_remote::history::{Entry, HistoryStore, Pending};
 
-use crate::{ApiError, AppState};
 use crate::auth::{Principal, Role};
+use crate::{ApiError, AppState};
 
 pub struct History {
     store: Mutex<HistoryStore>,
@@ -45,16 +45,28 @@ impl History {
         let entry = {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             match event {
-                Event::Finished { job, state, summary } => pending.remove(job).map(|metadata| metadata.finish(state, summary)),
+                Event::Finished {
+                    job,
+                    state,
+                    summary,
+                } => pending
+                    .remove(job)
+                    .map(|metadata| metadata.finish(state, summary)),
                 _ => return,
             }
         };
         if let Some(entry) = entry {
-            let result = entry.and_then(|entry| self.store.lock().unwrap_or_else(|e| e.into_inner()).record(entry));
+            let result = entry.and_then(|entry| {
+                self.store
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .record(entry)
+            });
             if let Err(error) = &result {
                 eprintln!("transfer history could not be saved: {error}");
             }
-            *self.error.lock().unwrap_or_else(|e| e.into_inner()) = result.err().map(|e| e.to_string());
+            *self.error.lock().unwrap_or_else(|e| e.into_inner()) =
+                result.err().map(|e| e.to_string());
         }
     }
 }
@@ -65,31 +77,68 @@ pub struct HistoryResponse {
     persistent: bool,
 }
 
-pub async fn list(State(state): State<Arc<AppState>>, principal: Principal) -> Result<Response, ApiError> {
+pub async fn list(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+) -> Result<Response, ApiError> {
     let history = state.history.clone();
     let entries = tokio::task::spawn_blocking(move || {
-        let result = history.store.lock().unwrap_or_else(|e| e.into_inner()).list();
-        *history.error.lock().unwrap_or_else(|e| e.into_inner()) = result.as_ref().err().map(|e| e.to_string());
+        let result = history
+            .store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .list();
+        *history.error.lock().unwrap_or_else(|e| e.into_inner()) =
+            result.as_ref().err().map(|e| e.to_string());
         result
-    }).await.map_err(|e| ApiError::Internal(format!("history worker failed: {e}")))?
-        .map_err(|e| ApiError::Internal(format!("cannot load transfer history: {e}")))?;
-    Ok(([(axum::http::header::CACHE_CONTROL, "no-store")], Json(HistoryResponse {
-        entries: entries.into_iter().filter(|e| principal.role == Role::Admin || e.owner.as_deref() == Some(&principal.name)).collect(),
-        persistent: state.history.persistent,
-    })).into_response())
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("history worker failed: {e}")))?
+    .map_err(|e| ApiError::Internal(format!("cannot load transfer history: {e}")))?;
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(HistoryResponse {
+            entries: entries
+                .into_iter()
+                .filter(|e| {
+                    principal.role == Role::Admin || e.owner.as_deref() == Some(&principal.name)
+                })
+                .collect(),
+            persistent: state.history.persistent,
+        }),
+    )
+        .into_response())
 }
 
-pub async fn clear(State(state): State<Arc<AppState>>, principal: Principal) -> Result<StatusCode, ApiError> {
+pub async fn clear(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+) -> Result<StatusCode, ApiError> {
     let history = state.history.clone();
     tokio::task::spawn_blocking(move || {
         let owner = (principal.role != Role::Admin).then_some(principal.name.as_str());
-        history.store.lock().unwrap_or_else(|e| e.into_inner()).clear(owner)
-    }).await.map_err(|e| ApiError::Internal(format!("history worker failed: {e}")))?
-        .map_err(|e| ApiError::Internal(format!("cannot clear transfer history: {e}")))?;
-    *state.history.error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        history
+            .store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear(owner)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("history worker failed: {e}")))?
+    .map_err(|e| ApiError::Internal(format!("cannot clear transfer history: {e}")))?;
+    *state
+        .history
+        .error
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub fn persistence_error(state: &AppState) -> Option<String> {
-    state.history.error.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    state
+        .history
+        .error
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
