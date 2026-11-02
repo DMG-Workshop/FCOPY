@@ -20,6 +20,8 @@ pub enum Refusal {
     InternalNotAllowed,
     /// Hosts an FCOPY state directory or an active job destination.
     ProtectedPath,
+    /// The worker only writes to real disks. Loop devices and other nodes are refused.
+    DeviceNotAllowed,
 }
 
 /// What the user must type back to proceed.

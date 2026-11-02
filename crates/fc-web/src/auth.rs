@@ -61,7 +61,11 @@ pub struct HashCost {
 impl Default for HashCost {
     /// OWASP 2024 Argon2id guidance: 19 MiB, 2 passes, 1 lane.
     fn default() -> Self {
-        Self { m_kib: 19 * 1024, t: 2, p: 1 }
+        Self {
+            m_kib: 19 * 1024,
+            t: 2,
+            p: 1,
+        }
     }
 }
 
@@ -80,10 +84,13 @@ pub enum AuthError {
 }
 
 fn derive(password: &[u8], salt: &[u8], cost: HashCost) -> Result<[u8; 32], AuthError> {
-    let params = Params::new(cost.m_kib, cost.t, cost.p, Some(32)).map_err(|e| AuthError::Hash(e.to_string()))?;
+    let params = Params::new(cost.m_kib, cost.t, cost.p, Some(32))
+        .map_err(|e| AuthError::Hash(e.to_string()))?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut out = [0u8; 32];
-    argon.hash_password_into(password, salt, &mut out).map_err(|e| AuthError::Hash(e.to_string()))?;
+    argon
+        .hash_password_into(password, salt, &mut out)
+        .map_err(|e| AuthError::Hash(e.to_string()))?;
     Ok(out)
 }
 
@@ -103,22 +110,33 @@ pub fn hash_password(password: &str, cost: HashCost) -> Result<String, AuthError
 
 fn decode_hash(stored: &str) -> Option<(HashCost, Vec<u8>, Vec<u8>)> {
     let parts: Vec<&str> = stored.split('$').collect();
-    let ["", scheme, version, m, t, p, salt, hash] = parts[..] else { return None };
+    let ["", scheme, version, m, t, p, salt, hash] = parts[..] else {
+        return None;
+    };
     if scheme != "fc-argon2id" || version != "v1" {
         return None;
     }
-    let (Ok(m), Ok(t), Ok(p)) = (m.parse::<u32>(), t.parse::<u32>(), p.parse::<u32>()) else { return None };
+    let (Ok(m), Ok(t), Ok(p)) = (m.parse::<u32>(), t.parse::<u32>(), p.parse::<u32>()) else {
+        return None;
+    };
     if !(1..=8).contains(&p) || !(1..=10).contains(&t) || !(8 * p..=1024 * 1024).contains(&m) {
         return None;
     }
-    let (Ok(salt), Ok(expected)) = (STANDARD_NO_PAD.decode(salt), STANDARD_NO_PAD.decode(hash)) else { return None };
-    if salt.len() != 16 || expected.len() != 32 { return None; }
+    let (Ok(salt), Ok(expected)) = (STANDARD_NO_PAD.decode(salt), STANDARD_NO_PAD.decode(hash))
+    else {
+        return None;
+    };
+    if salt.len() != 16 || expected.len() != 32 {
+        return None;
+    }
     Some((HashCost { m_kib: m, t, p }, salt, expected))
 }
 
 /// Check a password against a stored hash. Malformed hashes never match.
 pub fn verify_password(password: &str, stored: &str) -> bool {
-    let Some((cost, salt, expected)) = decode_hash(stored) else { return false; };
+    let Some((cost, salt, expected)) = decode_hash(stored) else {
+        return false;
+    };
     match derive(password.as_bytes(), &salt, cost) {
         Ok(got) => got.ct_eq(expected.as_slice()).into(),
         Err(_) => false,
@@ -157,8 +175,11 @@ struct AccountsFile {
 }
 
 fn valid_name(name: &str) -> bool {
-    !name.is_empty() && name.len() <= 64
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
 }
 
 impl UserStore {
@@ -171,27 +192,48 @@ impl UserStore {
         let accounts = if let Some(path) = &path {
             match std::fs::read(path) {
                 Ok(bytes) => {
-                    let file: AccountsFile = serde_json::from_slice(&bytes)
-                        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-                    if file.version != 1 || file.accounts.iter().any(|(name, account)| {
-                        !valid_name(name) || name != &account.name || decode_hash(&account.hash).is_none()
-                    }) {
-                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid saved account data").into());
+                    let file: AccountsFile = serde_json::from_slice(&bytes).map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                    })?;
+                    if file.version != 1
+                        || file.accounts.iter().any(|(name, account)| {
+                            !valid_name(name)
+                                || name != &account.name
+                                || decode_hash(&account.hash).is_none()
+                        })
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "invalid saved account data",
+                        )
+                        .into());
                     }
                     file.accounts
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
                 Err(error) => return Err(error.into()),
             }
-        } else { HashMap::new() };
-        Ok(Self { accounts: RwLock::new(accounts), cost, decoy, path })
+        } else {
+            HashMap::new()
+        };
+        Ok(Self {
+            accounts: RwLock::new(accounts),
+            cost,
+            decoy,
+            path,
+        })
     }
 
     fn save(&self, accounts: &HashMap<String, Account>) -> Result<(), AuthError> {
         if let Some(path) = &self.path {
-            if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
-            let bytes = serde_json::to_vec_pretty(&AccountsFile { version: 1, accounts: accounts.clone() })
-                .map_err(std::io::Error::other)?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let bytes = serde_json::to_vec_pretty(&AccountsFile {
+                version: 1,
+                accounts: accounts.clone(),
+            })
+            .map_err(std::io::Error::other)?;
             fc_remote::config::write_private(path, &bytes)?;
         }
         Ok(())
@@ -210,7 +252,14 @@ impl UserStore {
             return Err(AuthError::Exists);
         }
         let mut next = accounts.clone();
-        next.insert(name.to_string(), Account { name: name.to_string(), role, hash });
+        next.insert(
+            name.to_string(),
+            Account {
+                name: name.to_string(),
+                role,
+                hash,
+            },
+        );
         self.save(&next)?;
         *accounts = next;
         Ok(())
@@ -219,8 +268,16 @@ impl UserStore {
     /// Returns the account if `password` is correct. Always does one Argon2
     /// evaluation, so an unknown name costs the same as a wrong password.
     pub fn authenticate(&self, name: &str, password: &str) -> Option<Account> {
-        let account = self.accounts.read().unwrap_or_else(|e| e.into_inner()).get(name).cloned();
-        let stored = account.as_ref().map(|a| a.hash.as_str()).unwrap_or(&self.decoy);
+        let account = self
+            .accounts
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned();
+        let stored = account
+            .as_ref()
+            .map(|a| a.hash.as_str())
+            .unwrap_or(&self.decoy);
         let ok = verify_password(password, stored);
         account.filter(|_| ok)
     }
@@ -241,14 +298,19 @@ impl UserStore {
     pub fn remove(&self, name: &str) -> Result<bool, AuthError> {
         let mut accounts = self.accounts.write().unwrap_or_else(|e| e.into_inner());
         let mut next = accounts.clone();
-        if next.remove(name).is_none() { return Ok(false); }
+        if next.remove(name).is_none() {
+            return Ok(false);
+        }
         self.save(&next)?;
         *accounts = next;
         Ok(true)
     }
 
     pub fn len(&self) -> usize {
-        self.accounts.read().unwrap_or_else(|e| e.into_inner()).len()
+        self.accounts
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -269,7 +331,10 @@ pub struct SessionStore {
 
 impl SessionStore {
     pub fn new(ttl: Duration) -> Self {
-        Self { sessions: RwLock::new(HashMap::new()), ttl }
+        Self {
+            sessions: RwLock::new(HashMap::new()),
+            ttl,
+        }
     }
 
     pub fn ttl(&self) -> Duration {
@@ -282,7 +347,13 @@ impl SessionStore {
         let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         sessions.retain(|_, s| s.expires > now);
-        sessions.insert(sha256(&token), SessionEntry { principal, expires: now + self.ttl });
+        sessions.insert(
+            sha256(&token),
+            SessionEntry {
+                principal,
+                expires: now + self.ttl,
+            },
+        );
         URL_SAFE_NO_PAD.encode(token)
     }
 
@@ -296,12 +367,18 @@ impl SessionStore {
 
     /// End every session of `name` (used when an account is deleted).
     pub fn revoke_user(&self, name: &str) {
-        self.sessions.write().unwrap_or_else(|e| e.into_inner()).retain(|_, s| s.principal.name != name);
+        self.sessions
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, s| s.principal.name != name);
     }
 
     pub fn revoke(&self, token: &str) {
         if let Ok(raw) = URL_SAFE_NO_PAD.decode(token) {
-            self.sessions.write().unwrap_or_else(|e| e.into_inner()).remove(&sha256(&raw));
+            self.sessions
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&sha256(&raw));
         }
     }
 }
@@ -316,27 +393,43 @@ impl ApiKeys {
     /// Create a key for `principal`. The returned string is shown once.
     pub fn create(&self, principal: Principal) -> String {
         let key = URL_SAFE_NO_PAD.encode(random::<32>());
-        self.keys.write().unwrap_or_else(|e| e.into_inner()).insert(sha256(key.as_bytes()), principal);
+        self.keys
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(sha256(key.as_bytes()), principal);
         key
     }
 
     pub fn lookup(&self, key: &str) -> Option<Principal> {
-        self.keys.read().unwrap_or_else(|e| e.into_inner()).get(&sha256(key.as_bytes())).cloned()
+        self.keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&sha256(key.as_bytes()))
+            .cloned()
     }
 
     pub fn revoke(&self, key: &str) {
-        self.keys.write().unwrap_or_else(|e| e.into_inner()).remove(&sha256(key.as_bytes()));
+        self.keys
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&sha256(key.as_bytes()));
     }
 }
 
 /// Pull the session token out of a `Cookie` header.
 pub fn cookie_value<'a>(header: &'a str, name: &str) -> Option<&'a str> {
-    header.split(';').map(str::trim).find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+    header
+        .split(';')
+        .map(str::trim)
+        .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
 }
 
 /// `Set-Cookie` value for a new session.
 pub fn session_cookie(token: &str, max_age: Duration, secure: bool) -> String {
-    let mut c = format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}", max_age.as_secs());
+    let mut c = format!(
+        "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+        max_age.as_secs()
+    );
     if secure {
         c.push_str("; Secure");
     }
@@ -356,7 +449,11 @@ pub fn clear_session_cookie(secure: bool) -> String {
 mod tests {
     use super::*;
 
-    const CHEAP: HashCost = HashCost { m_kib: 256, t: 1, p: 1 };
+    const CHEAP: HashCost = HashCost {
+        m_kib: 256,
+        t: 1,
+        p: 1,
+    };
 
     #[test]
     fn account_hashes_and_deletions_persist_without_plaintext() {
@@ -402,12 +499,21 @@ mod tests {
 
     #[test]
     fn each_hash_gets_its_own_salt() {
-        assert_ne!(hash_password("same-password", CHEAP).unwrap(), hash_password("same-password", CHEAP).unwrap());
+        assert_ne!(
+            hash_password("same-password", CHEAP).unwrap(),
+            hash_password("same-password", CHEAP).unwrap()
+        );
     }
 
     #[test]
     fn malformed_stored_hashes_never_verify() {
-        for bad in ["", "plain", "$fc-argon2id$v1$x$1$1$a$b", "$other$v1$256$1$1$YQ$YQ", "$fc-argon2id$v2$256$1$1$YQ$YQ"] {
+        for bad in [
+            "",
+            "plain",
+            "$fc-argon2id$v1$x$1$1$a$b",
+            "$other$v1$256$1$1$YQ$YQ",
+            "$fc-argon2id$v2$256$1$1$YQ$YQ",
+        ] {
             assert!(!verify_password("anything", bad), "{bad}");
         }
     }
@@ -416,9 +522,21 @@ mod tests {
     fn users_are_validated_and_authenticated() {
         let users = UserStore::new(CHEAP).unwrap();
         users.add("alice", "password1", Role::Admin).unwrap();
-        assert_eq!(users.add("alice", "password2", Role::User).unwrap_err().to_string(), "account already exists");
-        assert!(matches!(users.add("../evil", "password1", Role::User), Err(AuthError::BadName)));
-        assert!(matches!(users.add("bob", "short", Role::User), Err(AuthError::WeakPassword)));
+        assert_eq!(
+            users
+                .add("alice", "password2", Role::User)
+                .unwrap_err()
+                .to_string(),
+            "account already exists"
+        );
+        assert!(matches!(
+            users.add("../evil", "password1", Role::User),
+            Err(AuthError::BadName)
+        ));
+        assert!(matches!(
+            users.add("bob", "short", Role::User),
+            Err(AuthError::WeakPassword)
+        ));
 
         let a = users.authenticate("alice", "password1").unwrap();
         assert_eq!(a.role, Role::Admin);
@@ -429,7 +547,10 @@ mod tests {
     #[test]
     fn sessions_resolve_until_revoked_or_expired() {
         let store = SessionStore::new(Duration::from_secs(60));
-        let p = Principal { name: "alice".into(), role: Role::Admin };
+        let p = Principal {
+            name: "alice".into(),
+            role: Role::Admin,
+        };
         let t = store.issue(p.clone());
         assert_eq!(store.lookup(&t), Some(p));
         assert_eq!(store.lookup("not-a-token"), None);
@@ -437,7 +558,10 @@ mod tests {
         assert_eq!(store.lookup(&t), None);
 
         let short = SessionStore::new(Duration::from_millis(1));
-        let t = short.issue(Principal { name: "bob".into(), role: Role::User });
+        let t = short.issue(Principal {
+            name: "bob".into(),
+            role: Role::User,
+        });
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(short.lookup(&t), None, "expired session");
     }
@@ -445,7 +569,10 @@ mod tests {
     #[test]
     fn api_keys_resolve_and_revoke() {
         let keys = ApiKeys::default();
-        let k = keys.create(Principal { name: "script".into(), role: Role::User });
+        let k = keys.create(Principal {
+            name: "script".into(),
+            role: Role::User,
+        });
         assert_eq!(keys.lookup(&k).unwrap().name, "script");
         keys.revoke(&k);
         assert!(keys.lookup(&k).is_none());
@@ -453,8 +580,15 @@ mod tests {
 
     #[test]
     fn cookie_parsing_and_attributes() {
-        assert_eq!(cookie_value("a=1; fc_session=tok; b=2", SESSION_COOKIE), Some("tok"));
-        assert_eq!(cookie_value("fc_session_x=tok", SESSION_COOKIE), None, "prefix must match a whole name");
+        assert_eq!(
+            cookie_value("a=1; fc_session=tok; b=2", SESSION_COOKIE),
+            Some("tok")
+        );
+        assert_eq!(
+            cookie_value("fc_session_x=tok", SESSION_COOKIE),
+            None,
+            "prefix must match a whole name"
+        );
         let c = session_cookie("tok", Duration::from_secs(3600), true);
         assert!(c.contains("HttpOnly") && c.contains("SameSite=Strict") && c.contains("Secure"));
     }

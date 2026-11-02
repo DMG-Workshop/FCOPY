@@ -12,11 +12,12 @@
 //! frames at 10 Hz and fans them out, so cost doesn't grow with browser count.
 
 pub mod api;
-pub mod clients;
-pub mod https;
-pub mod history;
-pub mod recovery;
 pub mod auth;
+pub mod clients;
+pub mod history;
+pub mod https;
+pub mod recovery;
+pub mod storage;
 pub mod telemetry;
 
 use std::collections::HashMap;
@@ -24,6 +25,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use axum::Json;
 use axum::Router;
 use axum::extract::FromRequestParts;
 use axum::http::header::{AUTHORIZATION, COOKIE};
@@ -31,15 +33,14 @@ use axum::http::request::Parts;
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
-use axum::Json;
 use tokio::sync::broadcast;
 
 use fc_engine::{Event, JobId, Queue};
 use fc_remote::access::LoginLimiter;
-use fc_torrent::TorrentEngine;
 use fc_remote::config::Limits;
+use fc_torrent::TorrentEngine;
 
-use auth::{ApiKeys, AuthError, HashCost, Principal, SessionStore, UserStore, SESSION_COOKIE};
+use auth::{ApiKeys, AuthError, HashCost, Principal, SESSION_COOKIE, SessionStore, UserStore};
 
 /// Header a browser session must send on every state-changing request. A cross-site
 /// page cannot set it without a CORS preflight, which this server never grants.
@@ -110,7 +111,11 @@ pub enum BuildError {
 
 /// Create the shared state and start the telemetry producer. Must be called
 /// inside a Tokio runtime. Add accounts with `state.users.add(..)` afterwards.
-pub fn build(queue: Queue, events: std::sync::mpsc::Receiver<Event>, config: Config) -> Result<Arc<AppState>, BuildError> {
+pub fn build(
+    queue: Queue,
+    events: std::sync::mpsc::Receiver<Event>,
+    config: Config,
+) -> Result<Arc<AppState>, BuildError> {
     let roots = config
         .roots
         .iter()
@@ -119,16 +124,29 @@ pub fn build(queue: Queue, events: std::sync::mpsc::Receiver<Event>, config: Con
     let (telemetry, _) = broadcast::channel(64);
     let state = Arc::new(AppState {
         queue,
-        users: UserStore::open(config.hash_cost, config.state_dir.as_ref().map(|dir| dir.join("users.json")))?,
+        users: UserStore::open(
+            config.hash_cost,
+            config.state_dir.as_ref().map(|dir| dir.join("users.json")),
+        )?,
         sessions: SessionStore::new(config.session_ttl),
         api_keys: ApiKeys::default(),
         limiter: LoginLimiter::new(Limits::default()),
         roots,
         owners: RwLock::new(HashMap::new()),
         telemetry,
-        clients: clients::ClientStore::open(config.state_dir.as_ref().map(|d| d.join("clients.json")))?,
-        history: Arc::new(history::History::open(config.state_dir.as_ref().map(|d| d.join("transfer-history.toml")))?),
-        recovery: Arc::new(recovery::Recovery::open(config.state_dir.map(|d| d.join("unfinished-jobs.toml"))).map_err(BuildError::Recovery)?),
+        clients: clients::ClientStore::open(
+            config.state_dir.as_ref().map(|d| d.join("clients.json")),
+        )?,
+        history: Arc::new(history::History::open(
+            config
+                .state_dir
+                .as_ref()
+                .map(|d| d.join("transfer-history.toml")),
+        )?),
+        recovery: Arc::new(
+            recovery::Recovery::open(config.state_dir.map(|d| d.join("unfinished-jobs.toml")))
+                .map_err(BuildError::Recovery)?,
+        ),
         cookie_secure: config.cookie_secure,
         certificate_fingerprint: config.certificate_fingerprint,
         torrents: config.torrents,
@@ -167,16 +185,34 @@ async fn asset(content_type: &'static str, body: &'static str) -> Response {
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(|| asset("text/html; charset=utf-8", INDEX_HTML)))
-        .route("/static/app.js", get(|| asset("text/javascript; charset=utf-8", APP_JS)))
-        .route("/static/app.css", get(|| asset("text/css; charset=utf-8", APP_CSS)))
-        .route("/static/console.css", get(|| asset("text/css; charset=utf-8", CONSOLE_CSS)))
-        .route("/static/appearance.js", get(|| asset("text/javascript; charset=utf-8", APPEARANCE_JS)))
-        .route("/static/alpine.min.js", get(|| asset("text/javascript; charset=utf-8", ALPINE_JS)))
+        .route(
+            "/static/app.js",
+            get(|| asset("text/javascript; charset=utf-8", APP_JS)),
+        )
+        .route(
+            "/static/app.css",
+            get(|| asset("text/css; charset=utf-8", APP_CSS)),
+        )
+        .route(
+            "/static/console.css",
+            get(|| asset("text/css; charset=utf-8", CONSOLE_CSS)),
+        )
+        .route(
+            "/static/appearance.js",
+            get(|| asset("text/javascript; charset=utf-8", APPEARANCE_JS)),
+        )
+        .route(
+            "/static/alpine.min.js",
+            get(|| asset("text/javascript; charset=utf-8", ALPINE_JS)),
+        )
         .route("/api/auth/login", post(api::login))
         .route("/api/auth/logout", post(api::logout))
         .route("/api/info", get(api::info))
         .route("/api/me", get(api::me))
-        .route("/api/transfers", get(api::list_transfers).post(api::create_transfer))
+        .route(
+            "/api/transfers",
+            get(api::list_transfers).post(api::create_transfer),
+        )
         .route("/api/history", get(history::list).delete(history::clear))
         .route("/api/recovery", get(recovery::list))
         .route("/api/recovery/{id}", post(recovery::act))
@@ -187,10 +223,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/queue", get(api::queue_state))
         .route("/api/queue/pause", post(api::pause_queue))
         .route("/api/queue/resume", post(api::resume_queue))
-        .route("/api/clients", get(api::list_clients).post(api::pair_client))
+        .route(
+            "/api/clients",
+            get(api::list_clients).post(api::pair_client),
+        )
         .route("/api/clients/{id}", delete(api::unpair_client))
         .route("/api/clients/{id}/browse", post(api::browse_client))
-        .route("/api/settings", get(api::get_settings).put(api::put_settings))
+        .route(
+            "/api/settings",
+            get(api::get_settings).put(api::put_settings),
+        )
         .route("/api/settings/vpn", get(api::vpn_providers))
         .route("/api/users", get(api::list_users).post(api::create_user))
         .route("/api/users/{name}", delete(api::delete_user))
@@ -198,11 +240,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/torrents/magnet", post(api::add_magnet))
         .route(
             "/api/torrents/file",
-            post(api::add_torrent_file).layer(axum::extract::DefaultBodyLimit::max(api::MAX_TORRENT_FILE)),
+            post(api::add_torrent_file)
+                .layer(axum::extract::DefaultBodyLimit::max(api::MAX_TORRENT_FILE)),
         )
         .route("/api/torrents/{id}", delete(api::remove_torrent))
         .route("/api/torrents/{id}/pause", post(api::pause_torrent))
         .route("/api/torrents/{id}/resume", post(api::resume_torrent))
+        .route("/api/storage/disks", get(storage::list_disks))
+        .route("/api/storage/health", get(storage::health))
         .route("/ws/telemetry", get(telemetry::ws_handler))
         .with_state(state)
 }
@@ -212,14 +257,20 @@ pub fn router(state: Arc<AppState>) -> Router {
 impl FromRequestParts<Arc<AppState>> for Principal {
     type Rejection = ApiError;
 
-    async fn from_request_parts(parts: &mut Parts, state: &Arc<AppState>) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
         if let Some(key) = parts
             .headers
             .get(AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
         {
-            return state.api_keys.lookup(key.trim()).ok_or(ApiError::Unauthorized);
+            return state
+                .api_keys
+                .lookup(key.trim())
+                .ok_or(ApiError::Unauthorized);
         }
 
         let token = parts
@@ -245,6 +296,8 @@ pub enum ApiError {
     BadRequest(String),
     Conflict(String),
     Internal(String),
+    /// The feature is not built into this platform's binary.
+    NotAvailable(String),
     LockedOut(Duration),
     /// A call to a paired agent failed; the status says whether it was refused or unreachable.
     Remote(StatusCode, String),
@@ -259,10 +312,14 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m.clone()),
+            ApiError::NotAvailable(m) => (StatusCode::NOT_IMPLEMENTED, m.clone()),
             ApiError::Remote(status, m) => (*status, m.clone()),
             ApiError::LockedOut(wait) => (
                 StatusCode::TOO_MANY_REQUESTS,
-                format!("too many failed sign-ins; try again in {} s", wait.as_secs().max(1)),
+                format!(
+                    "too many failed sign-ins; try again in {} s",
+                    wait.as_secs().max(1)
+                ),
             ),
         };
         (status, Json(serde_json::json!({ "error": message }))).into_response()
@@ -276,8 +333,14 @@ pub fn within_roots(roots: &[PathBuf], path: &Path) -> bool {
     if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
         return false;
     }
-    let base = if path.exists() { Some(path) } else { path.parent() };
-    let Some(real) = base.and_then(|b| b.canonicalize().ok()) else { return false };
+    let base = if path.exists() {
+        Some(path)
+    } else {
+        path.parent()
+    };
+    let Some(real) = base.and_then(|b| b.canonicalize().ok()) else {
+        return false;
+    };
     roots.iter().any(|root| real.starts_with(root))
 }
 
@@ -286,7 +349,11 @@ pub fn within_roots(roots: &[PathBuf], path: &Path) -> bool {
 /// Set `Config::cookie_secure` to true when calling this, so the session
 /// cookie is only sent over TLS.
 pub async fn serve(state: Arc<AppState>, listener: https::TlsListener) -> std::io::Result<()> {
-    axum::serve(listener, router(state).into_make_service_with_connect_info::<https::PeerAddr>()).await
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<https::PeerAddr>(),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -304,9 +371,15 @@ mod tests {
 
         assert!(within_roots(&roots, &inside));
         assert!(within_roots(&roots, &inside.join("f.txt")));
-        assert!(within_roots(&roots, &inside.join("not-yet-created")), "new name under a real dir");
+        assert!(
+            within_roots(&roots, &inside.join("not-yet-created")),
+            "new name under a real dir"
+        );
         assert!(!within_roots(&roots, outside.path()));
-        assert!(!within_roots(&roots, &root.path().join("..").join("x")), "parent traversal");
+        assert!(
+            !within_roots(&roots, &root.path().join("..").join("x")),
+            "parent traversal"
+        );
         assert!(!within_roots(&roots, Path::new("relative/path")));
     }
 

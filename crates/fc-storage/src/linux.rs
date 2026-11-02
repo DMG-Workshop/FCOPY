@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::devname::parent_disk;
 use crate::health::{Health, HealthSource};
@@ -170,6 +171,31 @@ pub fn system_set(
     Some(set)
 }
 
+/// Reads SMART data by running `<program> --json -a <device>` with an argument list.
+/// It is a read-only query. A missing tool, hidden SMART data or unreadable output
+/// all come back as unavailable, never as a zero reading.
+pub fn read_smart(program: &str, device: &Path) -> Health {
+    let unavailable = Health {
+        source: HealthSource::Unavailable,
+        passed: None,
+        temperature_c: None,
+        power_on_hours: None,
+        reallocated_sectors: None,
+        percent_used: None,
+    };
+    let Ok(out) = Command::new(program)
+        .arg("--json")
+        .arg("-a")
+        .arg(device)
+        .output()
+    else {
+        return unavailable;
+    };
+    // smartctl sets exit-status bits for warnings and still prints its JSON, so the
+    // output is parsed whatever the status.
+    crate::health::parse_smartctl(&String::from_utf8_lossy(&out.stdout)).unwrap_or(unavailable)
+}
+
 fn read_trim(path: PathBuf) -> Option<String> {
     fs::read_to_string(path)
         .ok()
@@ -207,6 +233,11 @@ impl LinuxSysfs {
             root: root.to_path_buf(),
             exe: None,
         }
+    }
+
+    /// The directory that holds `sys/` and `proc/`. It is `/` in production.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     fn mounts(&self) -> Result<Vec<MountEntry>, OsError> {
@@ -295,24 +326,41 @@ impl Platform for LinuxSysfs {
         system_set(&disks, &mounts, &swaps, exe_mount.as_deref())
     }
 
-    fn health(&self, _disk: &Disk) -> Result<Health, OsError> {
-        // SMART is not read yet. The smartctl integration comes in a later step.
-        Ok(Health {
-            source: HealthSource::Unavailable,
-            passed: None,
-            temperature_c: None,
-            power_on_hours: None,
-            reallocated_sectors: None,
-            percent_used: None,
-        })
+    fn health(&self, disk: &Disk) -> Result<Health, OsError> {
+        Ok(read_smart("smartctl", Path::new(&disk.os_path)))
     }
 
+    #[cfg(all(feature = "storage-destructive", target_os = "linux"))]
+    fn open_exclusive(&self, disk: &Disk) -> Result<Box<dyn ExclusiveDisk>, OsError> {
+        use crate::linux_block::{BlockDevice, LinuxExclusive, map_open_error};
+        let dev = BlockDevice::open(Path::new(&disk.os_path)).map_err(map_open_error)?;
+        Ok(Box::new(LinuxExclusive::new(
+            dev,
+            self.clone(),
+            disk.os_path.clone(),
+        )))
+    }
+
+    #[cfg(not(all(feature = "storage-destructive", target_os = "linux")))]
     fn open_exclusive(&self, _disk: &Disk) -> Result<Box<dyn ExclusiveDisk>, OsError> {
         Err(OsError::Unsupported(
-            "writing to block devices is not part of the read-only adapter",
+            "writing to block devices needs the storage-destructive feature",
         ))
     }
 
+    #[cfg(all(feature = "storage-destructive", target_os = "linux"))]
+    fn format_partition(
+        &self,
+        part: &PartitionRef,
+        fs: FsKind,
+        label: &str,
+    ) -> Result<(), OsError> {
+        use crate::linux_block::run_tool;
+        use crate::linux_tools::mkfs;
+        run_tool(&mkfs(fs, label, &part.os_path))
+    }
+
+    #[cfg(not(all(feature = "storage-destructive", target_os = "linux")))]
     fn format_partition(
         &self,
         _part: &PartitionRef,
@@ -320,7 +368,7 @@ impl Platform for LinuxSysfs {
         _label: &str,
     ) -> Result<(), OsError> {
         Err(OsError::Unsupported(
-            "formatting is not part of the read-only adapter",
+            "formatting needs the storage-destructive feature",
         ))
     }
 }
@@ -360,6 +408,34 @@ mod tests {
         assert_eq!(source_disk_name("/dev/dm-0"), None);
         assert_eq!(source_disk_name("tmpfs"), None);
         assert_eq!(source_disk_name("overlay"), None);
+    }
+
+    #[test]
+    fn a_missing_smart_tool_is_unavailable_not_zero() {
+        let h = read_smart("fcopy-no-such-smart-tool", Path::new("/dev/null"));
+        assert_eq!(h.source, HealthSource::Unavailable);
+        assert_eq!(h.passed, None);
+        assert_eq!(h.temperature_c, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_smart_report_from_the_tool_is_used() {
+        use std::os::unix::fs::PermissionsExt;
+        // A stand-in for smartctl that prints a healthy report, to check the wiring.
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("smartctl-stub");
+        std::fs::write(
+            &tool,
+            "#!/bin/sh\necho '{\"smart_status\":{\"passed\":true},\"temperature\":{\"current\":31}}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let h = read_smart(tool.to_str().unwrap(), Path::new("/dev/null"));
+        assert_eq!(h.source, HealthSource::Smartctl);
+        assert_eq!(h.passed, Some(true));
+        assert_eq!(h.temperature_c, Some(31));
     }
 
     #[test]
@@ -632,6 +708,10 @@ mod tests {
             assert_eq!(v, Verdict::ReadOnly(Refusal::NoSerial));
         }
 
+        // Only in the default build. With the feature on, these methods act on the
+        // device path in the fixture, which is the host's real /dev/sdb. A test must
+        // never reach that path.
+        #[cfg(not(feature = "storage-destructive"))]
         #[test]
         fn destructive_methods_refuse_in_this_adapter() {
             let t = tree();

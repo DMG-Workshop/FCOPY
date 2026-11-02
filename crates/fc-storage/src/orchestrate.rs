@@ -59,10 +59,11 @@ pub enum Outcome {
     Failed(String),
 }
 
-/// Receives a durable record of each operation. Implementations flush before
-/// returning from `begin`, because the first write follows it.
+/// Receives a durable record of each operation. `begin` must not return `Ok` until
+/// the record is on stable storage, because the first write follows it. An `Err`
+/// from `begin` stops the operation before anything is written.
 pub trait Audit {
-    fn begin(&mut self, request: &Request);
+    fn begin(&mut self, request: &Request) -> Result<(), String>;
     fn progress(&mut self, progress: &Progress);
     fn end(&mut self, outcome: &Outcome);
 }
@@ -83,6 +84,8 @@ pub enum StorageError {
     Os(#[from] OsError),
     #[error(transparent)]
     Wipe(#[from] WipeError),
+    #[error("the audit record could not be written, so nothing was changed: {0}")]
+    Audit(String),
 }
 
 /// Runs a confirmed request. `seed` comes from the caller, so tests are reproducible.
@@ -93,7 +96,9 @@ pub fn execute(
     cancel: &AtomicBool,
     audit: &mut dyn Audit,
 ) -> Result<(), StorageError> {
-    audit.begin(request);
+    if let Err(e) = audit.begin(request) {
+        return Err(StorageError::Audit(e));
+    }
     let result = run(platform, request, seed, cancel, audit);
     let outcome = match &result {
         Ok(()) => Outcome::Completed,
@@ -211,8 +216,9 @@ mod tests {
     }
 
     impl Audit for Recorder {
-        fn begin(&mut self, _: &Request) {
+        fn begin(&mut self, _: &Request) -> Result<(), String> {
             self.begun += 1;
+            Ok(())
         }
         fn progress(&mut self, _: &Progress) {
             self.progress += 1;

@@ -12,6 +12,7 @@ ctrlc = "3.5.2"
 fc-remote = { path = "../fc-remote" }
 rpassword = "7"
 fc-engine = { path = "../fc-engine" }
+fc-storage = { path = "../fc-storage" }
 
 [[bin]]
 name = "fcopy"

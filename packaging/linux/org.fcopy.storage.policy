@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  Authorizes the storage worker to erase, partition and format a disk.
+  Each operation asks for administrator authentication (auth_admin, not
+  auth_admin_keep), so nothing stays unlocked between operations.
+  The exec.path annotation ties the authorization to this one binary.
+-->
+<policyconfig>
+  <action id="org.fcopy.storage.destroy">
+    <description>Erase, partition and format a disk</description>
+    <message>Authentication is required to erase, partition or format this disk</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/fcopy/fcopy-storage-worker</annotate>
+  </action>
+</policyconfig>

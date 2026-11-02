@@ -141,15 +141,19 @@ impl JobDto {
             percent: t.map_or(0.0, |t| t.fraction * 100.0),
             rate_bps: t.map_or(0.0, |t| t.rate_bps),
             eta_secs: t.and_then(|t| t.eta).map(|d| d.as_secs_f64()),
-            current_file: t.and_then(|t| t.current_file.as_ref()).map(|p| p.display().to_string()),
+            current_file: t
+                .and_then(|t| t.current_file.as_ref())
+                .map(|p| p.display().to_string()),
             files_total: info.files_total,
             files_done: info.files_copied,
             files_failed: info.files_failed,
             bytes_total: info.bytes_total,
             bytes_copied: info.bytes_copied,
             conflict: info.conflict.as_ref().map(|c| ConflictDto {
-                id: c.id, source: c.details.source.display().to_string(),
-                destination: c.details.destination.display().to_string(), different: c.details.different,
+                id: c.id,
+                source: c.details.source.display().to_string(),
+                destination: c.details.destination.display().to_string(),
+                different: c.details.different,
             }),
         }
     }
@@ -188,7 +192,9 @@ pub fn spawn_producer(state: Arc<AppState>, events: std::sync::mpsc::Receiver<Ev
         .spawn(move || {
             while let Ok(ev) = events.recv() {
                 history.observe(&ev);
-                if let Some(state) = reader_state.upgrade() { state.recovery.observe(&ev, state.queue.is_shutting_down()); }
+                if let Some(state) = reader_state.upgrade() {
+                    state.recovery.observe(&ev, state.queue.is_shutting_down());
+                }
                 if tx.send(ev).is_err() {
                     break;
                 }
@@ -208,7 +214,9 @@ pub fn spawn_producer(state: Arc<AppState>, events: std::sync::mpsc::Receiver<Ev
                 ev = rx.recv() => Some(ev),
                 _ = tick.tick() => None,
             };
-            let Some(state) = weak_state.upgrade() else { break; };
+            let Some(state) = weak_state.upgrade() else {
+                break;
+            };
             match event {
                 Some(ev) => match ev {
                     Some(ev) => {
@@ -217,22 +225,39 @@ pub fn spawn_producer(state: Arc<AppState>, events: std::sync::mpsc::Receiver<Ev
                                 logs.push(LogLine { job: *job, kind: "history_error", message: format!("Transfer history was not saved: {error}. Open History and Refresh to retry.") });
                             }
                             if let Some(error) = state.recovery.error() {
-                                logs.push(LogLine { job: *job, kind: "recovery_error", message: error });
+                                logs.push(LogLine {
+                                    job: *job,
+                                    kind: "recovery_error",
+                                    message: error,
+                                });
                             }
                         }
                         collect(ev, &mut dirty, &mut removed, &mut logs);
-                    },
+                    }
                     None => break,
                 },
                 None => {
-                    let torrents = state.torrents.as_ref().map(torrent_rows).filter(|now| last_torrents.as_ref() != Some(now));
+                    let torrents = state
+                        .torrents
+                        .as_ref()
+                        .map(torrent_rows)
+                        .filter(|now| last_torrents.as_ref() != Some(now));
                     if torrents.is_some() {
                         last_torrents = torrents.clone();
                     }
-                    if dirty.is_empty() && removed.is_empty() && logs.is_empty() && torrents.is_none() {
+                    if dirty.is_empty()
+                        && removed.is_empty()
+                        && logs.is_empty()
+                        && torrents.is_none()
+                    {
                         continue;
                     }
-                    let mut frame = build_frame(&state, &dirty, std::mem::take(&mut removed), std::mem::take(&mut logs));
+                    let mut frame = build_frame(
+                        &state,
+                        &dirty,
+                        std::mem::take(&mut removed),
+                        std::mem::take(&mut logs),
+                    );
                     frame.torrents = torrents;
                     dirty.clear();
                     // No subscribers is fine: nobody is watching.
@@ -244,7 +269,12 @@ pub fn spawn_producer(state: Arc<AppState>, events: std::sync::mpsc::Receiver<Ev
 }
 
 /// Fold one queue event into the pending tick.
-fn collect(ev: Event, dirty: &mut BTreeSet<JobId>, removed: &mut Vec<JobId>, logs: &mut Vec<LogLine>) {
+fn collect(
+    ev: Event,
+    dirty: &mut BTreeSet<JobId>,
+    removed: &mut Vec<JobId>,
+    logs: &mut Vec<LogLine>,
+) {
     match ev {
         Event::Queued { job, .. }
         | Event::Conflict { job }
@@ -257,16 +287,28 @@ fn collect(ev: Event, dirty: &mut BTreeSet<JobId>, removed: &mut Vec<JobId>, log
         }
         Event::FileSkipped { job, src, reason } => {
             dirty.insert(job);
-            logs.push(LogLine { job, kind: "skipped", message: format!("{}: {reason}", src.display()) });
+            logs.push(LogLine {
+                job,
+                kind: "skipped",
+                message: format!("{}: {reason}", src.display()),
+            });
         }
         Event::FileFailed { job, src, reason } => {
             dirty.insert(job);
-            logs.push(LogLine { job, kind: "failed", message: format!("{}: {reason}", src.display()) });
+            logs.push(LogLine {
+                job,
+                kind: "failed",
+                message: format!("{}: {reason}", src.display()),
+            });
         }
         Event::Finished { job, state, .. } => {
             dirty.insert(job);
             if let JobState::Failed(msg) = state {
-                logs.push(LogLine { job, kind: "job_failed", message: msg });
+                logs.push(LogLine {
+                    job,
+                    kind: "job_failed",
+                    message: msg,
+                });
             }
         }
         Event::Removed { job } => {
@@ -275,11 +317,20 @@ fn collect(ev: Event, dirty: &mut BTreeSet<JobId>, removed: &mut Vec<JobId>, log
         }
         // A `Decision` is dropped here: the web policy is automatic, so the
         // queue never asks, and dropping a request counts as Skip.
-        Event::Decision(_) | Event::Paused | Event::Resumed | Event::SpeedLimit(_) | Event::Idle => {}
+        Event::Decision(_)
+        | Event::Paused
+        | Event::Resumed
+        | Event::SpeedLimit(_)
+        | Event::Idle => {}
     }
 }
 
-fn build_frame(state: &AppState, dirty: &BTreeSet<JobId>, removed: Vec<JobId>, logs: Vec<LogLine>) -> Frame {
+fn build_frame(
+    state: &AppState,
+    dirty: &BTreeSet<JobId>,
+    removed: Vec<JobId>,
+    logs: Vec<LogLine>,
+) -> Frame {
     let owners = state.owners.read().unwrap_or_else(|e| e.into_inner());
     let jobs = dirty
         .iter()
@@ -289,7 +340,12 @@ fn build_frame(state: &AppState, dirty: &BTreeSet<JobId>, removed: Vec<JobId>, l
             JobDto::from_info(&info, owner)
         })
         .collect();
-    Frame { jobs, removed, logs, torrents: None }
+    Frame {
+        jobs,
+        removed,
+        logs,
+        torrents: None,
+    }
 }
 
 /// What one user may see of a frame. Returns `None` if nothing is left.
@@ -297,15 +353,30 @@ pub fn visible(frame: &Frame, who: &Principal, owners: &BTreeMap<JobId, String>)
     let mine = |job: JobId| who.is_admin() || owners.get(&job).is_some_and(|o| *o == who.name);
     let jobs: Vec<JobDto> = frame.jobs.iter().filter(|j| mine(j.id)).cloned().collect();
     let logs: Vec<LogLine> = frame.logs.iter().filter(|l| mine(l.job)).cloned().collect();
-    let torrents = if who.is_admin() { frame.torrents.clone() } else { None };
+    let torrents = if who.is_admin() {
+        frame.torrents.clone()
+    } else {
+        None
+    };
     if jobs.is_empty() && logs.is_empty() && frame.removed.is_empty() && torrents.is_none() {
         return None;
     }
-    Some(Frame { jobs, removed: frame.removed.clone(), logs, torrents })
+    Some(Frame {
+        jobs,
+        removed: frame.removed.clone(),
+        logs,
+        torrents,
+    })
 }
 
 fn owners_snapshot(state: &AppState) -> BTreeMap<JobId, String> {
-    state.owners.read().unwrap_or_else(|e| e.into_inner()).iter().map(|(k, v)| (*k, v.clone())).collect()
+    state
+        .owners
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(k, v)| (*k, v.clone()))
+        .collect()
 }
 
 /// Full state for one user, used to resync a socket that fell behind.
@@ -318,15 +389,34 @@ fn full_snapshot(state: &AppState, who: &Principal) -> Frame {
         .map(|info| JobDto::from_info(info, owners.get(&info.id).map(String::as_str)))
         .collect();
     let torrents = state.torrents.as_ref().map(torrent_rows);
-    visible(&Frame { jobs, removed: vec![], logs: vec![], torrents }, who, &owners).unwrap_or_default()
+    visible(
+        &Frame {
+            jobs,
+            removed: vec![],
+            logs: vec![],
+            torrents,
+        },
+        who,
+        &owners,
+    )
+    .unwrap_or_default()
 }
 
-pub async fn ws_handler(State(state): State<Arc<AppState>>, who: Principal, ws: WebSocketUpgrade) -> Response {
+pub async fn ws_handler(
+    State(state): State<Arc<AppState>>,
+    who: Principal,
+    ws: WebSocketUpgrade,
+) -> Response {
     let rx = state.telemetry.subscribe();
     ws.on_upgrade(move |socket| stream(socket, rx, who, state))
 }
 
-async fn stream(mut socket: WebSocket, mut rx: broadcast::Receiver<Arc<Frame>>, who: Principal, state: Arc<AppState>) {
+async fn stream(
+    mut socket: WebSocket,
+    mut rx: broadcast::Receiver<Arc<Frame>>,
+    who: Principal,
+    state: Arc<AppState>,
+) {
     // Start with the current state so a new page is not blank until the next change.
     let first = serde_json::to_string(&full_snapshot(&state, &who)).unwrap_or_default();
     if socket.send(Message::Text(first.into())).await.is_err() {
@@ -385,36 +475,73 @@ mod tests {
             jobs: vec![dto(1, "alice"), dto(2, "bob")],
             removed: vec![],
             logs: vec![
-                LogLine { job: 1, kind: "failed", message: "a".into() },
-                LogLine { job: 2, kind: "failed", message: "b".into() },
+                LogLine {
+                    job: 1,
+                    kind: "failed",
+                    message: "a".into(),
+                },
+                LogLine {
+                    job: 2,
+                    kind: "failed",
+                    message: "b".into(),
+                },
             ],
             torrents: None,
         };
-        let bob = Principal { name: "bob".into(), role: crate::auth::Role::User };
+        let bob = Principal {
+            name: "bob".into(),
+            role: crate::auth::Role::User,
+        };
         let f = visible(&frame, &bob, &owners).unwrap();
         assert_eq!(f.jobs.iter().map(|j| j.id).collect::<Vec<_>>(), vec![2]);
         assert_eq!(f.logs.iter().map(|l| l.job).collect::<Vec<_>>(), vec![2]);
 
-        let admin = Principal { name: "root".into(), role: crate::auth::Role::Admin };
+        let admin = Principal {
+            name: "root".into(),
+            role: crate::auth::Role::Admin,
+        };
         assert_eq!(visible(&frame, &admin, &owners).unwrap().jobs.len(), 2);
     }
 
     #[test]
     fn empty_frames_are_dropped_for_a_user_with_nothing_to_see() {
         let owners: BTreeMap<JobId, String> = [(1, "alice".into())].into();
-        let frame = Frame { jobs: vec![dto(1, "alice")], removed: vec![], logs: vec![], torrents: None };
-        let eve = Principal { name: "eve".into(), role: crate::auth::Role::User };
+        let frame = Frame {
+            jobs: vec![dto(1, "alice")],
+            removed: vec![],
+            logs: vec![],
+            torrents: None,
+        };
+        let eve = Principal {
+            name: "eve".into(),
+            role: crate::auth::Role::User,
+        };
         assert!(visible(&frame, &eve, &owners).is_none());
     }
 
     #[test]
     fn torrents_reach_administrators_only() {
         let owners = BTreeMap::new();
-        let frame = Frame { torrents: Some(vec![]), ..Default::default() };
-        let bob = Principal { name: "bob".into(), role: crate::auth::Role::User };
-        assert!(visible(&frame, &bob, &owners).is_none(), "a torrent-only frame is nothing to a user");
-        let admin = Principal { name: "root".into(), role: crate::auth::Role::Admin };
-        assert_eq!(visible(&frame, &admin, &owners).unwrap().torrents, Some(vec![]));
+        let frame = Frame {
+            torrents: Some(vec![]),
+            ..Default::default()
+        };
+        let bob = Principal {
+            name: "bob".into(),
+            role: crate::auth::Role::User,
+        };
+        assert!(
+            visible(&frame, &bob, &owners).is_none(),
+            "a torrent-only frame is nothing to a user"
+        );
+        let admin = Principal {
+            name: "root".into(),
+            role: crate::auth::Role::Admin,
+        };
+        assert_eq!(
+            visible(&frame, &admin, &owners).unwrap().torrents,
+            Some(vec![])
+        );
     }
 
     #[test]
@@ -452,10 +579,27 @@ mod tests {
         let mut removed = Vec::new();
         let mut logs = Vec::new();
         for _ in 0..50 {
-            collect(Event::Progress { job: 3, telemetry: dummy_snapshot() }, &mut dirty, &mut removed, &mut logs);
+            collect(
+                Event::Progress {
+                    job: 3,
+                    telemetry: dummy_snapshot(),
+                },
+                &mut dirty,
+                &mut removed,
+                &mut logs,
+            );
         }
-        assert_eq!(dirty.len(), 1, "many progress events for one job collapse to one entry");
-        collect(Event::Removed { job: 3 }, &mut dirty, &mut removed, &mut logs);
+        assert_eq!(
+            dirty.len(),
+            1,
+            "many progress events for one job collapse to one entry"
+        );
+        collect(
+            Event::Removed { job: 3 },
+            &mut dirty,
+            &mut removed,
+            &mut logs,
+        );
         assert!(dirty.is_empty());
         assert_eq!(removed, vec![3]);
     }
