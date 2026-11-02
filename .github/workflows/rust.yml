@@ -38,7 +38,12 @@ jobs:
     - name: Unit tests with the destructive feature
       run: cargo test -p fc-storage --features storage-destructive --lib
     - name: Loop-device tests (root)
-      # sudo strips most of the environment, so the toolchain location is passed through.
-      run: >
-        sudo env "PATH=$PATH" "RUSTUP_HOME=$RUSTUP_HOME" "CARGO_HOME=$CARGO_HOME" FCOPY_LOOP_TESTS=1
-        cargo test -p fc-storage --features storage-destructive --test loop_device --test worker_loop -- --test-threads=1
+      # The test binaries are built as the normal user, so the toolchain is found as usual.
+      # Only the compiled binaries run under sudo, which needs no Rust toolchain.
+      run: |
+        for t in loop_device worker_loop; do
+          exe=$(cargo test -p fc-storage --features storage-destructive --test "$t" --no-run --message-format=json \
+            | jq -r 'select(.profile.test == true and .executable != null) | .executable' | tail -1)
+          echo "running $t: $exe"
+          sudo env "PATH=$PATH" FCOPY_LOOP_TESTS=1 "$exe" --test-threads=1
+        done
