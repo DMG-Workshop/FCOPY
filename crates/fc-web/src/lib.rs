@@ -296,6 +296,8 @@ pub enum ApiError {
     BadRequest(String),
     Conflict(String),
     Internal(String),
+    /// The feature is not built into this platform's binary.
+    NotAvailable(String),
     LockedOut(Duration),
     /// A call to a paired agent failed; the status says whether it was refused or unreachable.
     Remote(StatusCode, String),
@@ -310,6 +312,7 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m.clone()),
+            ApiError::NotAvailable(m) => (StatusCode::NOT_IMPLEMENTED, m.clone()),
             ApiError::Remote(status, m) => (*status, m.clone()),
             ApiError::LockedOut(wait) => (
                 StatusCode::TOO_MANY_REQUESTS,

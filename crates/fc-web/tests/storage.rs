@@ -123,6 +123,9 @@ async fn storage_routes_refuse_anonymous_and_non_admin_callers() {
     assert_eq!(r.status, StatusCode::FORBIDDEN);
 }
 
+// Disk inspection reads Linux sysfs, so these two run on Linux only. Elsewhere the
+// routes answer 501 (see the test below).
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_administrator_sees_disks_without_serial_numbers() {
     let e = env().await;
@@ -137,6 +140,7 @@ async fn an_administrator_sees_disks_without_serial_numbers() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn health_is_refused_for_a_path_that_is_not_a_listed_disk() {
     let e = env().await;
@@ -146,4 +150,14 @@ async fn health_is_refused_for_a_path_that_is_not_a_listed_disk() {
         let r = get(&e, &uri, Some(&admin)).await;
         assert_eq!(r.status, StatusCode::NOT_FOUND, "device {device}");
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn disk_inspection_says_it_is_unavailable_outside_linux() {
+    let e = env().await;
+    let admin = login(&e, "admin", "admin-password").await;
+    let r = get(&e, "/api/storage/disks", Some(&admin)).await;
+    assert_eq!(r.status, StatusCode::NOT_IMPLEMENTED, "body: {}", r.body);
+    assert!(r.body.contains("Linux"), "says why: {}", r.body);
 }

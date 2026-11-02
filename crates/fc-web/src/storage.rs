@@ -90,35 +90,45 @@ pub fn find_enumerated<'a>(disks: &'a [Disk], device: &str) -> Option<&'a Disk> 
     disks.iter().find(|d| d.os_path == device)
 }
 
+#[cfg(not(target_os = "linux"))]
+const NOT_LINUX: &str = "disk inspection is available on Linux in this build";
+
 #[cfg(target_os = "linux")]
-fn scan() -> Result<(Vec<Disk>, Option<HashSet<DiskId>>), String> {
+fn scan() -> Result<(Vec<Disk>, Option<HashSet<DiskId>>), ApiError> {
     use fc_storage::linux::LinuxSysfs;
     use fc_storage::platform::Platform;
     let host = LinuxSysfs::system();
-    let disks = host.enumerate().map_err(|e| e.to_string())?;
+    let disks = host
+        .enumerate()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok((disks, host.system_disks()))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn scan() -> Result<(Vec<Disk>, Option<HashSet<DiskId>>), String> {
-    Err("disk inspection is available on Linux in this build".to_owned())
+fn scan() -> Result<(Vec<Disk>, Option<HashSet<DiskId>>), ApiError> {
+    Err(ApiError::NotAvailable(NOT_LINUX.to_owned()))
 }
 
 #[cfg(target_os = "linux")]
-fn read_health(device: &str) -> Result<Option<Health>, String> {
+fn read_health(device: &str) -> Result<Option<Health>, ApiError> {
     use fc_storage::linux::LinuxSysfs;
     use fc_storage::platform::Platform;
     let host = LinuxSysfs::system();
-    let disks = host.enumerate().map_err(|e| e.to_string())?;
+    let disks = host
+        .enumerate()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
     match find_enumerated(&disks, device) {
-        Some(d) => host.health(d).map(Some).map_err(|e| e.to_string()),
+        Some(d) => host
+            .health(d)
+            .map(Some)
+            .map_err(|e| ApiError::Internal(e.to_string())),
         None => Ok(None),
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn read_health(_device: &str) -> Result<Option<Health>, String> {
-    Err("disk inspection is available on Linux in this build".to_owned())
+fn read_health(_device: &str) -> Result<Option<Health>, ApiError> {
+    Err(ApiError::NotAvailable(NOT_LINUX.to_owned()))
 }
 
 /// `GET /api/storage/disks`: attached disks, without serial numbers.
@@ -129,8 +139,7 @@ pub async fn list_disks(
     require_admin(&p)?;
     let (disks, system) = tokio::task::spawn_blocking(scan)
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?
-        .map_err(ApiError::Internal)?;
+        .map_err(|e| ApiError::Internal(e.to_string()))??;
     Ok(Json(
         disks
             .iter()
@@ -149,8 +158,7 @@ pub async fn health(
     let device = q.device;
     let found = tokio::task::spawn_blocking(move || read_health(&device))
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?
-        .map_err(ApiError::Internal)?;
+        .map_err(|e| ApiError::Internal(e.to_string()))??;
     found
         .map(|h| Json(HealthDto::from(h)))
         .ok_or(ApiError::NotFound)
