@@ -57,6 +57,8 @@ async fn env() -> Env {
 struct Reply {
     status: StatusCode,
     body: String,
+    // Read only by the Linux-only tests, so it is unused elsewhere.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     json: Value,
 }
 
