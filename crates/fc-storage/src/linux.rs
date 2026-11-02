@@ -209,6 +209,11 @@ impl LinuxSysfs {
         }
     }
 
+    /// The directory that holds `sys/` and `proc/`. It is `/` in production.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     fn mounts(&self) -> Result<Vec<MountEntry>, OsError> {
         read_text(self.root.join("proc/self/mountinfo")).map(|t| parse_mountinfo(&t))
     }
@@ -307,12 +312,37 @@ impl Platform for LinuxSysfs {
         })
     }
 
+    #[cfg(all(feature = "storage-destructive", target_os = "linux"))]
+    fn open_exclusive(&self, disk: &Disk) -> Result<Box<dyn ExclusiveDisk>, OsError> {
+        use crate::linux_block::{BlockDevice, LinuxExclusive, map_open_error};
+        let dev = BlockDevice::open(Path::new(&disk.os_path)).map_err(map_open_error)?;
+        Ok(Box::new(LinuxExclusive::new(
+            dev,
+            self.clone(),
+            disk.os_path.clone(),
+        )))
+    }
+
+    #[cfg(not(all(feature = "storage-destructive", target_os = "linux")))]
     fn open_exclusive(&self, _disk: &Disk) -> Result<Box<dyn ExclusiveDisk>, OsError> {
         Err(OsError::Unsupported(
-            "writing to block devices is not part of the read-only adapter",
+            "writing to block devices needs the storage-destructive feature",
         ))
     }
 
+    #[cfg(all(feature = "storage-destructive", target_os = "linux"))]
+    fn format_partition(
+        &self,
+        part: &PartitionRef,
+        fs: FsKind,
+        label: &str,
+    ) -> Result<(), OsError> {
+        use crate::linux_block::run_tool;
+        use crate::linux_tools::mkfs;
+        run_tool(&mkfs(fs, label, &part.os_path))
+    }
+
+    #[cfg(not(all(feature = "storage-destructive", target_os = "linux")))]
     fn format_partition(
         &self,
         _part: &PartitionRef,
@@ -320,7 +350,7 @@ impl Platform for LinuxSysfs {
         _label: &str,
     ) -> Result<(), OsError> {
         Err(OsError::Unsupported(
-            "formatting is not part of the read-only adapter",
+            "formatting needs the storage-destructive feature",
         ))
     }
 }
@@ -632,6 +662,10 @@ mod tests {
             assert_eq!(v, Verdict::ReadOnly(Refusal::NoSerial));
         }
 
+        // Only in the default build. With the feature on, these methods act on the
+        // device path in the fixture, which is the host's real /dev/sdb. A test must
+        // never reach that path.
+        #[cfg(not(feature = "storage-destructive"))]
         #[test]
         fn destructive_methods_refuse_in_this_adapter() {
             let t = tree();

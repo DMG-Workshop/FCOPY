@@ -21,12 +21,14 @@
 //! | In-memory platform for tests | [`fake`] | always |
 //! | Guarded execution pipeline and audit trail | [`orchestrate`] | `storage-destructive` |
 //! | Signed plan envelope and worker events | [`protocol`] | `storage-destructive` |
-//! | Linux block-device writer (`O_DIRECT`, `O_EXCL`) | [`linux_block`] | `storage-destructive` |
+//! | Linux partition and filesystem builders (pure) | [`linux_tools`] | always |
+//! | Linux block-device writer (`O_DIRECT`, `O_EXCL`, `sgdisk`, `mkfs`) | [`linux_block`] | `storage-destructive` |
 
 pub mod devname;
 pub mod fake;
 pub mod health;
 pub mod linux;
+pub mod linux_tools;
 pub mod model;
 pub mod plan;
 pub mod platform;
