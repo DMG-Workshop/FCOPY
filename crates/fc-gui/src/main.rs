@@ -37,6 +37,7 @@ mod instance;
 mod remote;
 mod profiles;
 mod state;
+mod storage;
 mod torrent;
 mod vpn;
 

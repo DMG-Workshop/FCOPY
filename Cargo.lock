@@ -1509,6 +1509,7 @@ dependencies = [
  "embed-resource",
  "fc-engine",
  "fc-remote",
+ "fc-storage",
  "fc-torrent",
  "fs4",
  "raw-window-handle",

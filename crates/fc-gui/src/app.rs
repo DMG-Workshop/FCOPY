@@ -49,6 +49,7 @@ enum View {
     Queue,
     History,
     Recovery,
+    Disks,
     Peers,
     Torrents,
     Logs,
@@ -142,6 +143,7 @@ pub struct FcApp {
     profiles: crate::profiles::Profiles,
     history: crate::history::History,
     recovery: crate::recovery::Recovery,
+    storage: crate::storage::Storage,
     appearance: crate::appearance::Appearance,
     rates: std::collections::VecDeque<f32>,
     last_rate: std::time::Instant,
@@ -186,6 +188,7 @@ impl FcApp {
             profiles: crate::profiles::Profiles::default(),
             history: crate::history::History::new(cc.egui_ctx.clone()),
             recovery: crate::recovery::Recovery::new(cc.egui_ctx.clone()),
+            storage: crate::storage::Storage::default(),
             appearance: crate::appearance::Appearance::default(),
             rates: std::collections::VecDeque::new(),
             last_rate: std::time::Instant::now(),
@@ -353,6 +356,7 @@ impl FcApp {
             }
             if ui.selectable_label(self.view == View::History, "History").clicked() { self.view = View::History; }
             if ui.selectable_label(self.view == View::Recovery, "Recovery").clicked() { self.view = View::Recovery; }
+            if ui.selectable_label(self.view == View::Disks, "Disks").clicked() { self.view = View::Disks; }
             let running = self.torrents.is_running();
             let tab = ui.add_enabled(
                 running,
@@ -1513,6 +1517,7 @@ impl eframe::App for FcApp {
             View::Queue => self.queue_view(ui),
             View::History => self.history.show(ui),
             View::Recovery => self.recovery.show(ui),
+            View::Disks => self.storage.show(ui),
             View::Peers => self.peers_view(ui),
             View::Torrents => torrent::show(ui, &mut self.torrents),
             View::Logs => self.logs_view(ui),
