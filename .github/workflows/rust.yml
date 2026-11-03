@@ -41,7 +41,7 @@ jobs:
       # The test binaries are built as the normal user, so the toolchain is found as usual.
       # Only the compiled binaries run under sudo, which needs no Rust toolchain.
       run: |
-        for t in loop_device worker_loop; do
+        for t in loop_device worker_loop worker_binary; do
           exe=$(cargo test -p fc-storage --features storage-destructive --test "$t" --no-run --message-format=json \
             | jq -r 'select(.profile.test == true and .executable != null) | .executable' | tail -1)
           echo "running $t: $exe"
