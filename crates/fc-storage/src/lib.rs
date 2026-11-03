@@ -43,3 +43,5 @@ pub mod orchestrate;
 pub mod protocol;
 #[cfg(feature = "storage-destructive")]
 pub mod worker;
+#[cfg(feature = "storage-destructive")]
+pub mod worker_client;

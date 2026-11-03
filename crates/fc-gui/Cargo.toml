@@ -11,12 +11,17 @@ eframe = { version = "0.32.3", default-features = false, features = ["glow", "x1
 egui = "0.32.3"
 fc-engine = { path = "../fc-engine" }
 fc-remote = { path = "../fc-remote" }
+fc-storage = { path = "../fc-storage" }
 fc-torrent = { path = "../fc-torrent" }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1.1.8"
 fs4 = "1.1.0"
+
+# Erasing disks. Off by default: a normal build can list disks but cannot erase one.
+[features]
+storage-destructive = ["fc-storage/storage-destructive"]
 
 [[bin]]
 name = "fcopy-gui"
