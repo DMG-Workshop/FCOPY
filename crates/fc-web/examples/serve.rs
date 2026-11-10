@@ -90,14 +90,22 @@ async fn main() {
     // BitTorrent downloads go to a folder of their own, below the share root.
     // Transfers and waiting magnets are kept in the agent's folder, so they survive a restart.
     let torrent_state = fc_remote::config::default_agent_dir().join("torrents");
-    let torrents = TorrentEngine::start(EngineConfig {
+    // If the engine cannot start (for example, on a host without IPv6), the console
+    // still serves copies; the BitTorrent tab shows as off, as in the desktop app.
+    let torrents = match TorrentEngine::start(EngineConfig {
         state_dir: Some(torrent_state),
         dht: torrent_dht,
         trackers: torrent_trackers,
         ..EngineConfig::new(root.join("BitTorrent"))
     })
     .await
-    .expect("torrent engine");
+    {
+        Ok(engine) => Some(engine),
+        Err(e) => {
+            eprintln!("warning: BitTorrent is off, because the engine could not start: {e}");
+            None
+        }
+    };
     let state = build(
         queue,
         events,
@@ -108,7 +116,7 @@ async fn main() {
             hash_cost: HashCost::default(),
             state_dir: None,
             certificate_fingerprint: fingerprint.clone(),
-            torrents: Some(torrents),
+            torrents,
         },
     )
     .expect("start console");
