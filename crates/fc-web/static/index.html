@@ -55,6 +55,7 @@
         <button role="tab" :aria-selected="mode === 'local'" class="mode-btn" :class="mode === 'local' && 'mode-on'" @click="setMode('local')">Local copy</button>
         <button role="tab" :aria-selected="mode === 'history'" class="mode-btn" :class="mode === 'history' && 'mode-on'" @click="setMode('history')">History</button>
         <button role="tab" :aria-selected="mode === 'recovery'" class="mode-btn" :class="mode === 'recovery' && 'mode-on'" @click="setMode('recovery')">Recovery (<span x-text="recovered.length"></span>)</button>
+        <button role="tab" x-show="isAdmin()" :aria-selected="mode === 'disks'" class="mode-btn" :class="mode === 'disks' && 'mode-on'" @click="setMode('disks')">Disks</button>
         <button role="tab" x-show="isAdmin()" :aria-selected="mode === 'remote'" class="mode-btn" :class="mode === 'remote' && 'mode-on'" @click="setMode('remote')">Remote node</button>
         <button role="tab" x-show="isAdmin()" :disabled="!torrentsEnabled" :aria-selected="mode === 'torrent'" :title="torrentsEnabled ? '' : 'BitTorrent is not enabled on this console'" class="mode-btn" :class="{ 'mode-on': mode === 'torrent', 'cursor-not-allowed opacity-40': !torrentsEnabled }" @click="setMode('torrent')">BitTorrent<span x-show="!torrentsEnabled" class="text-[10px]"> (off)</span></button>
       </nav>
@@ -239,6 +240,31 @@
               <button class="btn-mini" :disabled="recoveryBusy || (recoveryRemote(job) && (!isAdmin() || recoverySelected !== job.id || !recoveryPassword))" @click="recover(job,'retry')">Retry</button>
               <button class="btn-mini" :disabled="recoveryBusy" @click="recover(job,'discard')">Discard</button>
             </div>
+          </article>
+        </template>
+      </section>
+
+      <!-- Disks (admin only, read-only) -->
+      <section x-show="mode === 'disks'" x-cloak aria-label="Disks" class="min-h-0 flex-1 overflow-auto p-4">
+        <h2 class="font-semibold text-strong">Disks</h2>
+        <p class="text-dim">Disks attached to the console host. This view is read-only: the web console never erases, partitions or formats a disk. Serial numbers are not shown.</p>
+        <div class="my-3 flex flex-wrap items-center gap-2">
+          <button :disabled="disksBusy" class="btn-ghost h-8 px-3" @click="loadDisks()">Refresh disks</button>
+          <span x-show="disksBusy" role="status" class="text-dim">Loading...</span>
+        </div>
+        <p x-show="disksNotice" x-text="disksNotice" role="alert" class="text-bad"></p>
+        <p x-show="!disksBusy && !disksNotice && disks.length === 0" class="py-4 text-dim">No disks were found.</p>
+        <template x-for="disk in disks" :key="disk.os_path">
+          <article class="grid gap-2 border-b border-line py-3 break-all">
+            <h3 class="font-semibold text-strong"><span class="font-mono" x-text="disk.os_path"></span> - <span x-text="disk.model || 'Unknown model'"></span></h3>
+            <p x-text="`${fmtBytes(disk.size_bytes)} | ${disk.transport} | ${disk.removable ? 'Removable' : 'Not removable'}`"></p>
+            <p :class="disk.system === false ? 'text-dim' : 'text-warn'" x-text="diskSystemLabel(disk)"></p>
+            <p x-text="`Mounted at: ${disk.mounts.length ? disk.mounts.join(', ') : 'not mounted'}`"></p>
+            <div class="flex flex-wrap items-center gap-2">
+              <button :disabled="!!healthBusy[disk.os_path]" class="btn-mini" @click="loadHealth(disk.os_path)">Read health</button>
+              <span x-show="healthBusy[disk.os_path]" role="status" class="text-dim">Reading...</span>
+            </div>
+            <p x-show="diskHealth[disk.os_path]" :class="healthClass(diskHealth[disk.os_path])" x-text="healthSummary(diskHealth[disk.os_path])"></p>
           </article>
         </template>
       </section>

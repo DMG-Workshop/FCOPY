@@ -26,6 +26,22 @@ function fmtRate(bps) {
   return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${units[i]}`;
 }
 
+// One line saying what a drive reported. Missing readings are left out rather than shown as zero.
+function healthText(h) {
+  if (!h) return '';
+  if (h.error) return `Health: cannot read (${h.error})`;
+  const d = h.ok;
+  if (d.source === 'unavailable') return 'Health: unavailable (this enclosure does not report SMART)';
+  const parts = [];
+  if (d.passed === true) parts.push('SMART passed');
+  if (d.passed === false) parts.push('SMART FAILED');
+  if (d.temperature_c != null) parts.push(`${d.temperature_c} °C`);
+  if (d.power_on_hours != null) parts.push(`${d.power_on_hours} h powered on`);
+  if (d.reallocated_sectors != null) parts.push(`${d.reallocated_sectors} reallocated sectors`);
+  if (d.percent_used != null) parts.push(`${d.percent_used}% of rated life used`);
+  return `Health: ${parts.length ? parts.join(', ') : 'unavailable (no readable SMART fields)'}`;
+}
+
 function fmtBytes(b) {
   if (!b) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -106,6 +122,12 @@ function fcopy() {
     historyBusy: false,
     historyPersistent: true,
     historyRequest: 0,
+    disks: [],
+    disksBusy: false,
+    disksNotice: '',
+    disksRequest: 0,
+    diskHealth: {},
+    healthBusy: {},
     recovered: [],
     recoveryPersistent: true,
     recoveryNotice: '',
@@ -231,6 +253,7 @@ function fcopy() {
         return;
       }
       this.resetHistory();
+      this.resetDisks();
       this.user = await r.json();
       this.connect();
       this.loadRecovery();
@@ -246,6 +269,7 @@ function fcopy() {
       this.mode = 'local';
       this.jobs = {};
       this.resetHistory();
+      this.resetDisks();
       this.resetRecovery();
       this.logs = [];
       this.selected = {};
@@ -435,6 +459,76 @@ function fcopy() {
       } finally {
         if (this.user === user) this.historyBusy = false;
       }
+    },
+
+    // ---------- disks (read-only) ----------
+
+    resetDisks() {
+      this.disks = [];
+      this.disksNotice = '';
+      ++this.disksRequest;
+      this.disksBusy = false;
+      this.diskHealth = {};
+      this.healthBusy = {};
+    },
+
+    async loadDisks() {
+      const request = ++this.disksRequest;
+      const user = this.user;
+      this.disksBusy = true;
+      this.disksNotice = '';
+      try {
+        const r = await this.api('GET', '/api/storage/disks');
+        if (!r.ok) throw new Error(await errorText(r));
+        const disks = await r.json();
+        if (this.user !== user || request !== this.disksRequest) return;
+        this.disks = disks;
+        this.diskHealth = {};
+        this.healthBusy = {};
+      } catch (e) {
+        if (this.user === user && request === this.disksRequest) {
+          this.disks = [];
+          this.disksNotice = `Cannot list disks: ${e.message}`;
+        }
+      } finally {
+        if (this.user === user && request === this.disksRequest) this.disksBusy = false;
+      }
+    },
+
+    async loadHealth(device) {
+      const user = this.user;
+      const request = this.disksRequest;
+      this.healthBusy = { ...this.healthBusy, [device]: true };
+      let result;
+      try {
+        const r = await this.api('GET', `/api/storage/health?device=${encodeURIComponent(device)}`);
+        if (r.ok) result = { ok: await r.json() };
+        else result = { error: r.status === 404 ? 'this disk is no longer listed; refresh the list' : await errorText(r) };
+      } catch (e) {
+        result = { error: e.message };
+      }
+      // A refresh or sign-out since the request started makes this answer stale.
+      if (this.user !== user || request !== this.disksRequest) return;
+      this.diskHealth = { ...this.diskHealth, [device]: result };
+      const busy = { ...this.healthBusy };
+      delete busy[device];
+      this.healthBusy = busy;
+    },
+
+    diskSystemLabel(disk) {
+      if (disk.system === true) return 'Hosts the running system';
+      if (disk.system === false) return 'Not a system disk';
+      return 'Unknown whether this disk hosts the system';
+    },
+
+    healthSummary(h) {
+      return healthText(h);
+    },
+
+    healthClass(h) {
+      if (!h || h.error || h.ok.passed === false) return 'text-bad';
+      if (h.ok.passed === true) return 'text-ok';
+      return 'text-dim';
     },
 
     // ---------- BitTorrent ----------
@@ -705,6 +799,7 @@ function fcopy() {
         this.clientTimer = setInterval(() => this.loadClients(), 10000);
       }
       if (m === 'history') await this.loadHistory();
+      if (m === 'disks') await this.loadDisks();
       if (m === 'recovery') await this.loadRecovery();
     },
 
